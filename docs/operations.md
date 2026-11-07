@@ -228,7 +228,7 @@ Alert on a rising `result="error"` rate, and on workspaces whose
 | Pod refused at creation | The webhook explains why in the error message. |
 | `Ready=False` on a repository | Read the condition message. |
 | PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed or ran out of time (2 h). Fix the cause, then remove the annotation to retry. |
-| PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | A newer Pod already writes the workspace elsewhere. The PV holds older, unsaved data; recover it by hand or delete it. |
+| PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | A later Pod was recorded as writer on another volume, even if that Pod has stopped. The PV holds older, unsaved data; recover it by hand or delete it. |
 | A writer on a lost node blocks a new Pod | The block ends 2 minutes after the old Pod's deletion deadline. |
 
 ## Uninstall

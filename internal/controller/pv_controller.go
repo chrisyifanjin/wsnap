@@ -26,9 +26,9 @@ const (
 	RescueRunning = "running"
 	RescueDone    = "done"
 	RescueFailed  = "failed"
-	// RescueSkipped means another Pod already writes the workspace on a
-	// different volume. A rescue snapshot would become the newest snapshot
-	// and roll that Pod's work back, so the PV is kept for an operator.
+	// RescueSkipped means a later Pod was recorded as the workspace writer
+	// on a different volume. A rescue snapshot would become the newest
+	// snapshot and roll its work back, so the PV is kept for an operator.
 	RescueSkipped = "skipped-newer-writer"
 )
 
@@ -94,11 +94,9 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 		}
 		return ctrl.Result{}, err
 	}
-	if newer, err := r.newerWriterElsewhere(ctx, &ws, &pv); err != nil {
-		return ctrl.Result{}, err
-	} else if newer {
+	if newerWriterElsewhere(&ws, &pv) {
 		r.Recorder.Eventf(&ws, corev1.EventTypeWarning, "RescueSkipped",
-			"volume %s was released without a final snapshot, but pod %s already writes this workspace on volume %s; keeping %s for manual recovery",
+			"volume %s was released without a final snapshot, but pod %s was recorded as the later writer on volume %s; keeping %s for manual recovery",
 			pv.Name, ws.Status.WriterPod.Name, ws.Status.Volume.VolumeName, pv.Name)
 		return ctrl.Result{}, r.setRescue(ctx, &pv, RescueSkipped)
 	}
@@ -106,21 +104,14 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	return ctrl.Result{}, r.startRescue(ctx, &pv, &ws)
 }
 
-// newerWriterElsewhere reports whether a Pod other than the PV's writer
-// already writes the workspace on another volume.
-func (r *PVReconciler) newerWriterElsewhere(ctx context.Context, ws *wsnapv1.Workspace, pv *corev1.PersistentVolume) (bool, error) {
+// newerWriterElsewhere uses the durable workspace writer record. Checking
+// whether that Pod still exists is unsafe: its volume may already have been
+// snapshotted and deleted when this older PV is released.
+func newerWriterElsewhere(ws *wsnapv1.Workspace, pv *corev1.PersistentVolume) bool {
 	if ws.Status.WriterPod == nil || ws.Status.Volume == nil || ws.Status.Volume.VolumeName == pv.Name {
-		return false, nil
+		return false
 	}
-	if ws.Status.WriterPod.UID == pv.Annotations[workspace.AnnotationWriterPod] {
-		return false, nil
-	}
-	var pod corev1.Pod
-	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: ws.Namespace, Name: ws.Status.WriterPod.Name}, &pod)
-	if apierrors.IsNotFound(err) {
-		return false, nil
-	}
-	return err == nil && string(pod.UID) == ws.Status.WriterPod.UID, err
+	return ws.Status.WriterPod.UID != pv.Annotations[workspace.AnnotationWriterPod]
 }
 
 func (r *PVReconciler) setRescue(ctx context.Context, pv *corev1.PersistentVolume, phase string) error {

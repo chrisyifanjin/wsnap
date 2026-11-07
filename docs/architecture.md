@@ -167,7 +167,7 @@ stateDiagram-v2
   Running --> Done: mover Job saved the data
   Running --> Failed: mover Job failed or timed out (2 h)
   Done --> Reclaimed
-  Released --> Skipped: a newer Pod already writes this workspace elsewhere
+  Released --> Skipped: a later writer was recorded on another volume
   Reclaimed --> [*]: original reclaim policy restored
   Failed --> [*]: kept for an operator
   Skipped --> [*]: kept for an operator

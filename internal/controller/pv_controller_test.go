@@ -191,12 +191,31 @@ func TestRescueSkippedWhenNewerPodWritesElsewhere(t *testing.T) {
 	}
 }
 
-func TestRescueRunsWhenNewerWriterPodIsGone(t *testing.T) {
-	// The workspace's writer on pv-2 no longer exists, so nothing can be
-	// rolled back.
+func TestRescueSkippedWhenNewerWriterPodIsGone(t *testing.T) {
+	// Pod liveness does not determine snapshot order. Its work may already
+	// have been saved even though the Pod no longer exists.
 	ws := testWorkspace(func(ws *wsnapv1.Workspace) {
 		ws.Status.WriterPod = &wsnapv1.PodRef{Name: "gone", UID: "u9"}
 		ws.Status.Volume = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, VolumeName: "pv-2"}
+		ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "newer-snapshot", VolumeName: "pv-2", Pod: &wsnapv1.PodRef{Name: "gone", UID: "u9"}}
+	})
+	r, c := newPVReconciler(t, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
+	reconcilePV(t, r)
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueSkipped {
+		t.Errorf("rescue = %q, want skipped", a)
+	}
+	var jobs batchv1.JobList
+	_ = c.List(context.Background(), &jobs)
+	if len(jobs.Items) != 0 {
+		t.Error("started a rescue that would replace newer history")
+	}
+}
+
+func TestRescueRunsWhenLastWriterOwnedReleasedPV(t *testing.T) {
+	ws := testWorkspace(func(ws *wsnapv1.Workspace) {
+		ws.Status.WriterPod = &wsnapv1.PodRef{Name: "gone", UID: "u2"}
+		ws.Status.Volume = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, VolumeName: "pv-1"}
+		ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "older-snapshot", VolumeName: "pv-2", Pod: &wsnapv1.PodRef{Name: "older", UID: "u1"}}
 	})
 	r, c := newPVReconciler(t, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
 	reconcilePV(t, r)

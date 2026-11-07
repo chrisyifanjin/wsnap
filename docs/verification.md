@@ -119,6 +119,10 @@ Found by the second independent review and fixed:
   on the sidecar's private volume, written only after writer credentials are
   granted. `TestWarmVolumeWaitsForWriterClaimBeforeStartup` holds the broker
   at a conflict and checks that startup remains blocked.
+- A late rescue of an older PV could replace newer work once the newer Pod
+  disappeared. The PV reconciler now uses the Workspace's recorded latest
+  writer and volume, not Pod liveness. `TestRescueSkippedWhenNewerWriterPodIsGone`
+  and `TestRescueRunsWhenLastWriterOwnedReleasedPV` cover both orders.
 
 ## Open issues
 
@@ -127,21 +131,14 @@ Each item gives the problem, the result, and the planned fix.
 
 ### Data loss
 
-1. **A late rescue can replace newer work.**
-   The controller skips a rescue only while the newer writer Pod exists.
-   When that Pod has already stopped, the rescue runs.
-   Result: the old data becomes the newest snapshot.
-   Fix: compare the PV's writer with the workspace's last snapshot, not
-   with running Pods.
-
-2. **The workload can delete the marker that the mover trusts.**
+1. **The workload can delete the marker that the mover trusts.**
    A root workload can delete `.wsnap` (for example with `git clean -fdx`).
    The mover then thinks the volume holds no workspace data.
    Result: the mover saves nothing, and Kubernetes deletes the PV.
    Fix: skip the snapshot only for an empty volume or an interrupted
    restore, and record initialization outside the volume.
 
-3. **A namespace user can forge a wsnap Job.**
+2. **A namespace user can forge a wsnap Job.**
    The broker accepts a Job by its labels.
    A user can copy the labels into a new Job.
    Result: that user gets the maintenance (delete) credential, and can mark
@@ -151,13 +148,13 @@ Each item gives the problem, the result, and the planned fix.
 
 ### Wrong status
 
-4. **The broker accepts reports from a Pod that is not the writer.**
+3. **The broker accepts reports from a Pod that is not the writer.**
    Result: the last snapshot and request results can show the wrong
    snapshot.
    Fix: accept snapshot reports only from the writer Pod, and complete a
    request only for the Pod that claimed it.
 
-5. **A request times out while its work continues.**
+4. **A request times out while its work continues.**
    The timeout counts from creation, also while a Job or sidecar works.
    Result: a large first snapshot always fails, and a restore can finish
    after its request shows "Failed".
@@ -166,7 +163,7 @@ Each item gives the problem, the result, and the planned fix.
 
 ### Availability
 
-6. **The webhook certificate is not renewed while the controller runs.**
+5. **The webhook certificate is not renewed while the controller runs.**
    The renewal reads the webhook configuration through a cache that it
    has no permission to fill.
    Result: renewal waits forever. After about 335 days, all labeled Pods
@@ -175,13 +172,13 @@ Each item gives the problem, the result, and the planned fix.
 
 ### Security and documentation
 
-7. **A user who can edit a SnapshotRepository holds the admin credential.**
+6. **A user who can edit a SnapshotRepository holds the admin credential.**
    That user can select the `static` provider, set Job images and volumes,
    and point STS or Azure endpoints to any URL.
    Fix: document this as an administrator right, or move these fields to a
    cluster-scoped object.
 
-8. **Smaller items.**
+7. **Smaller items.**
    - With the default settings, credentials are never reused (the README
      says they are).
    - Kopia excludes every folder named `.wsnap` or `lost+found`, not only
