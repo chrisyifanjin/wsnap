@@ -9,7 +9,8 @@ wsnap.
   action of the controller (on by default from 1.30). Tested on 1.37.
 - A Pod Security level of `baseline` or `privileged` in workspace
   namespaces: the agent runs as root with a few capabilities.
-- A StorageClass for workspace volumes. For node-local disks, use a dynamic
+- A default dynamic StorageClass for the sample Pod, or set
+  `storageClassName` in its volume claim. For node-local disks, use a dynamic
   local provisioner (TopoLVM, OpenEBS LVM LocalPV, rancher local-path) with
   `volumeBindingMode: WaitForFirstConsumer`.
 - Object storage: S3-compatible, Google Cloud Storage, or Azure Blob. A
@@ -17,18 +18,24 @@ wsnap.
 
 ## Install
 
-From a release (multi-arch images on GHCR, pinned in `install.yaml`):
+There is no published release yet. Install from source on a kind cluster:
 
 ```sh
-kubectl apply -f https://github.com/chrisyifanjin/wsnap/releases/download/<version>/install.yaml
-```
-
-From source:
-
-```sh
-make images            # or build: docker build --target controller / --target agent
+kind create cluster --name wsnap
+make images
+kind load docker-image wsnap-controller:dev wsnap-agent:dev --name wsnap
 kubectl apply -k config/default
+kubectl -n wsnap-system rollout status deployment/wsnap-controller
 ```
+
+If you already have a cluster, build and push both images to a registry
+that its nodes can pull from. Change the controller image and its
+`--agent-image` argument in `config/manager/manager.yaml` before applying
+`config/default`. For a released version, use the `install.yaml` attached
+to the release instead; it pins both image tags.
+
+The sample volume needs a StorageClass. Check yours with
+`kubectl get storageclass` before creating a Pod.
 
 `wsnap-controller --version` and `wsnap-agent version` print the build.
 
@@ -52,10 +59,15 @@ The controller flags:
 
 ## Create a repository
 
-1. Create a Secret with the master key and the backend credential:
+Put the `SnapshotRepository`, its Secret, and every Pod that uses it in
+the **same namespace**. The following examples use `agents`:
+
+1. Create that namespace and a Secret with the master key and backend
+   credential:
 
    ```sh
-   kubectl create secret generic wsnap-creds \
+   kubectl create namespace agents
+   kubectl -n agents create secret generic wsnap-creds \
      --from-literal=WSNAP_MASTER_KEY="$(openssl rand -hex 32)" \
      --from-literal=AWS_ACCESS_KEY_ID=... \
      --from-literal=AWS_SECRET_ACCESS_KEY=...
@@ -63,7 +75,11 @@ The controller flags:
 
    Keep `WSNAP_MASTER_KEY` safe. Without it, no workspace can be restored.
 
-2. Create a `SnapshotRepository`. Choose one backend.
+2. Create a `SnapshotRepository` in `agents`. Choose one backend. The
+   following fragments show the relevant `spec` fields; the S3 example
+   is a complete object. For that example, edit the bucket, region and
+   role ARN in `config/samples/repository-s3-sts.yaml`, then run
+   `kubectl -n agents apply -f config/samples/repository-s3-sts.yaml`.
 
 **AWS S3 with STS (recommended on AWS).** The access key belongs to a user
 that may assume `roleARN`.
@@ -122,13 +138,17 @@ See `internal/engine/exec.go` for the contract.
 3. Check it:
 
    ```sh
-   kubectl get snaprepo
+   kubectl -n agents get snaprepo
    # NAME      ENGINE   PROVIDER   READY
    # default   kopia    s3-sts     True
    ```
 
-   `Ready=False` explains the problem: a missing Secret, a short master key,
-   or an engine and provider that do not work together.
+   `Ready=False` explains a configuration problem: for example, a missing
+   Secret, a short master key, or an incompatible engine and provider.
+   `Ready=True` does **not** test access to object storage; the first
+   snapshot does that. Check `CredentialsScoped=True` to confirm that
+   the agent receives scoped credentials. The `static` provider reports
+   `CredentialsScoped=False` because it gives the agent the admin key.
 
 ### Schedule and retention
 
@@ -142,7 +162,19 @@ See `internal/engine/exec.go` for the contract.
 
 ## Protect a workload
 
-Add two labels and a volume named `workspace`:
+The simplest example is [pod.yaml](https://github.com/chrisyifanjin/wsnap/blob/main/config/samples/pod.yaml), which
+uses a generic ephemeral volume. Apply it in the same namespace as the
+repository:
+
+```sh
+kubectl -n agents apply -f config/samples/pod.yaml
+kubectl -n agents wait --for=condition=Ready pod/my-agent --timeout=5m
+kubectl -n agents get workspace user-42-project-x
+```
+
+The webhook adds the sidecar and waits for the restore before starting
+the workload. To protect your own Pod, add the same two labels and mount
+a volume named `workspace`:
 
 ```yaml
 metadata:
@@ -172,7 +204,17 @@ The webhook adds the sidecar. Optional annotations:
 | `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 For agent-sandbox, put the labels in `Sandbox.spec.podTemplate.metadata`
-and the volume in `volumeClaimTemplates`.
+and the volume in `volumeClaimTemplates`, as in
+[sandbox.yaml](https://github.com/chrisyifanjin/wsnap/blob/main/config/samples/sandbox.yaml). Install agent-sandbox
+before applying that sample. The webhook injects the sidecar for both
+samples.
+
+Use a generic ephemeral PVC, or a standalone PVC whose PV is retained,
+when a mover must rescue a volume after its PVC is deleted without a final
+snapshot. With `emptyDir`, wsnap can take a final
+snapshot during a normal stop, but it cannot rescue data after the Pod
+disappears. If the underlying disk is lost, any volume type can restore
+only the last completed snapshot.
 
 ### Quiesce handshake
 

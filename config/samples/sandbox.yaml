@@ -1,5 +1,5 @@
-# An agent-sandbox Sandbox whose /workspace survives suspend, delete and
-# re-create. Only the sidecar mounts the wsnap token.
+# Requires agent-sandbox. Put this Sandbox in the same namespace as the
+# SnapshotRepository and its Secret. The wsnap webhook injects the sidecar.
 apiVersion: agents.x-k8s.io/v1beta1
 kind: Sandbox
 metadata:
@@ -13,34 +13,13 @@ spec:
   podTemplate:
     metadata:
       labels:
-        wsnap.dev/workspace: user-42-project-x   # stable identity across Sandboxes
+        wsnap.dev/workspace: user-42-project-x
         wsnap.dev/repository: default
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 60          # room for the final snapshot
-      initContainers:
-      - name: wsnap
-        image: ghcr.io/chrisyifanjin/wsnap-agent:dev
-        restartPolicy: Always                     # native sidecar (Kubernetes 1.29+)
-        args: [sidecar, --dir=/workspace, --final-timeout=50s]
-        startupProbe:                             # the agent starts after the restore
-          exec: {command: [/usr/local/bin/wsnap-agent, ready, --state-dir=/var/lib/wsnap]}
-          periodSeconds: 1
-          failureThreshold: 1800
-        volumeMounts:
-        - {name: workspace, mountPath: /workspace}
-        - {name: wsnap-token, mountPath: /var/run/secrets/wsnap, readOnly: true}
-        - {name: wsnap-state, mountPath: /var/lib/wsnap}
       containers:
       - name: agent
-        image: python:3.13
+        image: alpine:3.22
         command: [sleep, infinity]
         volumeMounts:
         - {name: workspace, mountPath: /workspace}
-      volumes:
-      - name: wsnap-token
-        projected:
-          sources:
-          - serviceAccountToken: {audience: wsnap, expirationSeconds: 600, path: token}
-      - name: wsnap-state
-        emptyDir: {}

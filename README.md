@@ -2,17 +2,31 @@
 
 wsnap keeps an agent's workspace alive across Pods on Kubernetes.
 
-An AI agent works in a directory on a volume. When its Pod stops (an idle
-sandbox is suspended, a node fails, a user deletes the sandbox), the work
-must not be lost. wsnap takes snapshots of the workspace volume to object
-storage while the Pod runs, takes a final snapshot when the Pod stops, and
-restores the newest snapshot into the next Pod before the agent starts.
+An AI agent works in a directory on a volume. wsnap copies that directory
+to a snapshot repository while the Pod runs, takes a final snapshot during
+a normal shutdown, and restores the last recorded snapshot before the next
+agent starts. If a Pod dies, wsnap can save newer data from its released
+PV when that PV is still accessible.
 
 It works with any agent image and any workload that creates Pods: plain
 Pods, Deployments, StatefulSets, and [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
 `Sandbox` objects.
 
-> **Status:** prototype (`wsnap.dev/v1alpha1`). The API can change.
+> **Status:** prototype (`wsnap.dev/v1alpha1`). The API can change. No
+> release has been published yet; install from source.
+
+## Recovery depends on the volume
+
+| Workspace volume | Normal shutdown | Pod crash or deletion without a final snapshot | Lost volume or node |
+|---|---|---|---|
+| Standalone PVC | Final snapshot; the next Pod can reuse the PVC. | The next Pod can reuse the PVC if it remains accessible. If the PVC is deleted and its PV is released, a mover can save it first. | Restore the last completed snapshot on a new volume; later writes may be lost. |
+| Generic ephemeral PVC | Final snapshot, then restore into the next Pod's new PVC. | A mover Job saves the released PV if it is accessible, then the next Pod restores it. | Restore the last completed snapshot; later writes may be lost. |
+| `emptyDir` | Final snapshot, then restore into the next Pod. | The volume disappears with the Pod; restore the last completed snapshot. | Restore the last completed snapshot; later writes may be lost. |
+
+For a node-local PV, a permanent node loss can also make the PV
+inaccessible. Choose the snapshot interval for the amount of recent work
+you can afford to lose. See [architecture.md](docs/architecture.md) for
+the recovery flow.
 
 ## What it supports
 
@@ -27,6 +41,9 @@ Pods, Deployments, StatefulSets, and [agent-sandbox](https://github.com/kubernet
 | Restore | Newest snapshot, a pinned snapshot (rollback), or another workspace's snapshot (fork); at start or in a running Pod |
 
 wsnap needs no cloud-specific API. It needs Kubernetes 1.30 or later.
+
+Read the [documentation site](https://chrisyifanjin.github.io/wsnap/) for
+setup, recovery behavior, security, and the API.
 
 ## How it works
 
@@ -50,35 +67,55 @@ flowchart LR
 4. While the agent runs, the sidecar takes snapshots, but only when files
    changed.
 5. When the Pod stops, the sidecar takes the final snapshot.
-6. If a Pod dies without a final snapshot, the controller rescues its volume
-   with a Job.
+6. If a PVC is deleted without a final snapshot and its PV is still
+   accessible, the controller can save the released PV with a Job.
 
 Read [docs/architecture.md](docs/architecture.md) for the full design.
 
-## Quick start
+## Quick start from source
+
+You need a Kubernetes 1.30+ cluster, Docker, Go, `kubectl`, and an S3
+bucket with credentials that can assume a workspace role. The example
+below uses kind; see [operations.md](docs/operations.md) for other
+clusters and storage backends.
 
 ```sh
+kind create cluster --name wsnap
 make images
-# Make both images available to cluster nodes (for kind, use kind load docker-image).
+kind load docker-image wsnap-controller:dev wsnap-agent:dev --name wsnap
 kubectl apply -k config/default
-kubectl create secret generic wsnap-creds \
+kubectl -n wsnap-system rollout status deployment/wsnap-controller
+
+kubectl create namespace agents
+kubectl -n agents create secret generic wsnap-creds \
   --from-literal=WSNAP_MASTER_KEY="$(openssl rand -hex 32)" \
   --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...
-# Set the bucket, endpoint, region and STS role in the sample for your store.
-kubectl apply -f config/samples/repository-s3-sts.yaml
+# First edit the sample's bucket, region and role ARN for your S3 account.
+kubectl -n agents apply -f config/samples/repository-s3-sts.yaml
+kubectl -n agents get snaprepo default
+kubectl -n agents apply -f config/samples/pod.yaml
+kubectl -n agents wait --for=condition=Ready pod/my-agent --timeout=5m
 ```
 
-Then add two labels and a volume named `workspace` to your workload:
+The repository, its Secret and the workload must be in the **same
+namespace**. `Ready=True` on the repository means that its configuration
+and Secret are valid; the first snapshot also checks access to storage.
+The sample Pod uses a generic ephemeral volume and gets its sidecar from
+the webhook. Write a file, delete the Pod, then re-create it to see a
+restore:
 
-```yaml
-metadata:
-  labels:
-    wsnap.dev/workspace: user-42-project-x
-    wsnap.dev/repository: default
+```sh
+kubectl -n agents exec my-agent -c agent -- sh -c 'echo hello > /workspace/hello.txt'
+kubectl -n agents delete pod my-agent
+kubectl -n agents apply -f config/samples/pod.yaml
+kubectl -n agents wait --for=condition=Ready pod/my-agent --timeout=5m
+kubectl -n agents exec my-agent -c agent -- cat /workspace/hello.txt
 ```
 
-See [docs/operations.md](docs/operations.md) for each backend, TLS,
-monitoring and uninstall.
+Keep `WSNAP_MASTER_KEY` safe: losing it makes existing snapshots
+unreadable. For agent-sandbox, see [sandbox.yaml](config/samples/sandbox.yaml).
+For other backends, TLS, monitoring and uninstall, see
+[operations.md](docs/operations.md).
 
 ## Tested
 

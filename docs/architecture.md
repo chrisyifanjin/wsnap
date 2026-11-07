@@ -8,12 +8,27 @@ parts talk to each other, and describes each flow step by step.
 An agent works in a directory: the workspace. The workspace lives on a
 volume in a Pod. Pods are temporary. A Pod stops when its node fails, when
 the platform suspends an idle agent, or when a user deletes a sandbox. When
-the Pod stops, the workspace must not be lost, and the next Pod must start
-with it.
+the Pod stops, the next Pod needs the most recent recoverable data.
 
 wsnap keeps a workspace alive across Pods. It stores snapshots of the
-workspace volume in object storage. It restores the newest snapshot into
-the next Pod before the agent starts.
+workspace volume in object storage. It restores the newest **recorded**
+snapshot into the next Pod before the agent starts. A snapshot exists in
+the repository only after the engine finishes it; the Workspace status
+points to it only after the broker accepts the report.
+
+The recovery point depends on what survived:
+
+| Event | Where the next Pod gets its data |
+|---|---|
+| Normal Pod shutdown | The final snapshot, after the workload stops. |
+| Pod crash, standalone PVC still bound | The next Pod can mount the same PVC and use the data on it. |
+| Pod crash, PVC deleted, PV released and accessible | A mover Job saves the PV, then the next Pod restores that snapshot on a new volume. |
+| PV or node permanently lost | The last completed snapshot. Writes after it are lost. |
+| `emptyDir` lost with its Pod | The last completed snapshot. There is no PV for a mover to rescue. |
+
+The snapshot interval is the intended maximum gap between saves while
+files change. It is not a recovery guarantee: storage or broker failures
+can delay a snapshot. Monitor `status.lastError` and failed rescues.
 
 ## Parts
 
@@ -225,9 +240,7 @@ sequenceDiagram
 
 Each sidecar keeps one long-poll connection to the broker. An informer
 event wakes only the waiters of that workspace. No component polls the API
-server, and no component uses `kubectl exec`.
-
-Each sidecar keeps one long-poll connection. If the answer to a poll is
+server, and no component uses `kubectl exec`. If the answer to a poll is
 lost, the next poll delivers the same claimed requests again; the sidecar
 ignores the names it is serving or just served. A claim stays while the
 claimant Pod exists, so a terminating sidecar can finish it.
@@ -278,7 +291,8 @@ See [security.md](security.md) for how each provider limits a credential.
   the same or a newer writer epoch.
 - **Pinned snapshots stay.** Maintenance keeps the recorded newest
   snapshot and every snapshot that a fork, a rollback, or an unfinished
-  restore names.
+  restore names. Kopia pins each snapshot as it creates it, so Kopia's
+  own retention cannot remove one before wsnap makes that decision.
 - **Restore after rescue.** A restore waits while a released volume of the
   workspace waits for its rescue snapshot.
 - **Truthful history.** After any restore, the newest snapshot matches the

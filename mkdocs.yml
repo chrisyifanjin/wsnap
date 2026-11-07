@@ -1,0 +1,47 @@
+site_name: wsnap
+site_description: Workspace snapshots and recovery for Kubernetes agents
+site_url: https://chrisyifanjin.github.io/wsnap/
+repo_url: https://github.com/chrisyifanjin/wsnap
+repo_name: chrisyifanjin/wsnap
+docs_dir: docs
+site_dir: site
+nav:
+  - Home: index.md
+  - Get started: operations.md
+  - Architecture: architecture.md
+  - Security: security.md
+  - API: api.md
+  - Verification: verification.md
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true

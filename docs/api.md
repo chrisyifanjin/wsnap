@@ -5,6 +5,10 @@
 API group `wsnap.dev`, version `v1alpha1`. The group name is a placeholder
 and can change before `v1beta1`.
 
+All four custom resources are namespaced. Put a `SnapshotRepository`, its
+Secret, and the Pods and request objects that use it in the same namespace.
+The controller creates a `Workspace` when the first labeled Pod starts.
+
 ### SnapshotRepository
 
 Where and how workspaces are stored.
