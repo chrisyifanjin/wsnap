@@ -623,13 +623,67 @@ func TestFinalMarksTheReportersOwnVolume(t *testing.T) {
 	claimA := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-w1"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-a"}}
 	e := newEnv(t, workloadPod("w1", "u1", "ws1"), pvA, pvB, claimA,
 		&wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
-			Status: wsnapv1.WorkspaceStatus{Volume: &wsnapv1.VolumeRef{Kind: "persistentVolumeClaim", ClaimName: "other", VolumeName: "pv-b"}}})
+			Status: wsnapv1.WorkspaceStatus{WriterPod: &wsnapv1.PodRef{Name: "w1", UID: "u1"}, Volume: &wsnapv1.VolumeRef{Kind: "persistentVolumeClaim", ClaimName: "other", VolumeName: "pv-b"}}})
 	e.call(t, "/v1/report", "token-w1", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "s1", Final: true})
 	var a, b corev1.PersistentVolume
 	_ = e.client.Get(context.Background(), types.NamespacedName{Name: "pv-a"}, &a)
 	_ = e.client.Get(context.Background(), types.NamespacedName{Name: "pv-b"}, &b)
 	if a.Annotations[workspace.AnnotationFinalPod] != "u1" || b.Annotations[workspace.AnnotationFinalPod] != "" {
 		t.Fatalf("final mark: pv-a %q, pv-b %q; want it on the reporter's pv-a only", a.Annotations[workspace.AnnotationFinalPod], b.Annotations[workspace.AnnotationFinalPod])
+	}
+}
+
+func TestReportRequiresCurrentWriterAndRequestClaim(t *testing.T) {
+	ws := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"},
+		Spec:   wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+		Status: wsnapv1.WorkspaceStatus{WriterPod: &wsnapv1.PodRef{Name: "w1", UID: "u1"}}}
+	requestObj := &wsnapv1.WorkspaceSnapshot{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "r1"},
+		Spec:   wsnapv1.WorkspaceSnapshotSpec{WorkspaceName: "ws1"},
+		Status: wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotRunning, ClaimedBy: "u1"}}
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"), workloadPod("w2", "u2", "ws1"), ws, requestObj)
+	for _, tc := range []struct {
+		name, token string
+		report      protocol.Report
+	}{
+		{"stale snapshot", "token-w2", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "wrong"}},
+		{"stale error", "token-w2", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, Error: "wrong"}},
+		{"stale request", "token-w2", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "wrong", Request: "r1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec, _ := e.call(t, "/v1/report", tc.token, tc.report); rec.Code != http.StatusForbidden {
+				t.Fatalf("report status %d, want 403", rec.Code)
+			}
+		})
+	}
+	var got wsnapv1.Workspace
+	if err := e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.LastSnapshot != nil || got.Status.LastError != "" {
+		t.Fatalf("stale reports changed workspace status: %+v", got.Status)
+	}
+	var request wsnapv1.WorkspaceSnapshot
+	if err := e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "r1"}, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Status.Phase != wsnapv1.SnapshotRunning {
+		t.Fatalf("stale report completed request: %+v", request.Status)
+	}
+
+	// Even the current writer cannot complete a request claimed by another
+	// Pod. This check must happen before updating workspace history.
+	request.Status.ClaimedBy = "u2"
+	if err := e.client.Status().Update(context.Background(), &request); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/report", "token-w1", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "wrong", Request: "r1"}); rec.Code != http.StatusForbidden {
+		t.Fatalf("report for another Pod's request got %d, want 403", rec.Code)
+	}
+	if err := e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.LastSnapshot != nil {
+		t.Fatal("unclaimed request report changed workspace history")
 	}
 }
 

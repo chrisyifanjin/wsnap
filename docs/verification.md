@@ -123,6 +123,13 @@ Found by the second independent review and fixed:
   disappeared. The PV reconciler now uses the Workspace's recorded latest
   writer and volume, not Pod liveness. `TestRescueSkippedWhenNewerWriterPodIsGone`
   and `TestRescueRunsWhenLastWriterOwnedReleasedPV` cover both orders.
+- Periodic webhook certificate renewal read the configuration through a
+  manager cache that did not watch it. Renewal now uses the direct API reader.
+  `TestPeriodicRenewalBypassesManagerCache` simulates the cache failure.
+- A stale Pod could report a snapshot or request result after a newer writer
+  took over. The broker now checks writer UID and request claimant before
+  changing history. `TestReportRequiresCurrentWriterAndRequestClaim` covers
+  stale success, failure, and a request claimed by another Pod.
 
 ## Open issues
 
@@ -148,37 +155,22 @@ Each item gives the problem, the result, and the planned fix.
 
 ### Wrong status
 
-3. **The broker accepts reports from a Pod that is not the writer.**
-   Result: the last snapshot and request results can show the wrong
-   snapshot.
-   Fix: accept snapshot reports only from the writer Pod, and complete a
-   request only for the Pod that claimed it.
-
-4. **A request times out while its work continues.**
+3. **A request times out while its work continues.**
    The timeout counts from creation, also while a Job or sidecar works.
    Result: a large first snapshot always fails, and a restore can finish
    after its request shows "Failed".
    Fix: time out only waiting requests; limit running work by the Job
    deadline and a heartbeat.
 
-### Availability
-
-5. **The webhook certificate is not renewed while the controller runs.**
-   The renewal reads the webhook configuration through a cache that it
-   has no permission to fill.
-   Result: renewal waits forever. After about 335 days, all labeled Pods
-   are refused.
-   Fix: read the configuration directly from the API server.
-
 ### Security and documentation
 
-6. **A user who can edit a SnapshotRepository holds the admin credential.**
+4. **A user who can edit a SnapshotRepository holds the admin credential.**
    That user can select the `static` provider, set Job images and volumes,
    and point STS or Azure endpoints to any URL.
    Fix: document this as an administrator right, or move these fields to a
    cluster-scoped object.
 
-7. **Smaller items.**
+5. **Smaller items.**
    - With the default settings, credentials are never reused (the README
      says they are).
    - Kopia excludes every folder named `.wsnap` or `lost+found`, not only

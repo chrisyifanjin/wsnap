@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -134,5 +135,45 @@ func TestRotationKeepsBothCAs(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(d2, "tls.crt")); !bytes.Equal(got, newCert) {
 		t.Error("replica 2 did not pick up the renewed certificate")
+	}
+}
+
+type noWebhookCache struct{ client.Client }
+
+func (c noWebhookCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*admissionv1.MutatingWebhookConfiguration); ok {
+		return errors.New("webhook configuration is not in the manager cache")
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func TestPeriodicRenewalBypassesManagerCache(t *testing.T) {
+	c := certEnv(t)
+	s := setupFor(c, t.TempDir())
+	if err := s.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var secret corev1.Secret
+	key := client.ObjectKey{Namespace: s.Namespace, Name: s.SecretName}
+	if err := c.Get(context.Background(), key, &secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data["tls.crt"] = []byte("expiring")
+	if err := c.Update(context.Background(), &secret); err != nil {
+		t.Fatal(err)
+	}
+
+	// The periodic path uses a cached write client, but live reads must
+	// bypass it. A cache miss must not stop certificate renewal.
+	s.Client = noWebhookCache{c}
+	s.Reader = c
+	if err := s.Ensure(context.Background()); err != nil {
+		t.Fatalf("renewal depended on the manager cache: %v", err)
+	}
+	if err := c.Get(context.Background(), key, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if expiresSoon(secret.Data["tls.crt"]) {
+		t.Error("certificate was not renewed")
 	}
 }

@@ -58,10 +58,13 @@ Read [docs/architecture.md](docs/architecture.md) for the full design.
 ## Quick start
 
 ```sh
+make images
+# Make both images available to cluster nodes (for kind, use kind load docker-image).
 kubectl apply -k config/default
 kubectl create secret generic wsnap-creds \
   --from-literal=WSNAP_MASTER_KEY="$(openssl rand -hex 32)" \
   --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...
+# Set the bucket, endpoint, region and STS role in the sample for your store.
 kubectl apply -f config/samples/repository-s3-sts.yaml
 ```
 

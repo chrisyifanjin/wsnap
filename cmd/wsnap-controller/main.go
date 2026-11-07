@@ -189,7 +189,7 @@ func main() {
 	// The broker serves on every replica; it does not need the leader lock.
 	must(mgr.Add(brokerRunnable{addr: *brokerAddr, handler: srv.Handler(), tls: tlsConfig}))
 	if *manageCerts {
-		certs := webhook.CertSetup{Client: mgr.GetClient(), Namespace: *namespace, SecretName: "wsnap-webhook-cert",
+		certs := webhook.CertSetup{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Namespace: *namespace, SecretName: "wsnap-webhook-cert",
 			ServiceName: "wsnap-webhook", WebhookName: "wsnap", CertDir: *webhookDir}
 		// Renew while running, on every replica (see CertSetup.Ensure).
 		must(mgr.Add(allReplicas(func(ctx context.Context) error {

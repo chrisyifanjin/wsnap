@@ -28,7 +28,10 @@ import (
 // wins; the others read it. Production clusters may use cert-manager
 // instead and skip this.
 type CertSetup struct {
-	Client      client.Client
+	Client client.Client
+	// Reader bypasses the manager cache for webhook configurations, which
+	// are not watched by a controller. Nil uses Client (startup and tests).
+	Reader      client.Reader
 	Namespace   string
 	SecretName  string
 	ServiceName string
@@ -49,9 +52,13 @@ const (
 // the others pick it up on their next run. The webhook server reloads the
 // files when they change.
 func (c CertSetup) Ensure(ctx context.Context) error {
+	reader := c.Reader
+	if reader == nil {
+		reader = c.Client
+	}
 	var secret corev1.Secret
 	key := client.ObjectKey{Namespace: c.Namespace, Name: c.SecretName}
-	err := c.Client.Get(ctx, key, &secret)
+	err := reader.Get(ctx, key, &secret)
 	if apierrors.IsNotFound(err) || (err == nil && expiresSoon(secret.Data["tls.crt"])) {
 		data, gerr := c.generate()
 		if gerr != nil {
@@ -64,7 +71,7 @@ func (c CertSetup) Ensure(ctx context.Context) error {
 					return err
 				}
 				// Another replica won; use its certificate.
-				if err := c.Client.Get(ctx, key, &secret); err != nil {
+				if err := reader.Get(ctx, key, &secret); err != nil {
 					return err
 				}
 			}
@@ -90,7 +97,7 @@ func (c CertSetup) Ensure(ctx context.Context) error {
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cfg admissionv1.MutatingWebhookConfiguration
-		if err := c.Client.Get(ctx, client.ObjectKey{Name: c.WebhookName}, &cfg); err != nil {
+		if err := reader.Get(ctx, client.ObjectKey{Name: c.WebhookName}, &cfg); err != nil {
 			return err
 		}
 		bundle := append(append([]byte{}, secret.Data["ca.crt"]...), secret.Data["ca-prev.crt"]...)

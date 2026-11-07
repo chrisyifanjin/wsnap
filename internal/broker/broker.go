@@ -606,6 +606,9 @@ func (s *Server) report(r *http.Request) error {
 		// A restore report arrives after the workload may have started.
 		return err
 	}
+	if err := s.authorizeReport(ctx, c, &rep); err != nil {
+		return err
+	}
 	podRef := &wsnapv1.PodRef{Name: c.pod.Name, UID: string(c.pod.UID)}
 	now := metav1.Now()
 	switch {
@@ -679,6 +682,38 @@ func (s *Server) report(r *http.Request) error {
 		})
 	}
 	return fail(http.StatusBadRequest, "unknown operation %q", rep.Operation)
+}
+
+// authorizeReport fences stale Pods before they can change workspace or
+// request status. A request result must also come from its actual claimant.
+func (s *Server) authorizeReport(ctx context.Context, c *caller, rep *protocol.Report) error {
+	if c.job == "" {
+		var ws wsnapv1.Workspace
+		if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: c.id.Name}, &ws); err != nil {
+			return fail(http.StatusForbidden, "workspace %s: %v", c.id.Name, err)
+		}
+		if ws.Status.WriterPod == nil || ws.Status.WriterPod.UID != string(c.pod.UID) {
+			return fail(http.StatusForbidden, "pod %s is not the workspace writer", c.pod.Name)
+		}
+	}
+	if rep.Request == "" {
+		return nil
+	}
+	obj, st, wsName, err := s.requestObject(ctx, c.id.Namespace, rep.Request, rep.Operation == protocol.OpRestore)
+	if err != nil {
+		return fail(http.StatusForbidden, "request %s: %v", rep.Request, err)
+	}
+	if wsName != c.id.Name || st.Phase != wsnapv1.SnapshotRunning {
+		return fail(http.StatusForbidden, "request %s is not running for workspace %s", rep.Request, c.id.Name)
+	}
+	if c.job == "" {
+		if st.ClaimedBy != string(c.pod.UID) {
+			return fail(http.StatusForbidden, "request %s is claimed by another pod", rep.Request)
+		}
+	} else if c.jobObj.Annotations[wsnapv1.AnnotationRequest] != obj.GetName() {
+		return fail(http.StatusForbidden, "job %s does not serve request %s", c.jobObj.Name, rep.Request)
+	}
+	return nil
 }
 
 func operationMatchesRole(op protocol.Operation, role protocol.Role) bool {
