@@ -1,0 +1,86 @@
+# Test-only S3 store. MinIO's AssumeRole rejects the root user, so the setup
+# Job creates a "broker" user for wsnap's admin credential.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: storage
+---
+# A PVC, so the chaos scenario can stop MinIO without losing repositories.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: storage
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 2Gi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: storage
+spec:
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: minio}
+  template:
+    metadata:
+      labels: {app: minio}
+    spec:
+      containers:
+      - name: minio
+        image: cgr.dev/chainguard/minio:latest
+        imagePullPolicy: IfNotPresent
+        args: [server, /data]
+        env:
+        - {name: MINIO_ROOT_USER, value: minioadmin}
+        - {name: MINIO_ROOT_PASSWORD, value: minioadmin123}
+        ports: [{containerPort: 9000}]
+        readinessProbe:
+          httpGet: {path: /minio/health/ready, port: 9000}
+        volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+      - name: data
+        persistentVolumeClaim: {claimName: minio-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: storage
+spec:
+  selector: {app: minio}
+  ports: [{port: 9000}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-setup
+  namespace: storage
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      # The mc image has no shell, so each step is its own init container
+      # sharing the mc config directory.
+      initContainers:
+      - name: alias
+        image: cgr.dev/chainguard/minio-client:latest
+        args: [--config-dir, /cfg, alias, set, local, http://minio.storage.svc:9000, minioadmin, minioadmin123]
+        volumeMounts: [{name: cfg, mountPath: /cfg}]
+      - name: bucket
+        image: cgr.dev/chainguard/minio-client:latest
+        args: [--config-dir, /cfg, mb, --ignore-existing, local/wsnap]
+        volumeMounts: [{name: cfg, mountPath: /cfg}]
+      - name: user
+        image: cgr.dev/chainguard/minio-client:latest
+        args: [--config-dir, /cfg, admin, user, add, local, broker, brokersecret123]
+        volumeMounts: [{name: cfg, mountPath: /cfg}]
+      containers:
+      - name: policy
+        image: cgr.dev/chainguard/minio-client:latest
+        args: [--config-dir, /cfg, admin, policy, attach, local, readwrite, --user, broker]
+        volumeMounts: [{name: cfg, mountPath: /cfg}]
+      volumes:
+      - name: cfg
+        emptyDir: {}

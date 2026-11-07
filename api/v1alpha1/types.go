@@ -1,0 +1,517 @@
+package v1alpha1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// Labels and annotations that connect a workload to wsnap. They go on the
+// Pod, usually through the pod template of whatever creates it.
+const (
+	// LabelWorkspace names the workspace a Pod belongs to. Pods that carry
+	// it get credentials from the broker. The value must be a DNS-1123
+	// label because it also names the Workspace object.
+	LabelWorkspace = "wsnap.dev/workspace"
+	// LabelRepository names the SnapshotRepository in the Pod's namespace.
+	LabelRepository = "wsnap.dev/repository"
+	// AnnotationVolume names the Pod volume that holds the workspace data.
+	// It defaults to "workspace".
+	AnnotationVolume = "wsnap.dev/volume"
+	// AnnotationSidecar names the container that runs the wsnap agent. It
+	// defaults to "wsnap". The broker treats every other container as
+	// workload when it decides whether the restore role is still allowed.
+	AnnotationSidecar = "wsnap.dev/sidecar"
+
+	// LabelJob marks Jobs the controller creates, and their Pods. The value
+	// is mover or maintenance.
+	LabelJob = "wsnap.dev/job"
+	// LabelJobWorkspace names the workspace of a controller-created Job.
+	// Jobs do not carry LabelWorkspace, which marks workload Pods.
+	LabelJobWorkspace = "wsnap.dev/job-workspace"
+	// LabelManagedBy marks objects the controller owns.
+	LabelManagedBy = "app.kubernetes.io/managed-by"
+	// ManagedByValue is the LabelManagedBy value of wsnap-owned objects.
+	ManagedByValue = "wsnap"
+	// LabelProtected marks PersistentVolumes whose reclaim policy wsnap
+	// switched to Retain.
+	LabelProtected = "wsnap.dev/protected"
+	// AnnotationWorkspaceRef on a protected PV is "<namespace>/<workspace>".
+	AnnotationWorkspaceRef = "wsnap.dev/workspace-ref"
+	// AnnotationOriginalReclaimPolicy on a protected PV records the policy
+	// to restore once the volume's data is safe.
+	AnnotationOriginalReclaimPolicy = "wsnap.dev/original-reclaim-policy"
+	// AnnotationRescue on a protected PV tracks the rescue of a released
+	// volume. See RescuePhase.
+	AnnotationRescue = "wsnap.dev/rescue"
+	// AnnotationVolumeName on a mover Job names the PV it snapshots.
+	AnnotationVolumeName = "wsnap.dev/volume-name"
+	// AnnotationRequest on a mover Job names the WorkspaceSnapshot it
+	// serves.
+	AnnotationRequest = "wsnap.dev/request"
+
+	// DefaultVolumeName is the default of AnnotationVolume.
+	DefaultVolumeName = "workspace"
+	// DefaultSidecarName is the default of AnnotationSidecar.
+	DefaultSidecarName = "wsnap"
+)
+
+// EngineSpec selects the snapshot technology.
+type EngineSpec struct {
+	// type is the snapshot technology.
+	// +kubebuilder:validation:Enum=kopia;restic;exec
+	Type string `json:"type"`
+	// command is the exec engine command. The agent appends the verb (init,
+	// snapshot, latest, restore, maintain). The command must exist in the
+	// agent image.
+	// +optional
+	Command []string `json:"command,omitempty"`
+}
+
+// S3Backend is any S3-compatible store: AWS S3, MinIO, Ceph RGW,
+// Cloudflare R2, Wasabi, Backblaze B2, or GCS through its XML API.
+type S3Backend struct {
+	// endpoint is host[:port] without a scheme.
+	// +kubebuilder:default="s3.amazonaws.com"
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+	Bucket   string `json:"bucket"`
+	// prefix is prepended to every workspace path.
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+	// +optional
+	Region string `json:"region,omitempty"`
+	// insecure uses plain HTTP. Use it only for local test stores.
+	// +optional
+	Insecure bool `json:"insecure,omitempty"`
+}
+
+// GCSBackend is Google Cloud Storage through its native API.
+type GCSBackend struct {
+	Bucket string `json:"bucket"`
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+}
+
+// AzureBackend is Azure Blob Storage.
+type AzureBackend struct {
+	Account string `json:"account"`
+	// container holds all workspaces with the static provider. With the
+	// azure-sas provider it is the name prefix of one container per
+	// workspace.
+	Container string `json:"container"`
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+	// endpointSuffix defaults to core.windows.net.
+	// +optional
+	EndpointSuffix string `json:"endpointSuffix,omitempty"`
+	// accessTier for new blobs (restic only). Empty uses the account
+	// default.
+	// +kubebuilder:validation:Enum=Hot;Cool;Cold
+	// +optional
+	AccessTier string `json:"accessTier,omitempty"`
+}
+
+// FilesystemBackend is a directory mounted into the agent, for example an
+// NFS export. Every agent that mounts it can reach every workspace below
+// it, so it offers no isolation between workspaces. Use it for development
+// or single-tenant clusters; use object storage with a scoped credential
+// provider otherwise.
+type FilesystemBackend struct {
+	// path is the mount path inside the agent container.
+	Path string `json:"path"`
+}
+
+// BackendSpec is where repositories live. Set exactly one field.
+// +kubebuilder:validation:XValidation:rule="[has(self.s3), has(self.gcs), has(self.azure), has(self.filesystem)].filter(x, x).size() == 1",message="set exactly one of s3, gcs, azure, filesystem"
+type BackendSpec struct {
+	// +optional
+	S3 *S3Backend `json:"s3,omitempty"`
+	// +optional
+	GCS *GCSBackend `json:"gcs,omitempty"`
+	// +optional
+	Azure *AzureBackend `json:"azure,omitempty"`
+	// +optional
+	Filesystem *FilesystemBackend `json:"filesystem,omitempty"`
+}
+
+// STSSpec configures the s3-sts provider.
+type STSSpec struct {
+	// endpoint is the STS URL with scheme. Empty means AWS STS. For MinIO
+	// and Ceph RGW use the S3 endpoint URL.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+	// roleARN is required on AWS and ignored by MinIO.
+	// +optional
+	RoleARN string `json:"roleARN,omitempty"`
+	// +optional
+	Region string `json:"region,omitempty"`
+}
+
+// AzureSASSpec configures the azure-sas provider.
+type AzureSASSpec struct {
+	// serviceURL overrides https://<account>.blob.<endpointSuffix>/ for the
+	// broker, for example to reach the Azurite emulator.
+	// +optional
+	ServiceURL string `json:"serviceURL,omitempty"`
+}
+
+// CredentialsSpec says how agents get credentials.
+type CredentialsSpec struct {
+	// secretName is a Secret in the repository's namespace. Only the
+	// controller reads it. Keys: WSNAP_MASTER_KEY (required, at least 16
+	// bytes), plus AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY,
+	// GOOGLE_CREDENTIALS_JSON, or AZURE_ACCOUNT_KEY for the backend.
+	SecretName string `json:"secretName"`
+	// provider turns the admin credential into a per-workspace, per-role
+	// credential. static hands out the admin credential unchanged.
+	// +kubebuilder:validation:Enum=static;s3-sts;gcs-downscoped;azure-sas
+	// +kubebuilder:default=static
+	// +optional
+	Provider string `json:"provider,omitempty"`
+	// +optional
+	STS *STSSpec `json:"sts,omitempty"`
+	// +optional
+	AzureSAS *AzureSASSpec `json:"azureSAS,omitempty"`
+	// ttl is the lifetime of issued credentials. AWS STS enforces a
+	// minimum of 15 minutes.
+	// +kubebuilder:default="1h"
+	// +optional
+	TTL metav1.Duration `json:"ttl,omitempty"`
+}
+
+// ScheduleSpec controls periodic snapshots.
+type ScheduleSpec struct {
+	// interval between snapshots taken by the sidecar. The sidecar skips
+	// a snapshot when nothing changed, so a short interval costs only a
+	// directory scan for idle workspaces.
+	// +kubebuilder:default="15m"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('10s')",message="interval must be at least 10s"
+	// +optional
+	Interval metav1.Duration `json:"interval,omitempty"`
+}
+
+// RetentionSpec controls maintenance.
+type RetentionSpec struct {
+	// keepLast is the number of snapshots maintenance keeps.
+	// +kubebuilder:default=10
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	KeepLast int32 `json:"keepLast,omitempty"`
+	// maintenanceEvery runs a maintenance Job after this many snapshots.
+	// 0 disables maintenance.
+	// +kubebuilder:default=20
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MaintenanceEvery int32 `json:"maintenanceEvery,omitempty"`
+}
+
+// JobsSpec configures the Jobs the controller creates.
+type JobsSpec struct {
+	// image runs the wsnap agent with the engine CLIs. Defaults to the
+	// controller's --agent-image.
+	// +optional
+	Image string `json:"image,omitempty"`
+	// volumes are added to Job Pods, for example the NFS export of a
+	// filesystem backend.
+	// +optional
+	Volumes []corev1.Volume `json:"volumes,omitempty"`
+	// volumeMounts are added to the agent container of Job Pods.
+	// +optional
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+	// securityContext of Job Pods. A mover must be able to read every file
+	// in the workspace volume.
+	// +optional
+	SecurityContext *corev1.PodSecurityContext `json:"securityContext,omitempty"`
+}
+
+// SnapshotRepositorySpec defines where and how workspaces are snapshotted.
+type SnapshotRepositorySpec struct {
+	Engine      EngineSpec      `json:"engine"`
+	Backend     BackendSpec     `json:"backend"`
+	Credentials CredentialsSpec `json:"credentials"`
+	// +optional
+	Schedule ScheduleSpec `json:"schedule,omitempty"`
+	// +optional
+	Retention RetentionSpec `json:"retention,omitempty"`
+	// +optional
+	Jobs JobsSpec `json:"jobs,omitempty"`
+}
+
+// SnapshotRepositoryStatus is the observed state of a SnapshotRepository.
+type SnapshotRepositoryStatus struct {
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// conditions: Ready, CredentialsScoped.
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// SnapshotRepository is a snapshot technology, a storage backend and a
+// credential policy. Every workspace gets its own repository below the
+// backend path, encrypted with its own password.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=snaprepo
+// +kubebuilder:printcolumn:name="Engine",type=string,JSONPath=`.spec.engine.type`
+// +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.spec.credentials.provider`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+type SnapshotRepository struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              SnapshotRepositorySpec   `json:"spec"`
+	Status            SnapshotRepositoryStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// SnapshotRepositoryList is a list of SnapshotRepository.
+type SnapshotRepositoryList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []SnapshotRepository `json:"items"`
+}
+
+// RestoreSource selects what the next restore of an empty volume uses
+// instead of this workspace's latest snapshot.
+type RestoreSource struct {
+	// workspaceName forks from another workspace in the same namespace.
+	// Empty means this workspace, e.g. to roll back to snapshotID.
+	// +optional
+	WorkspaceName string `json:"workspaceName,omitempty"`
+	// snapshotID pins a snapshot. Empty means the source's latest.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+}
+
+// WorkspaceSpec is the durable identity of a workspace.
+type WorkspaceSpec struct {
+	// repositoryName is the SnapshotRepository holding this workspace.
+	RepositoryName string `json:"repositoryName"`
+	// restoreFrom applies to the next restore after it is set or changed,
+	// and only once: status.restoreFromGeneration records that it was used.
+	// Create a Workspace with restoreFrom before its first Pod to fork.
+	// +optional
+	RestoreFrom *RestoreSource `json:"restoreFrom,omitempty"`
+}
+
+// VolumeRef is the volume currently holding a workspace's data.
+type VolumeRef struct {
+	// claimName is empty for emptyDir workspaces.
+	// +optional
+	ClaimName string `json:"claimName,omitempty"`
+	// volumeName is the bound PersistentVolume.
+	// +optional
+	VolumeName string `json:"volumeName,omitempty"`
+	// kind is persistentVolumeClaim, ephemeral or emptyDir.
+	Kind string `json:"kind"`
+}
+
+// PodRef identifies one Pod incarnation.
+type PodRef struct {
+	Name string `json:"name"`
+	UID  string `json:"uid"`
+}
+
+// SnapshotRecord describes one snapshot.
+type SnapshotRecord struct {
+	ID   string      `json:"id"`
+	Time metav1.Time `json:"time"`
+	// executor is sidecar or mover.
+	Executor string `json:"executor"`
+	// +optional
+	Pod *PodRef `json:"pod,omitempty"`
+	// volumeName is the PV a mover snapshotted.
+	// +optional
+	VolumeName string `json:"volumeName,omitempty"`
+	// final is true for the last snapshot of a Pod's life.
+	// +optional
+	Final bool `json:"final,omitempty"`
+}
+
+// RestoreRecord describes the last restore.
+type RestoreRecord struct {
+	// snapshotID is empty when the repository had no snapshot yet.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+	// sourceWorkspace is set when the restore came from another workspace.
+	// +optional
+	SourceWorkspace string      `json:"sourceWorkspace,omitempty"`
+	Time            metav1.Time `json:"time"`
+	Pod             PodRef      `json:"pod"`
+}
+
+// WorkspaceStatus is what wsnap knows about a workspace.
+type WorkspaceStatus struct {
+	// +optional
+	Volume *VolumeRef `json:"volume,omitempty"`
+	// writerPod is the last Pod that received a writing credential. The
+	// controller releases a protected volume only after a final snapshot
+	// from this Pod (or from a mover).
+	// +optional
+	WriterPod *PodRef `json:"writerPod,omitempty"`
+	// +optional
+	LastSnapshot *SnapshotRecord `json:"lastSnapshot,omitempty"`
+	// +optional
+	LastRestore *RestoreRecord `json:"lastRestore,omitempty"`
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+	// +optional
+	SnapshotsSinceMaintenance int32 `json:"snapshotsSinceMaintenance,omitempty"`
+	// +optional
+	LastMaintenance *metav1.Time `json:"lastMaintenance,omitempty"`
+	// restoreFromGeneration is the metadata.generation whose restoreFrom
+	// a restore already used.
+	// +optional
+	RestoreFromGeneration int64 `json:"restoreFromGeneration,omitempty"`
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// Workspace is the durable record of one workspace. It outlives the Pods
+// and volumes that hold the workspace at any moment. The controller creates
+// it the first time it sees a Pod with the wsnap.dev/workspace label.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=ws
+// +kubebuilder:printcolumn:name="Repository",type=string,JSONPath=`.spec.repositoryName`
+// +kubebuilder:printcolumn:name="Volume",type=string,JSONPath=`.status.volume.kind`
+// +kubebuilder:printcolumn:name="Last snapshot",type=date,JSONPath=`.status.lastSnapshot.time`
+// +kubebuilder:printcolumn:name="Executor",type=string,JSONPath=`.status.lastSnapshot.executor`
+type Workspace struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              WorkspaceSpec   `json:"spec"`
+	Status            WorkspaceStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// WorkspaceList is a list of Workspace.
+type WorkspaceList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []Workspace `json:"items"`
+}
+
+// WorkspaceSnapshotSpec requests one snapshot.
+type WorkspaceSnapshotSpec struct {
+	// workspaceName in the same namespace.
+	WorkspaceName string `json:"workspaceName"`
+}
+
+// Snapshot request phases.
+const (
+	SnapshotPending   = "Pending"
+	SnapshotRunning   = "Running"
+	SnapshotSucceeded = "Succeeded"
+	SnapshotFailed    = "Failed"
+)
+
+// WorkspaceSnapshotStatus is the outcome of a snapshot request.
+type WorkspaceSnapshotStatus struct {
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// claimedBy is the UID of the Pod (sidecar or Job) serving the request.
+	// +optional
+	ClaimedBy string `json:"claimedBy,omitempty"`
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+	// executor is sidecar (a Pod was running) or mover (the volume was idle).
+	// +optional
+	Executor string `json:"executor,omitempty"`
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// WorkspaceSnapshot asks for a snapshot now, from any client: a platform
+// API, an SDK, kubectl or a scheduler. A running Pod's sidecar takes it; if
+// no Pod runs and the workspace volume is a PVC, a mover Job takes it.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=wssnap
+// +kubebuilder:printcolumn:name="Workspace",type=string,JSONPath=`.spec.workspaceName`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Snapshot",type=string,JSONPath=`.status.snapshotID`
+// +kubebuilder:printcolumn:name="Executor",type=string,JSONPath=`.status.executor`
+type WorkspaceSnapshot struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              WorkspaceSnapshotSpec   `json:"spec"`
+	Status            WorkspaceSnapshotStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// WorkspaceSnapshotList is a list of WorkspaceSnapshot.
+type WorkspaceSnapshotList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []WorkspaceSnapshot `json:"items"`
+}
+
+// WorkspaceRestoreSpec requests a restore of a workspace's current volume.
+type WorkspaceRestoreSpec struct {
+	// workspaceName in the same namespace.
+	WorkspaceName string `json:"workspaceName"`
+	// snapshotID to restore. Empty means the source's latest snapshot.
+	// +optional
+	SnapshotID string `json:"snapshotID,omitempty"`
+	// sourceWorkspace restores another workspace's snapshot into this one.
+	// Empty means this workspace (a rollback).
+	// +optional
+	SourceWorkspace string `json:"sourceWorkspace,omitempty"`
+}
+
+// WorkspaceRestore replaces the contents of a workspace's volume with a
+// snapshot, from any client. A running writer Pod's sidecar restores in
+// place (pausing the agent first if the quiesce handshake is enabled); an
+// idle PVC is restored by a Job. Afterwards the restored state is
+// snapshotted, so "latest" matches the volume. The status reuses
+// WorkspaceSnapshotStatus; snapshotID is the snapshot that was restored.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=wsrestore
+// +kubebuilder:printcolumn:name="Workspace",type=string,JSONPath=`.spec.workspaceName`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Snapshot",type=string,JSONPath=`.status.snapshotID`
+// +kubebuilder:printcolumn:name="Executor",type=string,JSONPath=`.status.executor`
+type WorkspaceRestore struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              WorkspaceRestoreSpec    `json:"spec"`
+	Status            WorkspaceSnapshotStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// WorkspaceRestoreList is a list of WorkspaceRestore.
+type WorkspaceRestoreList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []WorkspaceRestore `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&WorkspaceRestore{}, &WorkspaceRestoreList{})
+	SchemeBuilder.Register(&SnapshotRepository{}, &SnapshotRepositoryList{}, &Workspace{}, &WorkspaceList{},
+		&WorkspaceSnapshot{}, &WorkspaceSnapshotList{})
+}
+
+// Request is implemented by WorkspaceSnapshot and WorkspaceRestore, which
+// share routing and status handling.
+// +kubebuilder:object:generate=false
+type Request interface {
+	GetWorkspaceName() string
+	GetRequestStatus() *WorkspaceSnapshotStatus
+}
+
+func (r *WorkspaceSnapshot) GetWorkspaceName() string                   { return r.Spec.WorkspaceName }
+func (r *WorkspaceSnapshot) GetRequestStatus() *WorkspaceSnapshotStatus { return &r.Status }
+func (r *WorkspaceRestore) GetWorkspaceName() string                    { return r.Spec.WorkspaceName }
+func (r *WorkspaceRestore) GetRequestStatus() *WorkspaceSnapshotStatus  { return &r.Status }

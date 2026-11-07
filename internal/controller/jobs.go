@@ -1,0 +1,123 @@
+package controller
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
+	wsnapv1 "github.com/chrisyifanjin/wsnap/api/v1alpha1"
+	"github.com/chrisyifanjin/wsnap/internal/webhook"
+)
+
+// JobConfig holds what every controller-created Job needs.
+type JobConfig struct {
+	// AgentImage is the default agent image.
+	AgentImage string
+	// BrokerURL is how agents reach the broker.
+	BrokerURL string
+	// Audience of the projected service account token.
+	Audience string
+	// CAConfigMap names a ConfigMap (key ca.crt) in each workload namespace
+	// that holds the CA of the broker's TLS certificate. Empty for a plain
+	// HTTP broker. trust-manager can keep it in sync across namespaces.
+	CAConfigMap string
+}
+
+const (
+	tokenMountPath = "/var/run/secrets/wsnap"
+	dataMountPath  = "/workspace"
+	stateMountPath = "/var/lib/wsnap"
+	// tokenExpiry is the projected token lifetime. Kubernetes refreshes the
+	// file before it expires; 600 seconds is the minimum it accepts.
+	tokenExpiry = 600
+	// jobDeadline stops a Job that cannot finish, for example a mover whose
+	// node-local PV sits on a dead node. The rescue then shows as failed
+	// instead of running forever.
+	jobDeadline = 2 * 60 * 60
+)
+
+// shortHash keeps generated names within the 63-character limit.
+func shortHash(parts ...string) string {
+	h := sha256.New()
+	for _, p := range parts {
+		h.Write([]byte(p))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:10]
+}
+
+// newAgentJob builds a Job that runs the agent once. kind is mover or
+// maintenance.
+func (c JobConfig) newAgentJob(kind string, name string, ws *wsnapv1.Workspace, repo *wsnapv1.SnapshotRepository, args []string, extraVolumes []corev1.Volume, extraMounts []corev1.VolumeMount) *batchv1.Job {
+	image := repo.Spec.Jobs.Image
+	if image == "" {
+		image = c.AgentImage
+	}
+	labels := map[string]string{
+		wsnapv1.LabelManagedBy:    wsnapv1.ManagedByValue,
+		wsnapv1.LabelJob:          kind,
+		wsnapv1.LabelJobWorkspace: ws.Name,
+		wsnapv1.LabelRepository:   ws.Spec.RepositoryName,
+	}
+	volumes := append([]corev1.Volume{
+		{Name: "wsnap-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience: c.Audience, ExpirationSeconds: ptr.To[int64](tokenExpiry), Path: "token",
+			}}},
+		}}},
+		{Name: "wsnap-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+	}, extraVolumes...)
+	volumes = append(volumes, repo.Spec.Jobs.Volumes...)
+	mounts := append([]corev1.VolumeMount{
+		{Name: "wsnap-token", MountPath: tokenMountPath, ReadOnly: true},
+		{Name: "wsnap-state", MountPath: stateMountPath},
+	}, extraMounts...)
+	mounts = append(mounts, repo.Spec.Jobs.VolumeMounts...)
+	if c.CAConfigMap != "" {
+		volumes = append(volumes, corev1.Volume{Name: "wsnap-ca", VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: c.CAConfigMap}}}})
+		mounts = append(mounts, corev1.VolumeMount{Name: "wsnap-ca", MountPath: "/var/run/wsnap-ca", ReadOnly: true})
+		args = append(args, "--ca-file=/var/run/wsnap-ca/ca.crt")
+	}
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ws.Namespace, Name: name, Labels: labels},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            ptr.To[int32](3),
+			ActiveDeadlineSeconds:   ptr.To[int64](jobDeadline),
+			TTLSecondsAfterFinished: ptr.To[int32](3600),
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					// The agent authenticates with the projected token only.
+					AutomountServiceAccountToken: ptr.To(false),
+					SecurityContext:              repo.Spec.Jobs.SecurityContext,
+					Volumes:                      volumes,
+					Containers: []corev1.Container{{
+						Name:            wsnapv1.DefaultSidecarName,
+						Image:           image,
+						Args:            append(args, "--broker-url="+c.BrokerURL, "--token-file="+tokenMountPath+"/token", "--state-dir="+stateMountPath),
+						VolumeMounts:    mounts,
+						SecurityContext: webhook.AgentSecurityContext(),
+					}},
+				},
+			},
+		},
+	}
+}
+
+// moverJobName is stable per PV, so a restarted controller finds the Job it
+// already created.
+func moverJobName(pvName string) string { return "wsnap-mover-" + shortHash(pvName) }
+
+// rescueClaimName is stable per PV for the same reason.
+func rescueClaimName(pvName string) string { return "wsnap-rescue-" + shortHash(pvName) }
+
+func maintenanceJobName(ws *wsnapv1.Workspace) string {
+	return fmt.Sprintf("wsnap-maint-%s", shortHash(ws.Namespace, ws.Name, ws.Status.LastSnapshot.ID))
+}

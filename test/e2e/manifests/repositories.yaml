@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wsnap-creds
+  namespace: e2e
+stringData:
+  WSNAP_MASTER_KEY: e2e-master-key-0123456789
+  AWS_ACCESS_KEY_ID: broker
+  AWS_SECRET_ACCESS_KEY: brokersecret123
+---
+apiVersion: wsnap.dev/v1alpha1
+kind: SnapshotRepository
+metadata:
+  name: kopia-s3
+  namespace: e2e
+spec:
+  engine: {type: kopia}
+  backend:
+    s3: {endpoint: minio.storage.svc:9000, bucket: wsnap, prefix: kopia, insecure: true}
+  credentials: {secretName: wsnap-creds, provider: s3-sts}
+  schedule: {interval: 20s}
+  retention: {keepLast: 2, maintenanceEvery: 3}
+---
+# Long retention: the requests scenario rolls back to and forks from early
+# snapshots, which kopia-s3's keepLast 2 would prune.
+apiVersion: wsnap.dev/v1alpha1
+kind: SnapshotRepository
+metadata:
+  name: kopia-keep
+  namespace: e2e
+spec:
+  engine: {type: kopia}
+  backend:
+    s3: {endpoint: minio.storage.svc:9000, bucket: wsnap, prefix: kopia-keep, insecure: true}
+  credentials: {secretName: wsnap-creds, provider: s3-sts}
+  schedule: {interval: 20s}
+  retention: {keepLast: 50, maintenanceEvery: 0}
+---
+apiVersion: wsnap.dev/v1alpha1
+kind: SnapshotRepository
+metadata:
+  name: restic-s3
+  namespace: e2e
+spec:
+  engine: {type: restic}
+  backend:
+    s3: {endpoint: minio.storage.svc:9000, bucket: wsnap, prefix: restic, insecure: true}
+  credentials: {secretName: wsnap-creds, provider: s3-sts}
+  schedule: {interval: 20s}
+  retention: {keepLast: 2, maintenanceEvery: 3}
+---
+# The exec engine with the example tar script, a filesystem backend on the
+# node, and the static provider.
+apiVersion: wsnap.dev/v1alpha1
+kind: SnapshotRepository
+metadata:
+  name: tar-fs
+  namespace: e2e
+spec:
+  engine: {type: exec, command: [/usr/local/bin/wsnap-tar-engine]}
+  backend:
+    filesystem: {path: /backend}
+  credentials: {secretName: wsnap-creds, provider: static}
+  schedule: {interval: 20s}
+  retention: {keepLast: 2, maintenanceEvery: 0}
+  jobs:
+    volumes:
+    - name: backend
+      hostPath: {path: /var/wsnap-backend, type: DirectoryOrCreate}
+    volumeMounts:
+    - {name: backend, mountPath: /backend}

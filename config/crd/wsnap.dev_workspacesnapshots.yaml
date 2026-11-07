@@ -1,0 +1,93 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: workspacesnapshots.wsnap.dev
+spec:
+  group: wsnap.dev
+  names:
+    kind: WorkspaceSnapshot
+    listKind: WorkspaceSnapshotList
+    plural: workspacesnapshots
+    shortNames:
+    - wssnap
+    singular: workspacesnapshot
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.workspaceName
+      name: Workspace
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.snapshotID
+      name: Snapshot
+      type: string
+    - jsonPath: .status.executor
+      name: Executor
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          WorkspaceSnapshot asks for a snapshot now, from any client: a platform
+          API, an SDK, kubectl or a scheduler. A running Pod's sidecar takes it; if
+          no Pod runs and the workspace volume is a PVC, a mover Job takes it.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WorkspaceSnapshotSpec requests one snapshot.
+            properties:
+              workspaceName:
+                description: workspaceName in the same namespace.
+                type: string
+            required:
+            - workspaceName
+            type: object
+          status:
+            description: WorkspaceSnapshotStatus is the outcome of a snapshot request.
+            properties:
+              claimedBy:
+                description: claimedBy is the UID of the Pod (sidecar or Job) serving
+                  the request.
+                type: string
+              completionTime:
+                format: date-time
+                type: string
+              executor:
+                description: executor is sidecar (a Pod was running) or mover (the
+                  volume was idle).
+                type: string
+              message:
+                type: string
+              phase:
+                type: string
+              snapshotID:
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

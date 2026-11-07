@@ -1,0 +1,37 @@
+# A Kopia repository on any S3-compatible store with per-workspace, per-role
+# STS credentials. For AWS, set credentials.sts.roleARN and leave the
+# endpoint at its default. For MinIO or Ceph RGW, the broker calls STS on the
+# S3 endpoint; the admin user must not be the MinIO root user.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wsnap-creds
+stringData:
+  WSNAP_MASTER_KEY: change-me-to-32-random-bytes-0000000
+  AWS_ACCESS_KEY_ID: broker
+  AWS_SECRET_ACCESS_KEY: change-me
+---
+apiVersion: wsnap.dev/v1alpha1
+kind: SnapshotRepository
+metadata:
+  name: default
+spec:
+  engine:
+    type: kopia            # or restic, or exec
+  backend:
+    s3:
+      endpoint: s3.amazonaws.com
+      bucket: my-workspaces
+      prefix: prod
+      region: us-east-1
+  credentials:
+    secretName: wsnap-creds
+    provider: s3-sts
+    sts:
+      roleARN: arn:aws:iam::123456789012:role/wsnap-workspaces
+    ttl: 1h
+  schedule:
+    interval: 15m
+  retention:
+    keepLast: 10
+    maintenanceEvery: 20

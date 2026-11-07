@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wsnap-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wsnap-controller
+  namespace: wsnap-system
+  labels:
+    app.kubernetes.io/name: wsnap-controller
+spec:
+  # Two replicas: the broker serves on both, the reconcilers run on the
+  # leader. A broker outage would fail final snapshots during shutdowns.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wsnap-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wsnap-controller
+    spec:
+      serviceAccountName: wsnap-controller
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: wsnap-controller
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: controller
+        image: wsnap-controller:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - --broker-addr=:8080
+        - --broker-url=http://wsnap-broker.wsnap-system.svc:8080
+        - --agent-image=wsnap-agent:dev
+        - --leader-elect
+        ports:
+        - name: broker
+          containerPort: 8080
+        - name: webhook
+          containerPort: 9443
+        volumeMounts:
+        - name: webhook-certs
+          mountPath: /tmp/wsnap-webhook
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: broker
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      volumes:
+      - name: webhook-certs
+        emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: wsnap-controller
+  namespace: wsnap-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wsnap-controller
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wsnap-broker
+  namespace: wsnap-system
+spec:
+  selector:
+    app.kubernetes.io/name: wsnap-controller
+  ports:
+  - name: broker
+    port: 8080
+    targetPort: broker
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wsnap-webhook
+  namespace: wsnap-system
+spec:
+  selector:
+    app.kubernetes.io/name: wsnap-controller
+  ports:
+  - name: webhook
+    port: 443
+    targetPort: webhook
+---
+# Fails closed: a Pod labeled wsnap.dev/workspace is either given a sidecar
+# or refused, and while the webhook is unreachable such Pods are not
+# admitted at all. Pods without the label never reach the webhook.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: wsnap
+webhooks:
+- name: pods.wsnap.dev
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Fail
+  reinvocationPolicy: IfNeeded
+  timeoutSeconds: 5
+  clientConfig:
+    service:
+      name: wsnap-webhook
+      namespace: wsnap-system
+      path: /mutate-pods
+  rules:
+  - operations: [CREATE]
+    apiGroups: [""]
+    apiVersions: [v1]
+    resources: [pods]
+  # kubectl debug adds ephemeral containers through this subresource.
+  - operations: [UPDATE]
+    apiGroups: [""]
+    apiVersions: [v1]
+    resources: [pods/ephemeralcontainers]
+  objectSelector:
+    matchExpressions:
+    - {key: wsnap.dev/workspace, operator: Exists}
+  namespaceSelector:
+    matchExpressions:
+    - {key: kubernetes.io/metadata.name, operator: NotIn, values: [kube-system, wsnap-system]}

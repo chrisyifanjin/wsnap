@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- wsnap.dev_snapshotrepositories.yaml
+- wsnap.dev_workspaces.yaml
+- wsnap.dev_workspacesnapshots.yaml
+- wsnap.dev_workspacerestores.yaml

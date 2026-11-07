@@ -1,0 +1,106 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: workspacerestores.wsnap.dev
+spec:
+  group: wsnap.dev
+  names:
+    kind: WorkspaceRestore
+    listKind: WorkspaceRestoreList
+    plural: workspacerestores
+    shortNames:
+    - wsrestore
+    singular: workspacerestore
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.workspaceName
+      name: Workspace
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.snapshotID
+      name: Snapshot
+      type: string
+    - jsonPath: .status.executor
+      name: Executor
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          WorkspaceRestore replaces the contents of a workspace's volume with a
+          snapshot, from any client. A running writer Pod's sidecar restores in
+          place (pausing the agent first if the quiesce handshake is enabled); an
+          idle PVC is restored by a Job. Afterwards the restored state is
+          snapshotted, so "latest" matches the volume. The status reuses
+          WorkspaceSnapshotStatus; snapshotID is the snapshot that was restored.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WorkspaceRestoreSpec requests a restore of a workspace's
+              current volume.
+            properties:
+              snapshotID:
+                description: snapshotID to restore. Empty means the source's latest
+                  snapshot.
+                type: string
+              sourceWorkspace:
+                description: |-
+                  sourceWorkspace restores another workspace's snapshot into this one.
+                  Empty means this workspace (a rollback).
+                type: string
+              workspaceName:
+                description: workspaceName in the same namespace.
+                type: string
+            required:
+            - workspaceName
+            type: object
+          status:
+            description: WorkspaceSnapshotStatus is the outcome of a snapshot request.
+            properties:
+              claimedBy:
+                description: claimedBy is the UID of the Pod (sidecar or Job) serving
+                  the request.
+                type: string
+              completionTime:
+                format: date-time
+                type: string
+              executor:
+                description: executor is sidecar (a Pod was running) or mover (the
+                  volume was idle).
+                type: string
+              message:
+                type: string
+              phase:
+                type: string
+              snapshotID:
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
