@@ -617,10 +617,12 @@ scenario_tls() {
 	broker_tls on
 	pass "broker restarted with TLS (certificate signed by a private CA)"
 
+	kubectl -n "$NS" delete pod tls-1 tls-bad tls-plain --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc tls-a --ignore-not-found --wait=true >/dev/null
 	fresh_workspace ws-tls
 	apply_pvc tls-a >/dev/null
 	WSNAP_TLS=trusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8080, --ca-file=/var/run/wsnap-ca/ca.crt" \
-		apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes >/dev/null
+		wait_for 60 "webhook admission after TLS rollout" apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes
 	wait_for 180 "tls-1 ready" pod_ready tls-1
 	write_file tls-1 /workspace/secret.txt over-tls
 	kubectl -n "$NS" delete pod tls-1 --wait=true >/dev/null
@@ -662,10 +664,13 @@ scenario_multinode() {
 	fi
 	local a=${nodes[0]} b=${nodes[1]}
 	log "multinode: workers $a and $b"
+	# A previous failed drain may leave its bare Pod and cordon behind.
+	kubectl uncordon "$a" >/dev/null
+	kubectl -n "$NS" delete pod drain-1 drain-2 --ignore-not-found --wait=true >/dev/null
 
 	fresh_workspace ws-mn
 	apply_pvc mn-a >/dev/null
-	NODE_SELECTOR=$a apply_pod mn-1 ws-mn restic-s3 pvc:mn-a yes >/dev/null
+	NODE_SELECTOR=$a wait_for 60 "webhook admission after TLS rollback" apply_pod mn-1 ws-mn restic-s3 pvc:mn-a yes
 	wait_for 180 "mn-1 ready on $a" pod_ready mn-1
 	write_file mn-1 /workspace/where.txt "written-on-$a"
 	kubectl -n "$NS" delete pod mn-1 --wait=true >/dev/null
@@ -695,7 +700,10 @@ scenario_multinode() {
 	NODE_SELECTOR=$a apply_pod drain-1 ws-drain restic-s3 ephemeral yes >/dev/null
 	wait_for 180 "drain-1 ready" pod_ready drain-1
 	write_file drain-1 /workspace/evicted.txt before-drain
-	kubectl drain "$a" --pod-selector=wsnap.dev/workspace=ws-drain --delete-emptydir-data --ignore-daemonsets --timeout=180s >/dev/null 2>&1 || true
+	if ! kubectl drain "$a" --pod-selector=wsnap.dev/workspace=ws-drain --delete-emptydir-data --ignore-daemonsets --force --timeout=180s >/dev/null; then
+		kubectl uncordon "$a" >/dev/null
+		die "could not drain $a"
+	fi
 	kubectl uncordon "$a" >/dev/null
 	wait_for 120 "drain-1 evicted" pod_gone drain-1
 	[[ $(ws_field ws-drain .status.lastSnapshot.final) == true ]] || die "eviction did not take a final snapshot"
