@@ -274,6 +274,14 @@ func KeepLast(repo *wsnapv1.SnapshotRepository) int {
 	return 10
 }
 
+// KeepDaily returns retention.keepDaily with its default (7).
+func KeepDaily(repo *wsnapv1.SnapshotRepository) int {
+	if n := repo.Spec.Retention.KeepDaily; n != nil {
+		return int(*n)
+	}
+	return 7
+}
+
 // TTL returns the credential lifetime with its default.
 func TTL(repo *wsnapv1.SnapshotRepository) time.Duration {
 	if d := repo.Spec.Credentials.TTL.Duration; d > 0 {

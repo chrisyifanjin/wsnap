@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"strings"
@@ -195,8 +196,22 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 		}
 		switch c.Type {
 		case batchv1.JobComplete:
+			// A Complete Job is not proof: its report could have been lost.
+			// Only the broker's final mark (set when it recorded the
+			// snapshot, or the mover's "nothing to save") lets the volume
+			// go. Read live: the mark lands moments before the Job ends.
+			var cur corev1.PersistentVolume
+			if err := r.Reader.Get(ctx, types.NamespacedName{Name: pv.Name}, &cur); err != nil {
+				return ctrl.Result{}, err
+			}
+			want := cmp.Or(job.Annotations[workspace.AnnotationWriterPod], "mover")
+			if cur.Annotations[workspace.AnnotationFinalPod] != want {
+				r.Recorder.Eventf(pv, corev1.EventTypeWarning, "RescueFailed",
+					"mover job %s/%s completed, but the broker recorded no final snapshot of this volume; keeping it", ns, job.Name)
+				return ctrl.Result{}, r.setRescue(ctx, &cur, RescueFailed)
+			}
 			log.FromContext(ctx).Info("rescue finished", "pv", pv.Name, "job", job.Name)
-			if err := r.setRescue(ctx, pv, RescueDone); err != nil {
+			if err := r.setRescue(ctx, &cur, RescueDone); err != nil {
 				return ctrl.Result{}, err
 			}
 			// Deleting the rescue claim releases the PV again; the next

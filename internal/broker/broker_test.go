@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -903,6 +904,23 @@ func TestOlderEpochNeverReplacesLatest(t *testing.T) {
 			if ws.Status.LastSnapshot.ID != tc.wantLatest {
 				t.Fatalf("lastSnapshot %q, want %q", ws.Status.LastSnapshot.ID, tc.wantLatest)
 			}
+			if superseded := tc.wantLatest != "mover-snap"; superseded {
+				if n := len(ws.Status.SupersededSnapshots); n != 1 || ws.Status.SupersededSnapshots[0].ID != "mover-snap" {
+					t.Fatalf("superseded snapshots %+v; the rescued data must stay reachable (reviewer #4 finding 6)", ws.Status.SupersededSnapshots)
+				}
+				m := newEnv(t, &ws, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-maint-x", UID: "maint-uid",
+					Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "maintenance",
+						wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"}}},
+					&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "maint-pod", UID: "mtp", Labels: map[string]string{wsnapv1.LabelJob: "maintenance"},
+						OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-maint-x", UID: "maint-uid", Controller: ptr.To(true)}}}})
+				var cur wsnapv1.Workspace
+				_ = m.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &cur)
+				cur.Status.Jobs = append(cur.Status.Jobs, wsnapv1.JobRef{Name: "wsnap-maint-x", UID: "maint-uid", Kind: "maintenance"})
+				_ = m.client.Status().Update(context.Background(), &cur)
+				if _, r := m.call(t, "/v1/credentials", "token-maint-pod", protocol.CredentialsRequest{Role: protocol.RoleMaintenance}); !slices.Contains(r.KeepIDs, "mover-snap") {
+					t.Fatalf("maintenance keep %v; the superseded rescue would be deleted", r.KeepIDs)
+				}
+			}
 			// A restore reads what the broker recorded, not the engine's newest.
 			e2 := newEnv(t, workloadPod("w9", "u9", "ws1"), &ws)
 			if _, r := e2.call(t, "/v1/credentials", "token-w9", protocol.CredentialsRequest{Role: protocol.RoleRestore}); r.LatestSnapshotID != tc.wantLatest {
@@ -1024,4 +1042,95 @@ type outageAuth struct{ n *int }
 func (a outageAuth) Authenticate(context.Context, string) (Identity, error) {
 	*a.n++
 	return Identity{}, fmt.Errorf("%w: timeout", ErrAuthUnavailable)
+}
+
+// TestJobWaitsForWorkloadOnItsVolume (reviewer #4 finding 2): the broker's
+// half of "one agent per volume".
+func TestJobWaitsForWorkloadOnItsVolume(t *testing.T) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-reqs-x", UID: "job-uid",
+		Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "mover",
+			wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"},
+		Annotations: map[string]string{wsnapv1.AnnotationVolumeName: "pv-1"}}}
+	jobPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mover-pod", UID: "mp",
+		Labels:          map[string]string{wsnapv1.LabelJob: "mover"},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-reqs-x", UID: "job-uid", Controller: ptr.To(true)}}}}
+	writer := workloadPod("w1", "u1", "ws1", func(p *corev1.Pod) { p.Status.Phase = corev1.PodPending })
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-w1"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+	wsObj := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "wsnap-reqs-x", UID: "job-uid", Kind: "mover"}}}}
+	e := newEnv(t, job, jobPod, writer, claim, wsObj)
+	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != http.StatusConflict {
+		t.Fatalf("mover got %d while a starting writer uses its volume, want 409", rec.Code)
+	}
+	writer.Status.Phase = corev1.PodSucceeded
+	if err := e.client.Status().Update(context.Background(), writer); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != 200 {
+		t.Fatalf("mover got %d after the writer stopped: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestLostCreateRaceUsesTheWinnersWorkspace (reviewer #4 finding 8).
+func TestLostCreateRaceUsesTheWinnersWorkspace(t *testing.T) {
+	e := newEnv(t, workloadPod("w1", "u1", "child"),
+		&wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "parent"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+			Status: wsnapv1.WorkspaceStatus{LastSnapshot: &wsnapv1.SnapshotRecord{ID: "p1"}}})
+	// The first read misses the Workspace; the user creates it (with a
+	// fork source) before the broker's Create.
+	e.srv.Reader = &missOnce{Client: e.client, create: &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "child", Generation: 1},
+		Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo", RestoreFrom: &wsnapv1.RestoreSource{WorkspaceName: "parent"}}}}
+	_, r := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleRestore})
+	if r.SourceWorkspace != "parent" || r.LatestSnapshotID != "p1" {
+		t.Fatalf("restore source %q latest %q; the fork was ignored", r.SourceWorkspace, r.LatestSnapshotID)
+	}
+}
+
+// missOnce answers the first Workspace read with NotFound, after creating
+// the Workspace behind the caller's back.
+type missOnce struct {
+	client.Client
+	create *wsnapv1.Workspace
+	done   bool
+}
+
+func (m *missOnce) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*wsnapv1.Workspace); ok && !m.done && key.Name == m.create.Name {
+		m.done = true
+		if err := m.Client.Create(ctx, m.create.DeepCopy()); err != nil {
+			return err
+		}
+		return apierrors.NewNotFound(wsnapv1.GroupVersion.WithResource("workspaces").GroupResource(), key.Name)
+	}
+	return m.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestRestoreWaitsForAStoppedWritersBoundVolume (reviewer #4 finding 5):
+// writer A failed (hard eviction: no final snapshot) and its claim is
+// still bound. Pod B must not restore the older lastSnapshot until A's
+// volume is saved.
+func TestRestoreWaitsForAStoppedWritersBoundVolume(t *testing.T) {
+	failedA := workloadPod("a", "uA", "ws1", func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
+	pvA := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-a", Annotations: map[string]string{
+		wsnapv1.AnnotationWorkspaceRef: ns + "/ws1", workspace.AnnotationWriterPod: "uA"}},
+		Spec:   corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: ns, Name: "data-a"}},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound}}
+	claimA := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-a"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-a"}}
+	e := newEnv(t, failedA, pvA, claimA, workloadPod("b", "uB", "ws1"),
+		&wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+			Status: wsnapv1.WorkspaceStatus{WriterPod: &wsnapv1.PodRef{Name: "a", UID: "uA"}, LastSnapshot: &wsnapv1.SnapshotRecord{ID: "stale"}}})
+	if rec, _ := e.call(t, "/v1/credentials", "token-b", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusConflict {
+		t.Fatalf("restore got %d while a stopped writer's volume holds unsaved data, want 409", rec.Code)
+	}
+	var reqs wsnapv1.WorkspaceSnapshotList
+	_ = e.client.List(context.Background(), &reqs)
+	if len(reqs.Items) != 1 || reqs.Items[0].Annotations[wsnapv1.AnnotationVolumeName] != "pv-a" {
+		t.Fatalf("rescue request %+v, want one targeting pv-a", reqs.Items)
+	}
+	// The mover saved it: the broker marked the PV final.
+	pvA.Annotations[workspace.AnnotationFinalPod] = "uA"
+	_ = e.client.Update(context.Background(), pvA)
+	if rec, _ := e.call(t, "/v1/credentials", "token-b", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
+		t.Fatalf("restore got %d after the volume was saved: %s", rec.Code, rec.Body.String())
+	}
 }

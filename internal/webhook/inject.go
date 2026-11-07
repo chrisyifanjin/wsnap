@@ -39,6 +39,9 @@ type Config struct {
 	Audience   string
 	// CAConfigMap names the ConfigMap with the broker's CA; empty for HTTP.
 	CAConfigMap string
+	// AllowAPIToken admits workload containers that mount an API server
+	// token (--allow-automounted-tokens).
+	AllowAPIToken bool
 }
 
 const (
@@ -111,7 +114,7 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		return fmt.Errorf("container %q is a regular container; the wsnap sidecar must be a native sidecar (an init container with restartPolicy: Always) so it restores before the workload starts", sidecarName)
 	}
 	if pod.Annotations[AnnotationInject] == "false" || existing != nil {
-		return validate(pod, sidecarName, cfg.Audience)
+		return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
 	}
 
 	ensureVolume(pod, corev1.Volume{Name: tokenVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
@@ -156,7 +159,7 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 	// First, so the restore finishes before any other init container (which
 	// might write to the workspace) starts.
 	pod.Spec.InitContainers = append([]corev1.Container{sidecar}, pod.Spec.InitContainers...)
-	return validate(pod, sidecarName, cfg.Audience)
+	return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
 }
 
 // AgentSecurityContext hardens the agent container. Its root filesystem
@@ -181,7 +184,7 @@ func AgentSecurityContext() *corev1.SecurityContext {
 }
 
 // validate checks a Pod that already has its sidecar.
-func validate(pod *corev1.Pod, sidecarName, audience string) error {
+func validate(pod *corev1.Pod, sidecarName, audience string, allowAPIToken bool) error {
 	sc := findContainer(pod.Spec.InitContainers, sidecarName)
 	if sc == nil {
 		return fmt.Errorf("annotation %s=false, but the pod has no %q init container", AnnotationInject, sidecarName)
@@ -192,59 +195,14 @@ func validate(pod *corev1.Pod, sidecarName, audience string) error {
 	if sc.StartupProbe == nil {
 		return fmt.Errorf("container %q needs a startupProbe, or the workload starts before the restore finishes", sidecarName)
 	}
-	tokenVols := map[string]bool{}
-	for _, v := range pod.Spec.Volumes {
-		if v.Projected == nil {
-			continue
-		}
-		for _, src := range v.Projected.Sources {
-			// Tokens for other audiences (e.g. Vault) are the workload's own.
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == audience {
-				tokenVols[v.Name] = true
-			}
-		}
-	}
-	for _, list := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
-		for _, c := range list {
-			if c.Name == sidecarName {
-				continue
-			}
-			for _, m := range c.VolumeMounts {
-				if tokenVols[m.Name] {
-					return fmt.Errorf("container %q mounts the token volume %q; only %q may", c.Name, m.Name, sidecarName)
-				}
-			}
-		}
-	}
-	return ValidateEphemeral(pod, sidecarName, audience)
+	return workspace.CheckIsolation(pod, audience, allowAPIToken)
 }
 
 // ValidateEphemeral refuses ephemeral containers (kubectl debug) that could
 // reach the agent's secrets: one that mounts the token volume, or one that
 // targets the sidecar and so shares its process namespace.
-func ValidateEphemeral(pod *corev1.Pod, sidecarName, audience string) error {
-	tokenVols := map[string]bool{}
-	for _, v := range pod.Spec.Volumes {
-		if v.Projected == nil {
-			continue
-		}
-		for _, src := range v.Projected.Sources {
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == audience {
-				tokenVols[v.Name] = true
-			}
-		}
-	}
-	for _, ec := range pod.Spec.EphemeralContainers {
-		if ec.TargetContainerName == sidecarName {
-			return fmt.Errorf("ephemeral container %q targets %q and would share its process namespace", ec.Name, sidecarName)
-		}
-		for _, m := range ec.VolumeMounts {
-			if tokenVols[m.Name] {
-				return fmt.Errorf("ephemeral container %q mounts the token volume %q", ec.Name, m.Name)
-			}
-		}
-	}
-	return nil
+func ValidateEphemeral(pod *corev1.Pod, audience string, allowAPIToken bool) error {
+	return workspace.CheckIsolation(pod, audience, allowAPIToken)
 }
 
 func hasVolume(pod *corev1.Pod, name string) bool {

@@ -128,7 +128,7 @@ func main() {
 
 	jobs := controller.JobConfig{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA}
 	mgr.GetWebhookServer().Register("/mutate-pods", &admission.Webhook{Handler: &webhook.Handler{
-		Config:  webhook.Config{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA},
+		Config:  webhook.Config{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA, AllowAPIToken: *allowAPITok},
 		Decoder: admission.NewDecoder(scheme),
 	}})
 	reader := mgr.GetAPIReader()

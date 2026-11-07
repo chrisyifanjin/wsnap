@@ -149,7 +149,9 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 		t.Error("mover pod automounts the API token")
 	}
 
-	// The Job completes: the rescue is done and its objects are removed.
+	// The broker records the mover's final snapshot, then the Job
+	// completes: the rescue is done and its objects are removed.
+	markFinal(t, c, "u2")
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	if err := c.Status().Update(context.Background(), &job); err != nil {
 		t.Fatal(err)
@@ -234,6 +236,7 @@ func TestStaleCacheDoesNotUndoRescue(t *testing.T) {
 	}
 	var job batchv1.Job
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job)
+	markFinal(t, c, "u2")
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	_ = c.Status().Update(context.Background(), &job)
 	reconcilePV(t, r)
@@ -261,7 +264,7 @@ func TestMissingMoverJobIsRecreated(t *testing.T) {
 // TestLostAnnotationHeals: a PV bound to its rescue claim but with an empty
 // rescue phase (the stranded state of the old bug) still finishes.
 func TestLostAnnotationHeals(t *testing.T) {
-	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: ""})
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: "", workspace.AnnotationFinalPod: "mover"})
 	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName("pv-1"), UID: "c"}
 	pv.Status.Phase = corev1.VolumeBound
 	done := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: moverJobName("pv-1")},
@@ -363,5 +366,32 @@ func TestStaleWorkspaceCacheDoesNotReclaim(t *testing.T) {
 	reconcilePV(t, r)
 	if p := getPV(t, c).Spec.PersistentVolumeReclaimPolicy; p != corev1.PersistentVolumeReclaimRetain {
 		t.Fatalf("PV reclaim policy %s after a stale cache read; the data would be deleted", p)
+	}
+}
+
+// markFinal does what the broker does when it records a mover's snapshot.
+func markFinal(t *testing.T, c client.Client, uid string) {
+	t.Helper()
+	pv := getPV(t, c)
+	pv.Annotations[workspace.AnnotationFinalPod] = uid
+	if err := c.Update(context.Background(), pv); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCompleteJobWithoutRecordedSnapshotKeepsTheVolume (reviewer #4
+// finding 1): the mover's report was lost, so the Job completed but the
+// broker never recorded the snapshot. The volume must be kept.
+func TestCompleteJobWithoutRecordedSnapshotKeepsTheVolume(t *testing.T) {
+	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
+	reconcilePV(t, r)
+	var job batchv1.Job
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job)
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	_ = c.Status().Update(context.Background(), &job)
+	reconcilePV(t, r)
+	pv := getPV(t, c)
+	if a := pv.Annotations[wsnapv1.AnnotationRescue]; a != RescueFailed || pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		t.Fatalf("rescue %q, policy %s; an unrecorded rescue must keep the volume", a, pv.Spec.PersistentVolumeReclaimPolicy)
 	}
 }

@@ -211,7 +211,7 @@ func (r *Restic) Restore(ctx context.Context, t Target, id, dir string) error {
 	return nil
 }
 
-func (r *Restic) Maintain(ctx context.Context, t Target, keepLast int, keep []string) error {
+func (r *Restic) Maintain(ctx context.Context, t Target, p Retention) error {
 	// Locks left by a killed sidecar would block prune.
 	if _, err := r.restic(ctx, t, "", "unlock"); err != nil {
 		return fmt.Errorf("restic unlock: %w", err)
@@ -220,13 +220,13 @@ func (r *Restic) Maintain(ctx context.Context, t Target, keepLast int, keep []st
 	if err != nil {
 		return err
 	}
-	ids := make([]string, len(list))
+	snaps := make([]snapRef, len(list))
 	for i, s := range list {
-		ids[i] = s.ID
+		snaps[i] = snapRef{s.ID, s.Time}
 	}
 	// Explicit IDs, not --keep-last: restic has no "keep this ID" policy,
 	// and tagging a snapshot to keep it would change its ID.
-	forget := forgettable(ids, keepLast, keep)
+	forget := forgettable(snaps, p, time.Now())
 	if len(forget) == 0 {
 		if _, err := r.restic(ctx, t, "", "prune"); err != nil {
 			return fmt.Errorf("restic prune: %w", err)

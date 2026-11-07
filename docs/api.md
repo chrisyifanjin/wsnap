@@ -24,6 +24,7 @@ Where and how workspaces are stored.
 | `spec.credentials.ttl` | duration | Credential lifetime. Default `1h`. |
 | `spec.schedule.interval` | duration | Snapshot interval. Default `15m`, minimum `10s`. |
 | `spec.retention.keepLast` | int | Snapshots kept by maintenance. Default `10`. |
+| `spec.retention.keepDaily` | int | Also keep the newest snapshot of each of the last N days. Default `7`. |
 | `spec.retention.maintenanceEvery` | int | New snapshots between maintenance runs. Default `20`; `0` turns it off. |
 | `spec.jobs.image` | string | Image for Jobs. Default: the controller's `--agent-image`. |
 | `spec.jobs.volumes`, `spec.jobs.volumeMounts` | lists | Extra volumes for Jobs, for example an NFS backend. |
@@ -49,6 +50,7 @@ first Pod. You can create it first, to set `restoreFrom`.
 | `status.writerEpoch` | Increases each time another Pod becomes the writer. |
 | `status.lastSnapshot` | `id`, `time`, `executor` (`sidecar`, `mover`), `pod`, `volumeName`, `final`, `epoch`. Restores use `id`. A snapshot of an older `epoch` never replaces it. |
 | `status.lastRestore` | `snapshotID`, `sourceWorkspace`, `time`, `pod`. |
+| `status.supersededSnapshots` | Rescue snapshots of older writer epochs (newest 10). Maintenance keeps them; restore one by ID with a `WorkspaceRestore`. |
 | `status.lastError` | The last failure. |
 | `status.snapshotsSinceMaintenance`, `status.lastMaintenance` | Maintenance bookkeeping. |
 | `status.restoreFromGeneration` | The generation whose `restoreFrom` was used (or skipped because the volume already had data). |
@@ -134,7 +136,8 @@ The agent runs `<command> <verb>`, with the verb `init`, `snapshot`,
 `latest`, `restore` or `maintain`. The environment holds `WSNAP_WORKSPACE`,
 `WSNAP_DIR`, `WSNAP_SNAPSHOT_ID`, `WSNAP_KEEP_LAST`, `WSNAP_READ_ONLY`,
 `WSNAP_STATE_DIR`, `WSNAP_PASSWORD`, `WSNAP_KEEP_IDS` (one snapshot ID
-per line; `maintain` must keep them), `WSNAP_BACKEND` (JSON),
+per line; `maintain` must keep them), `WSNAP_KEEP_DAILY` (`maintain` also
+keeps the newest snapshot of each of the last N days), `WSNAP_BACKEND` (JSON),
 `WSNAP_CREDENTIALS` (JSON), `WSNAP_EXCLUDE`, and the `AWS_*`,
 `GOOGLE_ACCESS_TOKEN` or `AZURE_*` variables of the backend.
 

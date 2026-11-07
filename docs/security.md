@@ -14,7 +14,7 @@ wsnap protects against these attacks from the agent container:
 | Attack | Control |
 |---|---|
 | Read another workspace's snapshots | Each credential opens one workspace repository only. |
-| Delete or corrupt snapshot history | Writing roles cannot delete (except engine scratch objects). |
+| Delete or corrupt snapshot history | Writing roles cannot delete (except engine scratch objects). Retention keeps the newest snapshot of each of the last 7 days, maintenance runs at most hourly, and request files are rate limited, so a flood of snapshots cannot push history out. |
 | Get a credential at all | The agent container has no token for the broker's audience. |
 | Get Kubernetes API access to create Pods that ask for credentials | Pods that mount the default API token are refused. |
 | Read the sidecar's memory or environment through `/proc` | Pods with a shared process namespace are refused. |

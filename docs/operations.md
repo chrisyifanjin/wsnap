@@ -136,7 +136,8 @@ See `internal/engine/exec.go` for the contract.
 |---|---|---|
 | `schedule.interval` | `15m` | Time between snapshots. Minimum `10s`. Idle workspaces skip the snapshot. |
 | `retention.keepLast` | `10` | Snapshots that maintenance keeps. |
-| `retention.maintenanceEvery` | `20` | Run maintenance after this many new snapshots. `0` turns it off. |
+| `retention.keepDaily` | `7` | Also keep the newest snapshot of each of the last N days (UTC). A burst of snapshots cannot push older days out. |
+| `retention.maintenanceEvery` | `20` | Run maintenance after this many new snapshots, at most once an hour. `0` turns it off. |
 | `credentials.ttl` | `1h` | Lifetime of issued credentials. AWS STS needs at least `15m`. Keep it at least 5 minutes longer than the agent's `--operation-timeout` (default `30m`); raise both for very large workspaces. |
 
 ## Protect a workload

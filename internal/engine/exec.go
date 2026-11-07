@@ -20,6 +20,7 @@ import (
 //	WSNAP_DIR               directory to snapshot or restore into
 //	WSNAP_SNAPSHOT_ID       snapshot to restore (restore)
 //	WSNAP_KEEP_LAST         retention (maintain)
+//	WSNAP_KEEP_DAILY        also keep the newest snapshot of each of the last N days (maintain)
 //	WSNAP_KEEP_IDS          newline-separated snapshot IDs to keep (maintain)
 //	WSNAP_READ_ONLY         "true" for the restore role
 //	WSNAP_STATE_DIR         private writable directory
@@ -149,7 +150,8 @@ func (e *Exec) Restore(ctx context.Context, t Target, id, dir string) error {
 	return err
 }
 
-func (e *Exec) Maintain(ctx context.Context, t Target, keepLast int, keep []string) error {
-	_, err := e.call(ctx, t, "maintain", "", "", keepLast, "WSNAP_KEEP_IDS="+strings.Join(keep, "\n"))
+func (e *Exec) Maintain(ctx context.Context, t Target, p Retention) error {
+	_, err := e.call(ctx, t, "maintain", "", "", p.KeepLast,
+		"WSNAP_KEEP_IDS="+strings.Join(p.Keep, "\n"), "WSNAP_KEEP_DAILY="+strconv.Itoa(p.KeepDaily))
 	return err
 }

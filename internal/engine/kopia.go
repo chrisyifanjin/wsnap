@@ -248,16 +248,16 @@ func (k *Kopia) Restore(ctx context.Context, t Target, id, dir string) error {
 	return nil
 }
 
-func (k *Kopia) Maintain(ctx context.Context, t Target, keepLast int, keep []string) error {
+func (k *Kopia) Maintain(ctx context.Context, t Target, p Retention) error {
 	list, err := k.list(ctx, t)
 	if err != nil {
 		return err
 	}
-	ids := make([]string, len(list))
+	snaps := make([]snapRef, len(list))
 	for i, s := range list {
-		ids[i] = s.ID
+		snaps[i] = snapRef{s.ID, s.StartTime}
 	}
-	for _, id := range forgettable(ids, keepLast, keep) {
+	for _, id := range forgettable(snaps, p, time.Now()) {
 		if _, err := k.kopia(ctx, t, "", "snapshot", "delete", id, "--delete"); err != nil {
 			return fmt.Errorf("kopia snapshot delete: %w", err)
 		}

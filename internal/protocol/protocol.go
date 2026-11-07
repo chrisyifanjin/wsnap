@@ -151,8 +151,9 @@ type CredentialsResponse struct {
 
 	// Interval is how often the sidecar takes a periodic snapshot.
 	Interval Duration `json:"interval"`
-	// KeepLast is the retention for maintenance.
-	KeepLast int `json:"keepLast"`
+	// KeepLast and KeepDaily are the retention for maintenance.
+	KeepLast  int `json:"keepLast"`
+	KeepDaily int `json:"keepDaily,omitempty"`
 
 	// For the restore role: SnapshotID pins the snapshot to restore (empty
 	// means latest). SourceWorkspace is set for a fork; Backend,
@@ -204,6 +205,10 @@ type Report struct {
 	// a rescue Job. The controller releases protected volumes only after a
 	// final snapshot.
 	Final bool `json:"final,omitempty"`
+	// NoData, from a mover, means the volume holds no workspace data (empty,
+	// or its first restore was cut off), so there is nothing to save. The
+	// broker marks the volume final without recording a snapshot.
+	NoData bool `json:"noData,omitempty"`
 	// Reused means the agent found no change since snapshot SnapshotID and
 	// is confirming it instead of taking a new one. The broker records it
 	// but does not count it toward maintenance.

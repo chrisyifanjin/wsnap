@@ -222,6 +222,53 @@ fails. 22 mutations are killed. One mutation first survived, because
 another guard caught the same input earlier; a direct test of the guard
 now kills it.
 
+Found by the fourth independent review, and fixed:
+
+- **A lost report let the controller delete a rescued PV.** A Job's
+  report failure only logged, the Job completed, and the PV was reclaimed
+  while `lastSnapshot` still named older data. Jobs now retry reports for
+  5 minutes and fail without them, a mover reports "nothing to save"
+  explicitly, and a rescue counts as done only when the broker's final
+  mark is on the PV (`TestJobFailsWhenItsReportIsLost`,
+  `TestCompleteJobWithoutRecordedSnapshotKeepsTheVolume`).
+- **A Job could run beside a starting or stopping writer** on a generic
+  ephemeral volume. The controller now waits for any wsnap Pod that mounts
+  the claim (including `<pod>-<volume>` claims), the broker refuses Job
+  credentials while such a Pod exists, and a sidecar is admitted before it
+  finishes a leftover swap (`TestJobWaitsForAStartingOrStoppingWriter`,
+  `TestJobWaitsForWorkloadOnItsVolume`).
+- **Untrusted code could wipe history** by triggering about 30 snapshots,
+  which started count-based maintenance. Retention now also keeps the
+  newest snapshot of each of the last 7 days (`retention.keepDaily`),
+  maintenance runs at most hourly, and request-file snapshots are spaced
+  30 s apart (`TestRetentionKeepsDailyHistory`,
+  `TestMaintenanceRunsAtMostHourly`, `TestRequestFilesAreSpaced`).
+- **A rollback lost writes made during the download.** The safety
+  snapshot now runs after the download, right before the swap
+  (`TestRollbackKeepsWritesMadeDuringTheDownload`).
+- **A new Pod restored stale data while a failed writer's volume was still
+  bound** (a hard eviction gives no final snapshot). The broker now asks
+  for a snapshot of exactly that volume and makes restores wait for it
+  (`TestRestoreWaitsForAStoppedWritersBoundVolume`,
+  `TestTargetedRequestSnapshotsThatVolume`).
+- **Superseded rescue snapshots were pruned** although the docs said they
+  stay. They are now kept in `status.supersededSnapshots` (newest 10) and
+  pinned against maintenance.
+- **A missing repository started an empty workspace** even when the broker
+  had recorded a snapshot. It is now an error
+  (`TestMissingRepositoryWithRecordedSnapshotFails`).
+- **A lost Workspace-create race ignored `restoreFrom`.** The broker now
+  re-reads the winner's object (`TestLostCreateRaceUsesTheWinnersWorkspace`).
+- **The workload could mount an API token or the sidecar's state volume**
+  (which holds the engine configuration with storage credentials). The
+  webhook and the broker now share one isolation check that refuses both
+  (`TestWorkloadCannotReachAgentSecretsOrTheAPI`).
+- **Some outages still answered 4xx** (gateway TokenReview and access
+  reviews, restore-request reads). They now answer 503.
+- Restored data and swap renames are flushed to disk before their
+  completion markers, and a full Job registry drops entries of Jobs that
+  are gone before those of running Jobs (`TestJobRegistryKeepsRunningJobs`).
+
 ## Known limits
 
 - A root workload can race the staging directory during an in-place

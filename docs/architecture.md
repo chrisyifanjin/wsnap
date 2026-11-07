@@ -232,8 +232,10 @@ lost, the next poll delivers the same claimed requests again; the sidecar
 ignores the names it is serving or just served. A claim stays while the
 claimant Pod exists, so a terminating sidecar can finish it.
 
-An in-place restore first snapshots the live data, so a rollback never
-destroys unsaved work. Then it uses two phases recorded in `.wsnap/swap`.
+An in-place restore first downloads the snapshot into `.wsnap/staging`.
+Right before the swap, it snapshots the live data, so a rollback keeps all
+work up to that moment (with `wsnap.dev/quiesce-timeout`, also writes made
+during that snapshot). The swap uses two phases recorded in `.wsnap/swap`.
 Phase 1 moves the live entries to `.wsnap/trash`. Phase 2 moves the staged
 entries into place. A sidecar (or mover) that crashes at any point
 finishes the swap when it starts again. After the swap, the sidecar takes

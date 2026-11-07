@@ -2546,6 +2546,16 @@ spec:
               retention:
                 description: RetentionSpec controls maintenance.
                 properties:
+                  keepDaily:
+                    default: 7
+                    description: |-
+                      keepDaily also keeps the newest snapshot of each of the last
+                      keepDaily days (UTC). It bounds what a burst of snapshots can push
+                      out of history: keepLast alone counts snapshots, and the workload
+                      can trigger snapshots.
+                    format: int32
+                    minimum: 0
+                    type: integer
                   keepLast:
                     default: 10
                     description: keepLast is the number of snapshots maintenance keeps.

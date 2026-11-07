@@ -248,6 +248,55 @@ spec:
               snapshotsSinceMaintenance:
                 format: int32
                 type: integer
+              supersededSnapshots:
+                description: |-
+                  supersededSnapshots are rescue snapshots of older writer epochs: data
+                  of a volume that was saved after a newer writer had already
+                  snapshotted. Restores never pick them, but maintenance keeps them, so
+                  an operator can restore one by ID. The newest 10 are kept here;
+                  remove an entry to let maintenance delete that snapshot.
+                items:
+                  description: SnapshotRecord describes one snapshot.
+                  properties:
+                    epoch:
+                      description: |-
+                        epoch is the writer epoch of the data in this snapshot: the
+                        workspace's writerEpoch for a sidecar, the volume's epoch for a Job.
+                        A snapshot of an older epoch never replaces lastSnapshot.
+                      format: int64
+                      type: integer
+                    executor:
+                      description: executor is sidecar or mover.
+                      type: string
+                    final:
+                      description: final is true for the last snapshot of a Pod's
+                        life.
+                      type: boolean
+                    id:
+                      type: string
+                    pod:
+                      description: PodRef identifies one Pod incarnation.
+                      properties:
+                        name:
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - name
+                      - uid
+                      type: object
+                    time:
+                      format: date-time
+                      type: string
+                    volumeName:
+                      description: volumeName is the PV a mover snapshotted.
+                      type: string
+                  required:
+                  - executor
+                  - id
+                  - time
+                  type: object
+                type: array
               volume:
                 description: VolumeRef is the volume currently holding a workspace's
                   data.

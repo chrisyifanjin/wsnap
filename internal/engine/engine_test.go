@@ -343,7 +343,7 @@ func TestRoundTrip(t *testing.T) {
 				}
 				if sname == "s3-sts" {
 					// The snapshot credential must not be able to delete.
-					if err := eng.Maintain(ctx, target(protocol.RoleSnapshot), 1, nil); err == nil {
+					if err := eng.Maintain(ctx, target(protocol.RoleSnapshot), engine.Retention{KeepLast: 1}); err == nil {
 						t.Errorf("Maintain with the snapshot credential succeeded")
 					}
 				}
@@ -363,7 +363,7 @@ func TestRoundTrip(t *testing.T) {
 				}
 				// keepLast 1 keeps the third; the pinned first survives too
 				// (reviewer #3 finding 8); the second goes.
-				if err := eng.Maintain(ctx, m, 1, []string{first.ID}); err != nil {
+				if err := eng.Maintain(ctx, m, engine.Retention{KeepLast: 1, Keep: []string{first.ID}}); err != nil {
 					t.Fatalf("Maintain: %v", err)
 				}
 				latest, err = eng.Latest(ctx, m)

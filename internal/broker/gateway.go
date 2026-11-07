@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -50,7 +51,7 @@ type KubeGatewayAuth struct {
 func (k KubeGatewayAuth) AuthenticateUser(ctx context.Context, token string) (authnv1.UserInfo, error) {
 	r, err := k.Client.AuthenticationV1().TokenReviews().Create(ctx, &authnv1.TokenReview{Spec: authnv1.TokenReviewSpec{Token: token}}, metav1.CreateOptions{})
 	if err != nil {
-		return authnv1.UserInfo{}, err
+		return authnv1.UserInfo{}, fmt.Errorf("%w: token review: %w", ErrAuthUnavailable, err)
 	}
 	if !r.Status.Authenticated {
 		return authnv1.UserInfo{}, fmt.Errorf("token rejected: %s", r.Status.Error)
@@ -116,6 +117,9 @@ func (s *Server) gatewayCaller(r *http.Request, verb, ns, resource string) (auth
 		return authnv1.UserInfo{}, fail(http.StatusUnauthorized, "missing bearer token")
 	}
 	user, err := s.Gateway.AuthenticateUser(r.Context(), token)
+	if errors.Is(err, ErrAuthUnavailable) {
+		return user, fail(http.StatusServiceUnavailable, "%v", err)
+	}
 	if err != nil {
 		return user, fail(http.StatusUnauthorized, "%v", err)
 	}
@@ -124,7 +128,7 @@ func (s *Server) gatewayCaller(r *http.Request, verb, ns, resource string) (auth
 	}
 	allowed, reason, err := s.Gateway.Allowed(r.Context(), user, verb, ns, resource)
 	if err != nil {
-		return user, fail(http.StatusBadGateway, "access review: %v", err)
+		return user, fail(http.StatusServiceUnavailable, "access review: %v", err)
 	}
 	if !allowed {
 		return user, fail(http.StatusForbidden, "%s may not %s %s in namespace %s %s", user.Username, verb, resource, ns, reason)
@@ -271,7 +275,7 @@ func (s *Server) doGatewayFork(r *http.Request) (*forkResponse, error) {
 		return nil, err
 	}
 	if allowed, reason, err := s.Gateway.Allowed(ctx, user, "create", ns, "workspaces"); err != nil {
-		return nil, fail(http.StatusBadGateway, "access review: %v", err)
+		return nil, fail(http.StatusServiceUnavailable, "access review: %v", err)
 	} else if !allowed {
 		return nil, fail(http.StatusForbidden, "%s may not create workspaces in namespace %s %s", user.Username, ns, reason)
 	}

@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"k8s.io/utils/ptr"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -428,5 +430,101 @@ func TestSnapshotAndRestoreNeverStartTwoJobsOnOneVolume(t *testing.T) {
 			names = append(names, j.Name)
 		}
 		t.Fatalf("%d Jobs on one volume: %v", len(jobs.Items), names)
+	}
+}
+
+// TestJobWaitsForAStartingOrStoppingWriter (reviewer #4 finding 2): the
+// writer Pod's sidecar may be restoring (Pending) or taking its final
+// snapshot (terminating) on a generic ephemeral volume. No Job may start
+// on that volume until the Pod is gone.
+func TestJobWaitsForAStartingOrStoppingWriter(t *testing.T) {
+	ephemeralVol := &wsnapv1.VolumeRef{Kind: workspace.KindEphemeral, ClaimName: "p-workspace", VolumeName: "pv-1"}
+	for name, mutate := range map[string]func(*corev1.Pod){
+		"pending":     func(p *corev1.Pod) { p.Status.Phase = corev1.PodPending },
+		"terminating": func(p *corev1.Pod) { p.DeletionTimestamp = ptr.To(metav1.Now()); p.Finalizers = []string{"test/keep"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "p", UID: "u", Labels: map[string]string{wsnapv1.LabelWorkspace: "ws1"}},
+				Spec:   corev1.PodSpec{Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{}}}}},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+			mutate(pod)
+			claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "p-workspace"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+			r, c := requestEnv(t, snapReq(time.Now(), "", ""), pod, claim, wsWith(ephemeralVol, &wsnapv1.PodRef{Name: "p", UID: "u"}))
+			got := reconcileReq(t, r, c)
+			var jobs batchv1.JobList
+			_ = c.List(context.Background(), &jobs)
+			if len(jobs.Items) != 0 || got.Status.Phase != wsnapv1.SnapshotPending {
+				t.Fatalf("%d Jobs, phase %q (%s); want none while the writer's sidecar uses the volume", len(jobs.Items), got.Status.Phase, got.Status.Message)
+			}
+		})
+	}
+}
+
+// TestMaintenanceRunsAtMostHourly (reviewer #4 finding 3): the workload
+// can drive the snapshot count, so the count alone must not schedule
+// maintenance.
+func TestMaintenanceRunsAtMostHourly(t *testing.T) {
+	ws := wsWith(pvcVol, nil)
+	ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "s"}
+	ws.Status.SnapshotsSinceMaintenance = 50
+	ws.Status.LastMaintenance = ptr.To(metav1.NewTime(time.Now().Add(-10 * time.Minute)))
+	r, c := requestEnv(t, ws)
+	repo := &wsnapv1.SnapshotRepository{}
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "repo"}, repo)
+	repo.Spec.Retention.MaintenanceEvery = 20
+	_ = c.Update(context.Background(), repo)
+	wr := &WorkspaceReconciler{Client: c, Reader: c, Jobs: r.Jobs}
+	res, err := wr.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "ws1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobs batchv1.JobList
+	_ = c.List(context.Background(), &jobs)
+	if len(jobs.Items) != 0 || res.RequeueAfter < 45*time.Minute {
+		t.Fatalf("%d maintenance Jobs 10 minutes after the last run, requeue %s", len(jobs.Items), res.RequeueAfter)
+	}
+}
+
+// TestTargetedRequestSnapshotsThatVolume (reviewer #4 finding 5): the
+// broker's rescue request names a stopped writer's PV; the mover must run
+// on that PV's claim, not on status.volume.
+func TestTargetedRequestSnapshotsThatVolume(t *testing.T) {
+	sr := snapReq(time.Now(), "", "")
+	sr.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: "pv-a"}
+	pvA := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-a", Annotations: map[string]string{
+		wsnapv1.AnnotationWorkspaceRef: testNS + "/ws1", workspace.AnnotationWriterPod: "uA"}},
+		Spec: corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: testNS, Name: "a-workspace"}}}
+	failedA := runningPod("a", "uA", "a-workspace")
+	failedA.Status.Phase = corev1.PodFailed
+	claimA := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "a-workspace"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-a"}}
+	r, c := requestEnv(t, sr, pvA, claimA, failedA, wsWith(pvcVol, &wsnapv1.PodRef{Name: "b", UID: "uB"}), runningPod("b", "uB", "data"), boundClaim())
+	got := reconcileReq(t, r, c)
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: requestJobName(request{sr})}, &job); err != nil {
+		t.Fatalf("no mover job (%s: %s): %v", got.Status.Phase, got.Status.Message, err)
+	}
+	if got := job.Spec.Template.Spec.Volumes[2].PersistentVolumeClaim.ClaimName; got != "a-workspace" || job.Annotations[workspace.AnnotationWriterPod] != "uA" {
+		t.Fatalf("mover mounts %q (writer %q); want the stopped writer's claim a-workspace", got, job.Annotations[workspace.AnnotationWriterPod])
+	}
+}
+
+// TestJobRegistryKeepsRunningJobs (reviewer #4 suspicion): when the list
+// is full, entries of Jobs that are gone go first, never a running Job's.
+func TestJobRegistryKeepsRunningJobs(t *testing.T) {
+	running := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "running", UID: "run-uid"}}
+	ws := wsWith(pvcVol, nil)
+	ws.Status.Jobs = []wsnapv1.JobRef{{Name: "running", UID: "run-uid", Kind: "maintenance"}}
+	for i := range maxRecordedJobs - 1 {
+		ws.Status.Jobs = append(ws.Status.Jobs, wsnapv1.JobRef{Name: fmt.Sprintf("gone-%d", i), UID: fmt.Sprintf("g%d", i), Kind: "mover"})
+	}
+	r, c := requestEnv(t, running, ws)
+	job := r.Jobs.newAgentJob("mover", "new-job", ws, &wsnapv1.SnapshotRepository{}, nil, nil, nil)
+	if err := createJob(context.Background(), c, c, job, "ws1"); err != nil {
+		t.Fatal(err)
+	}
+	var got wsnapv1.Workspace
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "ws1"}, &got)
+	if !slices.ContainsFunc(got.Status.Jobs, func(j wsnapv1.JobRef) bool { return j.UID == "run-uid" }) {
+		t.Fatalf("the running Job's entry was dropped: %+v", got.Status.Jobs)
 	}
 }

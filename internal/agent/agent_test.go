@@ -35,8 +35,10 @@ type fakeBroker struct {
 	reports      []protocol.Report
 	// restore overrides for pinned and fork restores
 	restoreID, restoreSource string
+	latestID                 string // LatestSnapshotID for restores
 	restoreRepo              string
 	waitQueue                chan string
+	failReports              atomic.Bool // answer reports with 503
 }
 
 func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +70,7 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Interval:           protocol.Duration{Duration: time.Hour},
 		}
 		if req.Role == protocol.RoleRestore {
-			resp.SnapshotID, resp.SourceWorkspace = b.restoreID, b.restoreSource
+			resp.SnapshotID, resp.SourceWorkspace, resp.LatestSnapshotID = b.restoreID, b.restoreSource, b.latestID
 			if b.restoreRepo != "" {
 				resp.Backend.Filesystem.Path = b.restoreRepo
 				resp.RestoreFromGeneration = 7
@@ -86,6 +88,10 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(protocol.WaitResponse{Requests: names})
 	case "/v1/report":
+		if b.failReports.Load() {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		var rep protocol.Report
 		_ = json.NewDecoder(r.Body).Decode(&rep)
 		b.mu.Lock()
@@ -713,15 +719,17 @@ func TestMoverSavesNothingFromAnUninitializedVolume(t *testing.T) {
 			if err := c.RunMover(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			if reps := b.snapshotReports(); len(reps) != 0 {
-				t.Fatalf("the mover snapshotted a volume without workspace data: %+v", reps)
+			// One NoData report (so the broker marks the volume final), and
+			// no snapshot.
+			if reps := b.snapshotReports(); len(reps) != 1 || !reps[0].NoData || !reps[0].Final || reps[0].SnapshotID != "" {
+				t.Fatalf("want one NoData report and no snapshot, got %+v", reps)
 			}
 			c.Request = "req-1"
 			if err := c.RunMover(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			reps := b.snapshotReports()
-			if len(reps) != 1 || reps[0].Request != "req-1" || reps[0].Error == "" || reps[0].SnapshotID != "" {
+			if len(reps) != 2 || reps[1].Request != "req-1" || reps[1].Error == "" || reps[1].SnapshotID != "" || !reps[1].NoData {
 				t.Fatalf("a request on such a volume must fail with the reason, got %+v", reps)
 			}
 		})
@@ -1067,4 +1075,95 @@ func TestNotWorkspaceDataReportsErrorsAsErrors(t *testing.T) {
 	if err == nil {
 		t.Fatalf("no error; reason %q would let the controller reclaim unsaved data", reason)
 	}
+}
+
+// TestJobFailsWhenItsReportIsLost (reviewer #4 finding 1): a mover whose
+// snapshot report never reaches the broker must fail, or the controller
+// reclaims the volume while lastSnapshot still names older data.
+func TestJobFailsWhenItsReportIsLost(t *testing.T) {
+	c, b := setup(t)
+	write(t, filepath.Join(c.Dir, "work.txt"), "unsaved")
+	b.failReports.Store(true)
+	defer func(d time.Duration) { strictReportFor = d }(strictReportFor)
+	strictReportFor = 2 * time.Second
+	if err := c.RunMover(context.Background()); err == nil {
+		t.Fatal("RunMover succeeded although no report reached the broker")
+	}
+}
+
+// TestMissingRepositoryWithRecordedSnapshotFails (reviewer #4 finding 7):
+// the broker recorded a snapshot, so a missing repository must stop the
+// start, not begin an empty workspace.
+func TestMissingRepositoryWithRecordedSnapshotFails(t *testing.T) {
+	c, b := setup(t)
+	b.latestID = "recorded-snap"
+	if _, err := c.initialize(context.Background()); err == nil {
+		t.Fatal("initialize started an empty workspace although the broker recorded a snapshot")
+	}
+	if Ready(c.Dir) == nil {
+		t.Fatal("the volume was marked initialized")
+	}
+}
+
+// TestRollbackKeepsWritesMadeDuringTheDownload (reviewer #4 finding 4):
+// the agent writes while the restore downloads; those writes must be in
+// the safety snapshot.
+func TestRollbackKeepsWritesMadeDuringTheDownload(t *testing.T) {
+	wrapper := filepath.Join(t.TempDir(), "engine.sh")
+	// On "restore", write into the live volume (two levels above
+	// .wsnap/staging) before the real restore.
+	script := "#!/bin/sh\nif [ \"$1\" = restore ]; then echo during > \"$(dirname \"$(dirname \"$WSNAP_DIR\")\")/during.txt\"; fi\nexec " + tarEngine(t) + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, b := setup(t, wrapper)
+	old := seed(t, c, map[string]string{"a.txt": "old"})
+	st, err := c.initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.restoreID = old
+	if _, _, err := c.restoreInPlace(context.Background(), "rollback-1", st); err != nil {
+		t.Fatal(err)
+	}
+	snaps := b.snapshotReports()
+	safety := snaps[len(snaps)-2]
+	// Check with the plain engine, which writes nothing by itself.
+	b.restoreID, b.command = safety.SnapshotID, []string{tarEngine(t)}
+	next, _ := setup(t)
+	next.BrokerURL, next.HTTP = c.BrokerURL, c.HTTP
+	if _, err := next.initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(next.Dir, "during.txt")); string(got) != "during\n" {
+		t.Fatalf("a write made during the download is in no snapshot (safety snapshot %s holds %q)", safety.SnapshotID, got)
+	}
+}
+
+// TestRequestFilesAreSpaced (reviewer #4 finding 3): the workload cannot
+// trigger snapshots faster than FileRequestSpacing.
+func TestRequestFilesAreSpaced(t *testing.T) {
+	c, _ := setup(t)
+	c.IntervalOverride = time.Hour
+	c.TriggerPoll = 20 * time.Millisecond
+	c.FileRequestSpacing = 2 * time.Second
+	seed(t, c, map[string]string{"a.txt": "one"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- c.RunSidecar(ctx) }()
+	for StartupReady(c.StateDir) != nil {
+		time.Sleep(20 * time.Millisecond)
+	}
+	reqDir := markerPath(c.Dir, "requests")
+	start := time.Now()
+	write(t, filepath.Join(reqDir, "r1"), "")
+	readResult(t, c, "r1")
+	write(t, filepath.Join(reqDir, "r2"), "")
+	readResult(t, c, "r2")
+	if elapsed := time.Since(start); elapsed < 2*time.Second {
+		t.Fatalf("two request files answered within %s; want at least the 2s spacing", elapsed)
+	}
+	cancel()
+	<-errc
 }

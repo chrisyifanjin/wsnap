@@ -46,6 +46,11 @@ type Config struct {
 	Request string
 	// TriggerPoll is how often the sidecar looks for request files.
 	TriggerPoll time.Duration
+	// FileRequestSpacing is the shortest time between two snapshots that
+	// request files (from the workload) trigger.
+	FileRequestSpacing time.Duration
+	// StrictReports makes a failed report an error (Jobs; see report).
+	StrictReports bool
 	// OperationTimeout bounds one snapshot or restore. Engines retry
 	// backend errors for a long time (restic up to 15 minutes), which would
 	// hold the request queue during a storage outage.
@@ -224,12 +229,35 @@ func (c *Config) invalidate(role protocol.Role) {
 	c.mu.Unlock()
 }
 
-func (c *Config) report(ctx context.Context, r protocol.Report) {
-	// A lost report delays bookkeeping only. For a final snapshot, the
-	// controller then rescues the volume, which is safe but slower.
-	if err := c.post(ctx, "/v1/report", r, nil); err != nil {
-		c.Log.Error("report failed", "operation", r.Operation, "error", err)
+// strictReportFor is how long a Job keeps retrying a report. A variable
+// for tests.
+var strictReportFor = 5 * time.Minute
+
+// report sends r to the broker. For a sidecar a lost report delays
+// bookkeeping only: without a recorded final snapshot, the controller
+// rescues the volume later. A Job (StrictReports) exists to produce the
+// record, so it retries for longer and returns the error, and the Job
+// fails instead of completing with nothing recorded.
+func (c *Config) report(ctx context.Context, r protocol.Report) error {
+	err := c.post(ctx, "/v1/report", r, nil)
+	if c.StrictReports {
+		deadline := time.Now().Add(strictReportFor)
+		for err != nil && retryable(err) && time.Now().Before(deadline) && ctx.Err() == nil {
+			c.Log.Warn("report failed; retrying", "operation", r.Operation, "error", err)
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Second):
+			}
+			err = c.post(ctx, "/v1/report", r, nil)
+		}
 	}
+	if err != nil {
+		c.Log.Error("report failed", "operation", r.Operation, "error", err)
+		if c.StrictReports {
+			return fmt.Errorf("report %s: %w", r.Operation, err)
+		}
+	}
+	return nil
 }
 
 // open fetches a credential for role and opens the repository with it.
@@ -294,8 +322,10 @@ func (c *Config) takeSnapshot(ctx context.Context, role protocol.Role, o snapOpt
 			c.Log.Debug("no change since the last snapshot; skipping", "id", st.id)
 			return st, st.id, nil
 		}
-		c.report(ctx, protocol.Report{Role: role, Operation: protocol.OpSnapshot, SnapshotID: st.id,
-			Final: o.final, Reused: true, Request: o.request, StartTime: start, EndTime: time.Now().UTC()})
+		if err := c.report(ctx, protocol.Report{Role: role, Operation: protocol.OpSnapshot, SnapshotID: st.id,
+			Final: o.final, Reused: true, Request: o.request, StartTime: start, EndTime: time.Now().UTC()}); err != nil {
+			return st, "", err
+		}
 		c.Log.Info("no change since the last snapshot; confirmed it", "id", st.id, "final", o.final, "request", o.request)
 		return st, st.id, nil
 	}
@@ -322,7 +352,9 @@ func (c *Config) takeSnapshot(ctx context.Context, role protocol.Role, o snapOpt
 		return st, "", err
 	}
 	rep.SnapshotID = snap.ID
-	c.report(context.WithoutCancel(ctx), rep)
+	if err := c.report(context.WithoutCancel(ctx), rep); err != nil {
+		return st, "", err
+	}
 	c.Log.Info("snapshot taken", "id", snap.ID, "final", o.final, "request", o.request, "seconds", rep.EndTime.Sub(start).Seconds())
 	return state{id: snap.ID, fp: fp, valid: fpErr == nil}, snap.ID, nil
 }
@@ -369,6 +401,14 @@ func (c *Config) quiesce(ctx context.Context) (thaw func()) {
 // writes makes an interrupted restore detectable: "restoring" exists from
 // the moment restored files start to appear until "initialized" exists.
 func (c *Config) initialize(ctx context.Context) (state, error) {
+	if c.swapPending() {
+		// A swap was cut off. A restorer Job may still be running it, so
+		// get admitted as the writer first: the broker refuses (409) while
+		// a Job works on this volume.
+		if _, err := c.credentials(ctx, protocol.RoleSnapshot); err != nil {
+			return state{}, err
+		}
+	}
 	if err := c.recoverSwap(); err != nil {
 		return state{}, err
 	}
@@ -409,9 +449,11 @@ func (c *Config) initialize(ctx context.Context) (state, error) {
 	if err := c.prepareTriggerDirs(); err != nil {
 		return state{}, err
 	}
+	syncDisks() // the restored files reach the disk before "initialized"
 	if err := v.WriteFile(MarkerPath(c.Dir), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
 		return state{}, err
 	}
+	syncDisks()
 	if err := v.Remove(restoring); err != nil && !os.IsNotExist(err) {
 		return state{}, err
 	}
@@ -474,8 +516,15 @@ func (c *Config) restore(ctx context.Context) (restoreResult, error) {
 		rep.SourceWorkspace, rep.RestoreFromGeneration = creds.SourceWorkspace, creds.RestoreFromGeneration
 	}
 	switch {
-	case errors.Is(err, engine.ErrRepositoryNotFound) && creds.SnapshotID == "" && creds.SourceWorkspace == "":
-		err = nil // a new workspace
+	case errors.Is(err, engine.ErrRepositoryNotFound) && creds.SnapshotID == "" && creds.SourceWorkspace == "" && creds.LatestSnapshotID == "":
+		err = nil // a new workspace: no repository, and the broker recorded no snapshot
+	case errors.Is(err, engine.ErrRepositoryNotFound):
+		// The broker recorded a snapshot (or a fork names one), so a missing
+		// repository is a misconfiguration or lost storage, never a new
+		// workspace. Starting empty would hide it and, after the first
+		// snapshot, bury the real history.
+		err = fmt.Errorf("the repository is missing, but snapshot %s is expected: %w",
+			cmp.Or(creds.SnapshotID, creds.LatestSnapshotID, "of "+creds.SourceWorkspace), err)
 	case err == nil && creds.SnapshotID != "":
 		id = creds.SnapshotID
 		err = c.stageAndMove(ctx, eng, t, id)
@@ -639,12 +688,27 @@ func (c *Config) RunSidecar(ctx context.Context) error {
 		inflight = map[trigger]bool{}
 		recent   = map[trigger]time.Time{}
 	)
+	var (
+		lastFileRun time.Time
+		fileTimer   <-chan time.Time
+	)
 	startNext := func() {
 		if p != nil {
 			return
 		}
 		switch {
 		case len(queue) > 0:
+			// Request files come from the workload. Space their snapshots,
+			// so it cannot flood the repository (or push history out).
+			if t := queue[0]; !t.object && t.name != "" {
+				if wait := c.FileRequestSpacing - time.Since(lastFileRun); wait > 0 {
+					if fileTimer == nil {
+						fileTimer = time.After(wait)
+					}
+					return
+				}
+				lastFileRun = time.Now()
+			}
 			p = c.start(pbase, st, queue[0])
 			queue = queue[1:]
 		case tickDue:
@@ -660,6 +724,9 @@ func (c *Config) RunSidecar(ctx context.Context) error {
 		select {
 		case <-ticker.C:
 			tickDue = true
+			startNext()
+		case <-fileTimer:
+			fileTimer = nil
 			startNext()
 		case t := <-triggers:
 			if t.object {
@@ -929,6 +996,7 @@ func (c *Config) initializeWithRetry(ctx context.Context) (state, error) {
 // an error while checking, fails the Job: the controller then keeps the PV
 // (RescueFailed) instead of reclaiming data that was never saved.
 func (c *Config) RunMover(ctx context.Context) error {
+	c.StrictReports = true
 	// An in-place restore cut off mid-swap: finish it, so the volume holds
 	// whole trees. The pre-restore data was snapshotted before the swap.
 	if err := c.recoverSwap(); err != nil {
@@ -940,12 +1008,14 @@ func (c *Config) RunMover(ctx context.Context) error {
 	}
 	if reason != "" {
 		c.Log.Info("nothing to save", "reason", reason)
+		now := time.Now().UTC()
+		rep := protocol.Report{Role: protocol.RoleMover, Operation: protocol.OpSnapshot, Request: c.Request,
+			NoData: true, Final: true, StartTime: now, EndTime: now}
 		if c.Request != "" {
-			now := time.Now().UTC()
-			c.report(ctx, protocol.Report{Role: protocol.RoleMover, Operation: protocol.OpSnapshot, Request: c.Request,
-				Error: "volume not snapshotted: " + reason, StartTime: now, EndTime: now})
+			rep.Error = "volume not snapshotted: " + reason
 		}
-		return nil
+		// The controller frees the volume only after the broker marks it.
+		return c.report(ctx, rep)
 	}
 	_, _, err = c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{final: true, request: c.Request}, state{})
 	return err
@@ -997,7 +1067,7 @@ func (c *Config) RunMaintenance(ctx context.Context) error {
 	rep := protocol.Report{Role: protocol.RoleMaintenance, Operation: protocol.OpMaintenance, StartTime: start}
 	creds, eng, t, err := c.open(ctx, protocol.RoleMaintenance)
 	if err == nil {
-		err = eng.Maintain(ctx, t, creds.KeepLast, creds.KeepIDs)
+		err = eng.Maintain(ctx, t, engine.Retention{KeepLast: creds.KeepLast, KeepDaily: creds.KeepDaily, Keep: creds.KeepIDs})
 	}
 	rep.EndTime = time.Now().UTC()
 	if err != nil {
@@ -1029,16 +1099,18 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 		c.report(context.WithoutCancel(ctx), rep)
 		return st, id, err
 	}
-	cur, _, err := c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true}, cur)
-	if err != nil {
-		return finish(cur, "", fmt.Errorf("could not save the live data before the restore: %w", err))
-	}
 	creds, err := c.credentialsFor(ctx, protocol.CredentialsRequest{Role: protocol.RoleRestore, Request: request})
 	if err != nil {
 		return finish(cur, "", err)
 	}
 	rep.SourceWorkspace = creds.SourceWorkspace
-	id, err := c.restoreAndSwap(ctx, creds)
+	id, err := c.restoreAndSwap(ctx, creds, func() error {
+		var err error
+		if cur, _, err = c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true}, cur); err != nil {
+			return fmt.Errorf("could not save the live data before the restore: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return finish(cur, id, err)
 	}
@@ -1052,7 +1124,11 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 	return finish(st, id, nil)
 }
 
-func (c *Config) restoreAndSwap(ctx context.Context, creds *protocol.CredentialsResponse) (string, error) {
+// restoreAndSwap downloads the snapshot into .wsnap/staging, calls
+// beforeSwap (the safety snapshot of the live data), then swaps. The
+// safety snapshot runs after the download, so writes made while the
+// snapshot downloads are in it too.
+func (c *Config) restoreAndSwap(ctx context.Context, creds *protocol.CredentialsResponse, beforeSwap func() error) (string, error) {
 	ctx, cancel := c.withOperationTimeout(ctx)
 	defer cancel()
 	eng, err := engine.New(creds.Engine)
@@ -1093,6 +1169,9 @@ func (c *Config) restoreAndSwap(ctx context.Context, creds *protocol.Credentials
 	if err := eng.Restore(ctx, t, id, staging); err != nil {
 		return "", err
 	}
+	if err := beforeSwap(); err != nil {
+		return "", err
+	}
 	return id, c.swap()
 }
 
@@ -1115,10 +1194,23 @@ func (c *Config) swap() error {
 	if err := v.MkdirAll(trash, 0o755); err != nil {
 		return err
 	}
+	syncDisks() // the staged tree is on disk before the swap starts
 	if err := v.WriteFile(marker, []byte("1\n"), 0o644); err != nil {
 		return err
 	}
 	return c.recoverSwap()
+}
+
+// swapPending reports whether .wsnap/swap exists. An error counts as
+// pending, so the caller takes the safe path.
+func (c *Config) swapPending() bool {
+	v, err := openVolume(c.Dir)
+	if err != nil {
+		return true
+	}
+	defer v.Close()
+	_, err = v.Lstat(markerPath(c.Dir, "swap"))
+	return !os.IsNotExist(err)
 }
 
 // recoverSwap finishes a swap from whichever phase it reached.
@@ -1154,6 +1246,7 @@ func (c *Config) recoverSwap() error {
 	if err := moveEntries(v, staging, c.Dir, false); err != nil {
 		return fmt.Errorf("swap phase 2: %w", err)
 	}
+	syncDisks() // the renames are on disk before the marker goes
 	if err := v.Remove(marker); err != nil {
 		return err
 	}
@@ -1208,6 +1301,7 @@ func clearCollisions(v *volume, src, dst, trash string) error {
 // Like restoreInPlace, it saves the volume's data first, and reports the
 // request only after the restored state is in a snapshot.
 func (c *Config) RunRestorer(ctx context.Context) error {
+	c.StrictReports = true
 	if err := c.recoverSwap(); err != nil {
 		return err
 	}
@@ -1218,25 +1312,26 @@ func (c *Config) RunRestorer(ctx context.Context) error {
 		if err != nil {
 			rep.Error = err.Error()
 		}
-		c.report(context.WithoutCancel(ctx), rep)
-		return err
-	}
-	// The last Pod may have stopped without a final snapshot.
-	reason, err := c.notWorkspaceData()
-	if err != nil {
-		return finish("", fmt.Errorf("check the volume: %w", err))
-	}
-	if reason == "" {
-		if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{}, state{}); err != nil {
-			return finish("", fmt.Errorf("could not save the volume before the restore: %w", err))
-		}
+		return cmp.Or(err, c.report(context.WithoutCancel(ctx), rep))
 	}
 	creds, err := c.credentialsFor(ctx, protocol.CredentialsRequest{Role: protocol.RoleRestore, Request: c.Request})
 	if err != nil {
 		return finish("", err)
 	}
 	rep.SourceWorkspace = creds.SourceWorkspace
-	id, err := c.restoreAndSwap(ctx, creds)
+	id, err := c.restoreAndSwap(ctx, creds, func() error {
+		// The last Pod may have stopped without a final snapshot.
+		reason, err := c.notWorkspaceData()
+		if err != nil {
+			return fmt.Errorf("check the volume: %w", err)
+		}
+		if reason == "" {
+			if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{}, state{}); err != nil {
+				return fmt.Errorf("could not save the volume before the restore: %w", err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return finish(id, err)
 	}

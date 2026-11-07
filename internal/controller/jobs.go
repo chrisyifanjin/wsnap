@@ -173,6 +173,18 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 			}
 		}
 		ws.Status.Jobs = append(ws.Status.Jobs, ref)
+		if len(ws.Status.Jobs) > maxRecordedJobs {
+			// Drop entries of Jobs that are gone first: dropping a running
+			// Job's entry would make the broker refuse it.
+			ws.Status.Jobs = slices.DeleteFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool {
+				if j.UID == ref.UID {
+					return false
+				}
+				var cur batchv1.Job
+				err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: j.Name}, &cur)
+				return apierrors.IsNotFound(err) || (err == nil && string(cur.UID) != j.UID)
+			})
+		}
 		if n := len(ws.Status.Jobs); n > maxRecordedJobs {
 			ws.Status.Jobs = ws.Status.Jobs[n-maxRecordedJobs:]
 		}

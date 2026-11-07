@@ -144,13 +144,13 @@ func TestEphemeralContainersCannotReachTheSidecar(t *testing.T) {
 			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", VolumeMounts: mounts}}}
 		return q
 	}
-	if err := ValidateEphemeral(debug("agent"), "wsnap", "wsnap"); err != nil {
+	if err := ValidateEphemeral(debug("agent"), "wsnap", false); err != nil {
 		t.Errorf("debugging the workload was refused: %v", err)
 	}
-	if err := ValidateEphemeral(debug("wsnap"), "wsnap", "wsnap"); err == nil {
+	if err := ValidateEphemeral(debug("wsnap"), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may share the sidecar's process namespace")
 	}
-	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: tokenVolume, MountPath: "/t"}), "wsnap", "wsnap"); err == nil {
+	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: tokenVolume, MountPath: "/t"}), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may mount the wsnap token")
 	}
 }
@@ -174,5 +174,45 @@ func TestSidecarIsRootWhateverThePodSays(t *testing.T) {
 	pr := p.Spec.InitContainers[0].StartupProbe
 	if limit := time.Duration(pr.PeriodSeconds*pr.FailureThreshold) * time.Second; limit < 4*time.Hour {
 		t.Fatalf("startup probe gives up after %s", limit)
+	}
+}
+
+// TestWorkloadCannotReachAgentSecretsOrTheAPI (reviewer #4 finding 9).
+func TestWorkloadCannotReachAgentSecretsOrTheAPI(t *testing.T) {
+	apiToken := corev1.Volume{Name: "kube-api-access-x", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token"}}}}}}
+	vaultToken := corev1.Volume{Name: "vault", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "vault", Path: "token"}}}}}}
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*corev1.Pod)
+		allowed bool
+	}{
+		{"a copied kube-api-access volume", func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, apiToken)
+			p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: apiToken.Name, MountPath: "/var/run/secrets/kubernetes.io/serviceaccount"})
+		}, false},
+		{"a token for another audience", func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, vaultToken)
+			p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "vault", MountPath: "/vault"})
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := labeledPod(tc.mutate)
+			if err := Mutate(p, cfg); (err == nil) != tc.allowed {
+				t.Fatalf("Mutate err = %v, want allowed=%v", err, tc.allowed)
+			}
+		})
+	}
+	// The sidecar's state volume holds the engine configuration with
+	// storage credentials. Inject first, then let the workload mount it.
+	p := labeledPod()
+	if err := Mutate(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: stateVolume, MountPath: "/steal"})
+	p.Annotations = map[string]string{AnnotationInject: "false"}
+	if err := Mutate(p, cfg); err == nil {
+		t.Fatal("a workload container that mounts the sidecar's state volume was admitted")
 	}
 }

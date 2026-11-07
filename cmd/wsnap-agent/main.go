@@ -42,6 +42,7 @@ func main() {
 	caFile := fs.String("ca-file", os.Getenv("WSNAP_CA_FILE"), "CA bundle that signs the broker's TLS certificate")
 	fs.DurationVar(&cfg.QuiesceTimeout, "quiesce-timeout", 0, "ask the workload to quiesce before each snapshot and wait this long for its ack (0 disables)")
 	fs.StringVar(&cfg.Request, "request", "", "WorkspaceSnapshot or WorkspaceRestore served by this Job")
+	fs.DurationVar(&cfg.FileRequestSpacing, "file-request-spacing", 30*time.Second, "shortest time between snapshots triggered by request files")
 	fs.DurationVar(&cfg.OperationTimeout, "operation-timeout", 30*time.Minute, "time limit for one snapshot or restore; keep it at least 5m below the repository's credentials.ttl")
 	_ = fs.Parse(os.Args[2:])
 	// A credential request includes the broker's STS round trip.

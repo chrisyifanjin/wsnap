@@ -6,6 +6,8 @@ package broker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -306,42 +308,8 @@ func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 // request credentials themselves. The agent's token must be mounted only
 // into the sidecar.
 func (s *Server) checkWorkloadIsolation(pod *corev1.Pod) error {
-	tokenVolumes := map[string]bool{}
-	for _, v := range pod.Spec.Volumes {
-		if v.Projected == nil {
-			continue
-		}
-		for _, src := range v.Projected.Sources {
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == s.Audience {
-				tokenVolumes[v.Name] = true
-			}
-		}
-	}
-	if ptr.Deref(pod.Spec.ShareProcessNamespace, false) || pod.Spec.HostPID {
-		return fail(http.StatusForbidden, "pod %s shares a process namespace; the workload could read the agent's secrets through /proc", pod.Name)
-	}
-	sidecar := workspace.SidecarName(pod)
-	for _, ec := range pod.Spec.EphemeralContainers {
-		if ec.TargetContainerName == sidecar {
-			return fail(http.StatusForbidden, "ephemeral container %q shares the %q container's process namespace", ec.Name, sidecar)
-		}
-		for _, m := range ec.VolumeMounts {
-			if tokenVolumes[m.Name] {
-				return fail(http.StatusForbidden, "ephemeral container %q mounts the wsnap token", ec.Name)
-			}
-		}
-	}
-	for _, list := range [][]corev1.Container{pod.Spec.Containers, pod.Spec.InitContainers} {
-		for _, ctr := range list {
-			if ctr.Name == sidecar {
-				continue
-			}
-			for _, m := range ctr.VolumeMounts {
-				if tokenVolumes[m.Name] {
-					return fail(http.StatusForbidden, "container %q mounts the wsnap token volume %q; mount it only into the %q container", ctr.Name, m.Name, sidecar)
-				}
-			}
-		}
+	if err := workspace.CheckIsolation(pod, s.Audience, s.AllowAutomountedTokens); err != nil {
+		return fail(http.StatusForbidden, "pod %s: %v", pod.Name, err)
 	}
 	return nil
 }
@@ -433,6 +401,11 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 	if restoreReq == nil && c.job == "restorer" && req.Role == protocol.RoleRestore {
 		return nil, fail(http.StatusForbidden, "a restorer job must name its WorkspaceRestore")
 	}
+	if c.job == "mover" || c.job == "restorer" {
+		if err := s.checkNoWorkloadOnVolume(ctx, c); err != nil {
+			return nil, err
+		}
+	}
 	var repo wsnapv1.SnapshotRepository
 	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: c.id.Repository}, &repo); err != nil {
 		return nil, upstream(err, "snapshot repository %s/%s", c.id.Namespace, c.id.Repository)
@@ -448,7 +421,7 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 			return nil, err
 		}
 		if req.Role == protocol.RoleRestore && restoreReq == nil {
-			if err := s.checkNoPendingRescue(ctx, c.id); err != nil {
+			if err := s.checkNoPendingRescue(ctx, c); err != nil {
 				return nil, err
 			}
 		}
@@ -538,10 +511,14 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 		Engine: eng, Backend: backend, Credentials: creds, RepositoryPassword: password,
 		Interval:   protocol.Duration{Duration: workspace.Interval(&repo)},
 		KeepLast:   workspace.KeepLast(&repo),
+		KeepDaily:  workspace.KeepDaily(&repo),
 		SnapshotID: snapshotID, SourceWorkspace: source, RestoreFromGeneration: restoreGen,
 		LatestSnapshotID: latestID, KeepIDs: keep,
 	}, nil
 }
+
+// maxSuperseded bounds Workspace.status.supersededSnapshots.
+const maxSuperseded = 10
 
 // pinnedSnapshots lists the snapshots of workspace id that maintenance
 // must keep: its recorded newest snapshot, and every snapshot that a
@@ -555,6 +532,11 @@ func (s *Server) pinnedSnapshots(ctx context.Context, id workspace.Identity) ([]
 	for _, ws := range list.Items {
 		if ws.Name == id.Name && ws.Status.LastSnapshot != nil {
 			keep = append(keep, ws.Status.LastSnapshot.ID)
+		}
+		if ws.Name == id.Name {
+			for _, s := range ws.Status.SupersededSnapshots {
+				keep = append(keep, s.ID)
+			}
 		}
 		if rf := ws.Spec.RestoreFrom; rf != nil && rf.SnapshotID != "" {
 			src := rf.WorkspaceName
@@ -592,13 +574,19 @@ func (s *Server) ensureWorkspace(ctx context.Context, id workspace.Identity) (*w
 				Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue}},
 			Spec: wsnapv1.WorkspaceSpec{RepositoryName: id.Repository},
 		}
-		if err := s.Client.Create(ctx, &ws); err != nil && !apierrors.IsAlreadyExists(err) {
-			return nil, fail(http.StatusInternalServerError, "create workspace: %v", err)
+		err = s.Client.Create(ctx, &ws)
+		if err == nil {
+			return &ws, nil
 		}
-		return &ws, nil
+		if !apierrors.IsAlreadyExists(err) {
+			return nil, upstream(err, "create workspace")
+		}
+		// Lost the race: the winner (a user who set restoreFrom, or another
+		// replica) has the real spec and status; ours is empty.
+		err = s.Reader.Get(ctx, client.ObjectKey{Namespace: id.Namespace, Name: id.Name}, &ws)
 	}
 	if err != nil {
-		return nil, err
+		return nil, upstream(err, "workspace %s", id.Name)
 	}
 	if ws.Spec.RepositoryName != id.Repository {
 		return nil, fail(http.StatusConflict, "workspace %s uses repository %s, but the pod asks for %s", id.Name, ws.Spec.RepositoryName, id.Repository)
@@ -654,8 +642,10 @@ func stillWriting(p *corev1.Pod, now time.Time) bool {
 // checkNoPendingRescue holds a restore while a released volume of this
 // workspace still awaits its rescue snapshot. Restoring earlier would start
 // from an older snapshot, and the rescue would then roll the new Pod back.
-func (s *Server) checkNoPendingRescue(ctx context.Context, id workspace.Identity) error {
+func (s *Server) checkNoPendingRescue(ctx context.Context, c *caller) error {
+	id := c.id
 	ref := id.Namespace + "/" + id.Name
+	own, _ := workspace.ResolveVolume(ctx, s.Reader, c.pod)
 	var pvs corev1.PersistentVolumeList
 	if err := s.Client.List(ctx, &pvs, client.MatchingFields{workspace.IndexWorkspaceRef: ref}); err != nil {
 		return err
@@ -672,8 +662,60 @@ func (s *Server) checkNoPendingRescue(ctx context.Context, id workspace.Identity
 		if running || awaiting {
 			return fail(http.StatusConflict, "volume %s of workspace %s is being rescued; waiting", pv.Name, id.Name)
 		}
+		if rescue == "" && !hasFinal && pv.Status.Phase == corev1.VolumeBound && pv.Name != own.VolumeName {
+			if err := s.checkStoppedWriterVolume(ctx, id, &pv); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// checkStoppedWriterVolume handles a volume that is still bound but whose
+// writer stopped without a final snapshot: a Pod that failed (a hard
+// eviction gives no grace period) keeps its ephemeral claim until it is
+// deleted. Its data is newer than lastSnapshot. The broker asks for a
+// snapshot of exactly that volume and makes restores wait for it. A
+// failed rescue does not block forever: as with a Released PV whose rescue
+// failed, the operator is alerted (status.lastError) and restores go on.
+func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Identity, pv *corev1.PersistentVolume) error {
+	writer := pv.Annotations[workspace.AnnotationWriterPod]
+	if writer == "" {
+		return nil
+	}
+	var pods corev1.PodList
+	if err := s.Reader.List(ctx, &pods, client.InNamespace(id.Namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: id.Name}); err != nil {
+		return upstream(err, "list workspace pods")
+	}
+	for _, p := range pods.Items {
+		if string(p.UID) == writer && p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+			return nil // still running: the single-writer rule applies
+		}
+	}
+	h := sha256.Sum256([]byte(pv.Name + "\x00" + writer))
+	name := "wsnap-unsaved-" + hex.EncodeToString(h[:])[:10]
+	var req wsnapv1.WorkspaceSnapshot
+	err := s.Reader.Get(ctx, client.ObjectKey{Namespace: id.Namespace, Name: name}, &req)
+	if apierrors.IsNotFound(err) {
+		req = wsnapv1.WorkspaceSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Namespace: id.Namespace, Name: name,
+				Labels:      map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue},
+				Annotations: map[string]string{wsnapv1.AnnotationVolumeName: pv.Name}},
+			Spec: wsnapv1.WorkspaceSnapshotSpec{WorkspaceName: id.Name},
+		}
+		if err := s.Client.Create(ctx, &req); err != nil && !apierrors.IsAlreadyExists(err) {
+			return upstream(err, "create rescue request")
+		}
+		return fail(http.StatusConflict, "volume %s of stopped pod holds unsaved data; saving it first (request %s)", pv.Name, name)
+	}
+	if err != nil {
+		return upstream(err, "rescue request %s", name)
+	}
+	switch req.Status.Phase {
+	case wsnapv1.SnapshotSucceeded, wsnapv1.SnapshotFailed:
+		return nil
+	}
+	return fail(http.StatusConflict, "volume %s of stopped pod holds unsaved data; waiting for request %s", pv.Name, name)
 }
 
 // trackVolume records the workspace volume, protects its PV and marks this
@@ -736,6 +778,35 @@ func (s *Server) trackVolume(ctx context.Context, c *caller, consumeRestoreFrom 
 		workspace.AnnotationWriterEpoch: strconv.FormatInt(epoch, 10),
 	}); err != nil {
 		return fmt.Errorf("mark volume writer: %w", err)
+	}
+	return nil
+}
+
+// checkNoWorkloadOnVolume makes a mover or restorer wait while a workspace
+// Pod that has not stopped uses the Job's volume: its sidecar may be
+// restoring into it or taking its final snapshot. It is the broker's half
+// of "one agent per volume"; checkNoActiveJob is the other half.
+func (s *Server) checkNoWorkloadOnVolume(ctx context.Context, c *caller) error {
+	volume := c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
+	if volume == "" {
+		return nil
+	}
+	var pods corev1.PodList
+	if err := s.Reader.List(ctx, &pods, client.InNamespace(c.id.Namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: c.id.Name}); err != nil {
+		return upstream(err, "list workspace pods")
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		ref, err := workspace.ResolveVolume(ctx, s.Reader, p)
+		if err != nil {
+			continue // not bound yet, or no usable volume: not this one
+		}
+		if ref.VolumeName == volume {
+			return fail(http.StatusConflict, "pod %s uses volume %s; waiting until it stops", p.Name, volume)
+		}
 	}
 	return nil
 }
@@ -830,6 +901,15 @@ func (s *Server) report(r *http.Request) error {
 	default:
 		reports.WithLabelValues(string(rep.Operation), "ok").Inc()
 	}
+	if rep.NoData {
+		if c.job != "mover" || rep.Operation != protocol.OpSnapshot {
+			return fail(http.StatusBadRequest, "only a mover reports a volume without data")
+		}
+		if err := s.markFinal(ctx, c, c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]); err != nil {
+			return err
+		}
+		return s.completeRequest(ctx, c, rep.Request, false, "", "", rep.Error)
+	}
 	if rep.Error != "" {
 		s.Log.Info("agent reported failure", "workspace", c.id.Name, "operation", rep.Operation, "error", rep.Error)
 		if err := s.updateStatus(ctx, c.id, func(st *wsnapv1.WorkspaceStatus) {
@@ -875,6 +955,11 @@ func (s *Server) report(r *http.Request) error {
 			superseded = st.LastSnapshot != nil && rec.Epoch < st.LastSnapshot.Epoch
 			if !superseded {
 				st.LastSnapshot = &rec
+			} else if !rep.Reused {
+				st.SupersededSnapshots = append(st.SupersededSnapshots, rec)
+				if n := len(st.SupersededSnapshots); n > maxSuperseded {
+					st.SupersededSnapshots = st.SupersededSnapshots[n-maxSuperseded:]
+				}
 			}
 			if !rep.Reused {
 				st.SnapshotsSinceMaintenance++
@@ -885,7 +970,7 @@ func (s *Server) report(r *http.Request) error {
 			return err
 		}
 		if superseded {
-			s.Log.Info("snapshot of an older writer epoch kept, but not as the newest", "workspace", c.id.Name,
+			s.Log.Info("snapshot of an older writer epoch kept in status.supersededSnapshots, not as the newest", "workspace", c.id.Name,
 				"snapshot", rep.SnapshotID, "epoch", rec.Epoch)
 		}
 		if rep.Final {
@@ -962,8 +1047,10 @@ func (s *Server) markFinal(ctx context.Context, c *caller, volumeName string) er
 // named by this Job (restorer).
 func (s *Server) claimedRestore(ctx context.Context, c *caller, name string) (*wsnapv1.WorkspaceRestore, error) {
 	var r wsnapv1.WorkspaceRestore
-	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: name}, &r); err != nil {
+	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: name}, &r); apierrors.IsNotFound(err) {
 		return nil, fail(http.StatusForbidden, "restore request %s: %v", name, err)
+	} else if err != nil {
+		return nil, upstream(err, "restore request %s", name)
 	}
 	if r.Spec.WorkspaceName != c.id.Name || r.Status.Phase != wsnapv1.SnapshotRunning {
 		return nil, fail(http.StatusForbidden, "restore request %s is not running for workspace %s", name, c.id.Name)

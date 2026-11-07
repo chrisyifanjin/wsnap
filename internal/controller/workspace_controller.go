@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -13,6 +14,10 @@ import (
 
 	wsnapv1 "github.com/chrisyifanjin/wsnap/api/v1alpha1"
 )
+
+// MaintenanceMinInterval is the shortest time between two maintenance
+// runs of one workspace.
+var MaintenanceMinInterval = time.Hour
 
 // WorkspaceReconciler starts maintenance Jobs. Maintenance needs the delete
 // permission, which no sidecar ever gets, so it always runs in a Job.
@@ -37,6 +42,13 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	every := repo.Spec.Retention.MaintenanceEvery
 	if every <= 0 || ws.Status.SnapshotsSinceMaintenance < every {
 		return ctrl.Result{}, nil
+	}
+	// The workload can trigger snapshots, so the count alone must not let
+	// it run maintenance (which deletes) as often as it likes.
+	if last := ws.Status.LastMaintenance; last != nil {
+		if wait := MaintenanceMinInterval - time.Since(last.Time); wait > 0 {
+			return ctrl.Result{RequeueAfter: wait}, nil
+		}
 	}
 	// One maintenance Job at a time per workspace.
 	var jobs batchv1.JobList

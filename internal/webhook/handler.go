@@ -24,7 +24,7 @@ func (h *Handler) Handle(_ context.Context, req admission.Request) admission.Res
 		pod.Namespace = req.Namespace // generateName Pods have no namespace yet
 	}
 	if req.SubResource == "ephemeralcontainers" {
-		if err := ValidateEphemeral(&pod, workspaceSidecar(&pod), h.Config.Audience); err != nil {
+		if err := ValidateEphemeral(&pod, h.Config.Audience, h.Config.AllowAPIToken); err != nil {
 			return admission.Denied("wsnap: " + err.Error())
 		}
 		return admission.Allowed("")
@@ -37,11 +37,4 @@ func (h *Handler) Handle(_ context.Context, req admission.Request) admission.Res
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, raw)
-}
-
-func workspaceSidecar(pod *corev1.Pod) string {
-	if n := pod.Annotations["wsnap.dev/sidecar"]; n != "" {
-		return n
-	}
-	return "wsnap"
 }
