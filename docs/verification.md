@@ -265,6 +265,13 @@ Found by the fourth independent review, and fixed:
   (`TestWorkloadCannotReachAgentSecretsOrTheAPI`).
 - **Some outages still answered 4xx** (gateway TokenReview and access
   reviews, restore-request reads). They now answer 503.
+- **The workload kept the API token** (found by the end-to-end suite
+  while checking the fix above). The ServiceAccount admission plugin runs
+  before mutating webhooks, so a Pod that did not set
+  `automountServiceAccountToken` itself already had `kube-api-access-*`
+  mounted into every container; the webhook's `false` came too late, and
+  the broker checked only the field. The webhook now removes API-token
+  volumes and their mounts (`TestAdmissionPluginTokenIsRemoved`).
 - Restored data and swap renames are flushed to disk before their
   completion markers, and a full Job registry drops entries of Jobs that
   are gone before those of running Jobs (`TestJobRegistryKeepsRunningJobs`).

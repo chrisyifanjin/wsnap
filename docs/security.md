@@ -16,7 +16,7 @@ wsnap protects against these attacks from the agent container:
 | Read another workspace's snapshots | Each credential opens one workspace repository only. |
 | Delete or corrupt snapshot history | Writing roles cannot delete (except engine scratch objects). Retention keeps the newest snapshot of each of the last 7 days, maintenance runs at most hourly, and request files are rate limited, so a flood of snapshots cannot push history out. |
 | Get a credential at all | The agent container has no token for the broker's audience. |
-| Get Kubernetes API access to create Pods that ask for credentials | Pods that mount the default API token are refused. |
+| Get Kubernetes API access to create Pods that ask for credentials | The webhook removes the API token that the ServiceAccount admission plugin mounted (it runs before webhooks, so setting `automountServiceAccountToken: false` there is too late). The broker refuses a Pod whose workload containers still mount one. |
 | Read the sidecar's memory or environment through `/proc` | Pods with a shared process namespace are refused. |
 | Lead the sidecar out of the volume with symlinks | File operations on the volume go through `os.Root`. |
 | Replace the sidecar's binaries | The sidecar's root filesystem is read-only. |

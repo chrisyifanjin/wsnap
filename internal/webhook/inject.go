@@ -6,6 +6,7 @@ package webhook
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -78,6 +79,9 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		return fmt.Errorf("automountServiceAccountToken is true: untrusted containers would hold an API token; remove it or set it to false")
 	}
 	pod.Spec.AutomountServiceAccountToken = ptr.To(false)
+	if !cfg.AllowAPIToken {
+		removeAPITokens(pod)
+	}
 
 	finalTimeout := defaultFinalTimeout
 	if v := pod.Annotations[AnnotationFinalTimeout]; v != "" {
@@ -203,6 +207,39 @@ func validate(pod *corev1.Pod, sidecarName, audience string, allowAPIToken bool)
 // targets the sidecar and so shares its process namespace.
 func ValidateEphemeral(pod *corev1.Pod, audience string, allowAPIToken bool) error {
 	return workspace.CheckIsolation(pod, audience, allowAPIToken)
+}
+
+// removeAPITokens takes API server tokens out of the Pod. The
+// ServiceAccount admission plugin runs before mutating webhooks, so when a
+// Pod does not set automountServiceAccountToken itself, its
+// kube-api-access volume is already mounted into every container by the
+// time this webhook sets the field to false. Removing the projected volumes
+// that carry an API token (no audience), and their mounts, gives the Pod
+// what automountServiceAccountToken: false would have given it.
+func removeAPITokens(pod *corev1.Pod) {
+	drop := map[string]bool{}
+	pod.Spec.Volumes = slices.DeleteFunc(pod.Spec.Volumes, func(v corev1.Volume) bool {
+		if v.Projected == nil {
+			return false
+		}
+		for _, src := range v.Projected.Sources {
+			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == "" {
+				drop[v.Name] = true
+				return true
+			}
+		}
+		return false
+	})
+	if len(drop) == 0 {
+		return
+	}
+	strip := func(cs []corev1.Container) {
+		for i := range cs {
+			cs[i].VolumeMounts = slices.DeleteFunc(cs[i].VolumeMounts, func(m corev1.VolumeMount) bool { return drop[m.Name] })
+		}
+	}
+	strip(pod.Spec.InitContainers)
+	strip(pod.Spec.Containers)
 }
 
 func hasVolume(pod *corev1.Pod, name string) bool {
