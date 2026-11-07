@@ -65,6 +65,10 @@ req_is() { [[ $(req_phase "$1" "$2") == "$3" ]]; }
 req_field() { kubectl -n "$NS" get "$1" "$2" -o jsonpath="{$3}" 2>/dev/null; }
 
 apply_request() { # kind name workspace [snapshotID] [sourceWorkspace]
+	# Requests are one-shot objects. Reapplying a name from an earlier run
+	# preserves its terminal status and can make a rerun pass or fail against
+	# stale results instead of exercising the agent.
+	kubectl -n "$NS" delete "$1" "$2" --ignore-not-found --wait=true >/dev/null
 	if [[ $1 == wssnap ]]; then
 		printf 'apiVersion: wsnap.dev/v1alpha1\nkind: WorkspaceSnapshot\nmetadata: {name: %s, namespace: %s}\nspec: {workspaceName: %s}\n' "$2" "$NS" "$3" | kubectl apply -f -
 	else
@@ -230,6 +234,7 @@ EOF
 
 pv_of() { kubectl -n "$NS" get pvc "$1" -o jsonpath='{.spec.volumeName}'; }
 pv_gone() { ! kubectl get pv "$1" >/dev/null 2>&1; }
+pvc_gone() { ! kubectl -n "$NS" get pvc "$1" >/dev/null 2>&1; }
 pod_ready() { [[ $(kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]; }
 read_file() { kubectl -n "$NS" exec "$1" -c agent -- cat "$2"; }
 write_file() { kubectl -n "$NS" exec "$1" -c agent -- sh -c "echo '$3' > $2"; }
@@ -248,6 +253,9 @@ setup() {
 	# The setup Job is not idempotent (policy attach fails when attached).
 	kubectl -n storage delete job minio-setup --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	kubectl apply -f "$M/minio.yaml" >/dev/null
+	# The TLS scenario patches the Deployment outside kubectl apply's field
+	# ownership. Recreate it so a later setup really returns to plain HTTP.
+	kubectl -n wsnap-system delete deploy wsnap-controller --ignore-not-found --wait=true >/dev/null
 	kubectl apply -k "$ROOT/config/default" >/dev/null
 	kubectl -n wsnap-system rollout restart deploy/wsnap-controller >/dev/null
 	kubectl -n storage wait --for=condition=complete job/minio-setup --timeout=180s >/dev/null
@@ -427,10 +435,17 @@ scenario_singlewriter() {
 
 scenario_requests() {
 	log "requests: control plane (CRs) and data plane (files); work done by the Pod or a Job"
+	# A failed earlier run may have left the claim and its initialized data.
+	# Start from an empty volume so this scenario tests a fresh restore path.
+	kubectl -n "$NS" delete pod req-1 req-2 fork-1 fork-2 --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc req-a --ignore-not-found --wait=true >/dev/null
 	fresh_workspace ws-req
 	apply_pvc req-a >/dev/null
 	apply_pod req-1 ws-req kopia-keep pvc:req-a yes >/dev/null
 	wait_for 180 "req-1 ready" pod_ready req-1
+	# The repository intentionally survives test runs, so a new PVC may
+	# restore files from the previous run. Establish the baseline explicitly.
+	kubectl -n "$NS" exec req-1 -c agent -- rm -f /workspace/added-later.txt
 	write_file req-1 /workspace/state.txt v1
 
 	apply_request wssnap snap-live ws-req >/dev/null
@@ -495,7 +510,10 @@ scenario_requests() {
 	apply_request wssnap snap-nothing ws-tmp >/dev/null
 	wait_for 60 "request with nothing to act on" req_is wssnap snap-nothing Failed
 	pass "request for an emptyDir workspace with no Pod failed: $(req_field wssnap snap-nothing .status.message)"
-	kubectl -n "$NS" delete pvc req-a >/dev/null
+	wait_for 60 "finished request Job Pods removed" no_pods "$NS" 'wsnap.dev/job-workspace=ws-req,wsnap.dev/job in (mover,restorer)'
+	kubectl -n "$NS" delete pvc req-a --wait=false >/dev/null
+	wait_for 60 "PVC deleted after request Jobs" pvc_gone req-a
+	pass "finished Jobs released the PVC promptly for deletion or reprovisioning"
 }
 
 scenario_chaos() {
@@ -607,10 +625,12 @@ scenario_tls() {
 	broker_tls on
 	pass "broker restarted with TLS (certificate signed by a private CA)"
 
+	kubectl -n "$NS" delete pod tls-1 tls-bad tls-plain --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc tls-a --ignore-not-found --wait=true >/dev/null
 	fresh_workspace ws-tls
 	apply_pvc tls-a >/dev/null
 	WSNAP_TLS=trusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8080, --ca-file=/var/run/wsnap-ca/ca.crt" \
-		apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes >/dev/null
+		wait_for 60 "webhook admission after TLS rollout" apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes
 	wait_for 180 "tls-1 ready" pod_ready tls-1
 	write_file tls-1 /workspace/secret.txt over-tls
 	kubectl -n "$NS" delete pod tls-1 --wait=true >/dev/null
@@ -652,10 +672,13 @@ scenario_multinode() {
 	fi
 	local a=${nodes[0]} b=${nodes[1]}
 	log "multinode: workers $a and $b"
+	# A previous failed drain may leave its bare Pod and cordon behind.
+	kubectl uncordon "$a" >/dev/null
+	kubectl -n "$NS" delete pod drain-1 drain-2 --ignore-not-found --wait=true >/dev/null
 
 	fresh_workspace ws-mn
 	apply_pvc mn-a >/dev/null
-	NODE_SELECTOR=$a apply_pod mn-1 ws-mn restic-s3 pvc:mn-a yes >/dev/null
+	NODE_SELECTOR=$a wait_for 60 "webhook admission after TLS rollback" apply_pod mn-1 ws-mn restic-s3 pvc:mn-a yes
 	wait_for 180 "mn-1 ready on $a" pod_ready mn-1
 	write_file mn-1 /workspace/where.txt "written-on-$a"
 	kubectl -n "$NS" delete pod mn-1 --wait=true >/dev/null
@@ -685,7 +708,10 @@ scenario_multinode() {
 	NODE_SELECTOR=$a apply_pod drain-1 ws-drain restic-s3 ephemeral yes >/dev/null
 	wait_for 180 "drain-1 ready" pod_ready drain-1
 	write_file drain-1 /workspace/evicted.txt before-drain
-	kubectl drain "$a" --pod-selector=wsnap.dev/workspace=ws-drain --delete-emptydir-data --ignore-daemonsets --timeout=180s >/dev/null 2>&1 || true
+	if ! kubectl drain "$a" --pod-selector=wsnap.dev/workspace=ws-drain --delete-emptydir-data --ignore-daemonsets --force --timeout=180s >/dev/null; then
+		kubectl uncordon "$a" >/dev/null
+		die "could not drain $a"
+	fi
 	kubectl uncordon "$a" >/dev/null
 	wait_for 120 "drain-1 evicted" pod_gone drain-1
 	[[ $(ws_field ws-drain .status.lastSnapshot.final) == true ]] || die "eviction did not take a final snapshot"

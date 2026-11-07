@@ -62,7 +62,7 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	sr := request{obj}
 	switch sr.Status().Phase {
 	case wsnapv1.SnapshotSucceeded, wsnapv1.SnapshotFailed:
-		return ctrl.Result{}, nil
+		return r.cleanupFinishedJob(ctx, sr)
 	}
 	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" &&
 		time.Since(sr.GetCreationTimestamp().Time) > RunningTimeout {
@@ -148,6 +148,35 @@ func (r *RequestReconciler) claimantAlive(ctx context.Context, namespace, wsName
 		}
 	}
 	return false, nil
+}
+
+// cleanupFinishedJob releases a request's PVC as soon as the agent exits.
+// A completed Job's Pod still counts as a PVC user until the Job is removed;
+// leaving it for the one-hour TTL can block claim deletion and reprovisioning.
+// Wait for the Job to finish because the agent reports before its final local
+// cleanup (for example, a restorer writes the initialized marker).
+func (r *RequestReconciler) cleanupFinishedJob(ctx context.Context, sr request) (ctrl.Result, error) {
+	if sr.Status().Executor != r.jobKind() {
+		return ctrl.Result{}, nil
+	}
+	var job batchv1.Job
+	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: sr.GetNamespace(), Name: requestJobName(sr)}, &job)
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if job.Labels[wsnapv1.LabelJob] != r.jobKind() || job.Annotations[wsnapv1.AnnotationRequest] != sr.GetName() {
+		// Not this request's Job (see createJob for same-name Jobs wsnap
+		// did not create). Leave it; retrying would never succeed.
+		return ctrl.Result{}, nil
+	}
+	if !jobFinished(&job) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	bg := metav1.DeletePropagationBackground
+	return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, &job, &client.DeleteOptions{PropagationPolicy: &bg}))
 }
 
 // request wraps a request object for brevity.
