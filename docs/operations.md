@@ -17,10 +17,20 @@ wsnap.
 
 ## Install
 
+From a release (multi-arch images on GHCR, pinned in `install.yaml`):
+
+```sh
+kubectl apply -f https://github.com/chrisyifanjin/wsnap/releases/download/<version>/install.yaml
+```
+
+From source:
+
 ```sh
 make images            # or build: docker build --target controller / --target agent
 kubectl apply -k config/default
 ```
+
+`wsnap-controller --version` and `wsnap-agent version` print the build.
 
 This installs the CRDs, the controller (2 replicas, leader election, PDB),
 the broker Service, the webhook Service, the
@@ -221,8 +231,37 @@ Metrics on `:8081/metrics`:
 | `wsnap_credential_issue_seconds` | `role` | Time to issue a credential, including STS. |
 | `wsnap_agent_reports_total` | `operation`, `result` | Snapshots, restores and maintenance: `ok`, `reused` or `error`. |
 
-Alert on a rising `result="error"` rate, and on workspaces whose
-`status.lastSnapshot.time` is older than a few intervals.
+Health gauges, computed from the informer cache at each scrape. Every
+replica serves them; use `max()`:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `wsnap_workspaces_failing` | — | Workspaces with `status.lastError` set. |
+| `wsnap_volumes_rescue` | `phase` (`running`, `failed`) | Protected PVs being rescued, or kept after a failed rescue. |
+| `wsnap_build_info` | `version` | Always 1. |
+
+No metric carries a workspace or Pod name, so the series count stays
+fixed as workspaces grow. `config/prometheus/rules.yaml` holds ready
+alerts (Prometheus Operator): a failed rescue (critical: unsaved data
+waits for an operator), a stuck rescue, failing workspaces, a high agent
+error rate, and broker 503s.
+
+Do not alert on the age of `status.lastSnapshot.time`: an idle workspace
+skips its snapshots on purpose.
+
+## Upgrade
+
+Apply the new `install.yaml`. The controller rolls one replica at a time
+(PDB), and the webhook stays available. Running sidecars keep their old
+image until their Pods restart; the broker accepts older agents within one
+minor version.
+
+Upgrading to the release with writer epochs: existing PVs have no
+`wsnap.dev/writer-epoch` annotation and count as epoch 0, and existing
+snapshot records count as epoch 0. PVs that an earlier version marked
+`wsnap.dev/rescue=skipped-newer-writer` stay as they are; remove the
+annotation to rescue them (their data is kept without replacing newer
+history).
 
 ## Troubleshoot
 

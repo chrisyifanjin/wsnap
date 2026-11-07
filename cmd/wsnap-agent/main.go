@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"github.com/chrisyifanjin/wsnap/internal/version"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,10 +23,14 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|mover|restorer|maintain|ready [flags]")
+		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|mover|restorer|maintain|ready|version [flags]")
 		os.Exit(2)
 	}
 	mode := os.Args[1]
+	if mode == "version" {
+		fmt.Println(version.Version)
+		return
+	}
 	fs := flag.NewFlagSet(mode, flag.ExitOnError)
 	cfg := agent.Config{}
 	fs.StringVar(&cfg.BrokerURL, "broker-url", envOr("WSNAP_BROKER_URL", "http://wsnap-broker.wsnap-system.svc:8080"), "broker URL")
