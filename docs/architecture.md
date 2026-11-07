@@ -138,7 +138,7 @@ sequenceDiagram
     S->>S: rename staged entries into place
     S->>S: write .wsnap/initialized
   end
-  S->>B: credentials(role=snapshot); claim writer, new writer epoch
+  S->>B: request snapshot credential and claim writer with a new epoch
   S->>S: write private startup-ready marker
   K->>S: startupProbe: wsnap-agent ready
   K->>A: start (only after the probe passes)

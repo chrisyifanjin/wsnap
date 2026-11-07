@@ -5,14 +5,20 @@ on:
     paths:
       - .github/workflows/docs.yml
       - mkdocs.yml
+      - package.json
+      - package-lock.json
       - requirements-docs.txt
+      - README.md
       - docs/**
   push:
     branches: [main]
     paths:
       - .github/workflows/docs.yml
       - mkdocs.yml
+      - package.json
+      - package-lock.json
       - requirements-docs.txt
+      - README.md
       - docs/**
   workflow_dispatch:
 
@@ -33,6 +39,12 @@ jobs:
         run: python -m pip install -r requirements-docs.txt
       - name: Build and validate site
         run: mkdocs build --strict
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Validate Mermaid diagrams
+        run: npm ci && npm run check:mermaid
       - name: Configure Pages
         if: github.ref == 'refs/heads/main'
         uses: actions/configure-pages@v5
