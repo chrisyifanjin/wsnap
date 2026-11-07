@@ -80,11 +80,18 @@ func markerPath(dir, name string) string { return filepath.Join(dir, engine.Stat
 // restore.
 func MarkerPath(dir string) string { return markerPath(dir, "initialized") }
 
-// Ready reports whether the sidecar finished initializing the volume. The
-// sidecar's startupProbe runs it, so workload containers start only after a
-// restore.
+// Ready reports whether the workspace volume has been initialized. This
+// marker can survive across Pods and must not be used by the startup probe.
 func Ready(dir string) error {
 	_, err := os.Stat(MarkerPath(dir))
+	return err
+}
+
+// StartupReady is checked by the sidecar's startup probe. Its marker is on
+// the sidecar's private volume, so a marker left on a reused workspace volume
+// cannot start the workload before this Pod is accepted as its writer.
+func StartupReady(stateDir string) error {
+	_, err := os.Stat(filepath.Join(stateDir, "startup-ready"))
 	return err
 }
 
@@ -560,9 +567,19 @@ func isEmpty(v *volume, dir string) (bool, error) {
 // the broker, and files in .wsnap/requests), and on SIGTERM a final one
 // after any in-flight snapshot finishes.
 func (c *Config) RunSidecar(ctx context.Context) error {
+	readyPath := filepath.Join(c.StateDir, "startup-ready")
+	if err := os.Remove(readyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear startup readiness: %w", err)
+	}
 	st, err := c.initializeWithRetry(ctx)
 	if err != nil {
 		return nil // terminated before initialization; nothing to snapshot
+	}
+	if err := os.MkdirAll(c.StateDir, 0o700); err != nil {
+		return fmt.Errorf("create private state directory: %w", err)
+	}
+	if err := os.WriteFile(readyPath, []byte("ready\n"), 0o600); err != nil {
+		return fmt.Errorf("mark startup ready: %w", err)
 	}
 	interval := c.IntervalOverride
 	if interval == 0 {
@@ -825,6 +842,11 @@ func (c *Config) initializeWithRetry(ctx context.Context) (state, error) {
 	backoff := time.Second
 	for {
 		st, err := c.initialize(ctx)
+		if err == nil {
+			// A warm volume skips restore, but it must still claim the writer
+			// role before the startup probe may release workload containers.
+			_, err = c.credentials(ctx, protocol.RoleSnapshot)
+		}
 		if err == nil {
 			return st, nil
 		}

@@ -121,16 +121,19 @@ sequenceDiagram
     B-->>S: read-only credential for this workspace
     S->>O: restore newest snapshot into .wsnap/staging
     S->>S: rename staged entries into place
+    S->>S: write .wsnap/initialized
   end
-  S->>S: write .wsnap/initialized
+  S->>B: credentials(role=snapshot); claim writer
+  S->>S: write private startup-ready marker
   K->>S: startupProbe: wsnap-agent ready
   K->>A: start (only after the probe passes)
 ```
 
-The agent container cannot start before the restore ends. The startup probe
-of the native sidecar holds it back. A restore that stops halfway leaves the
-`.wsnap/restoring` marker. The next attempt deletes the partial data and
-restores again.
+The agent container cannot start before the restore ends and the broker
+accepts this Pod as the workspace writer. The startup probe checks a marker
+on the sidecar's private volume, not the reusable workspace volume. A restore
+that stops halfway leaves the `.wsnap/restoring` marker. The next attempt
+deletes the partial data and restores again.
 
 ### 2. The Pod runs
 

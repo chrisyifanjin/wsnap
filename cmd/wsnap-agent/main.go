@@ -77,7 +77,7 @@ func main() {
 	case "maintain":
 		err = cfg.RunMaintenance(ctx)
 	case "ready":
-		err = agent.Ready(cfg.Dir)
+		err = agent.StartupReady(cfg.StateDir)
 	default:
 		err = fmt.Errorf("unknown mode %q", mode)
 	}

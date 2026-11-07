@@ -22,13 +22,14 @@ import (
 // fakeBroker hands out exec-engine credentials for a filesystem repository
 // and records reports.
 type fakeBroker struct {
-	t        *testing.T
-	repo     string
-	command  []string
-	fail503  atomic.Int32 // fail this many credential requests with 503
-	credReqs atomic.Int32
-	mu       sync.Mutex
-	reports  []protocol.Report
+	t            *testing.T
+	repo         string
+	command      []string
+	fail503      atomic.Int32 // fail this many credential requests with 503
+	denySnapshot atomic.Bool
+	credReqs     atomic.Int32
+	mu           sync.Mutex
+	reports      []protocol.Report
 	// restore overrides for pinned and fork restores
 	restoreID, restoreSource string
 	restoreRepo              string
@@ -46,6 +47,10 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		var req protocol.CredentialsRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Role == protocol.RoleSnapshot && b.denySnapshot.Load() {
+			http.Error(w, "another writer still owns the workspace", http.StatusConflict)
+			return
+		}
 		resp := protocol.CredentialsResponse{
 			Namespace: "ns", Workspace: "ws", Role: req.Role,
 			Engine:             protocol.Engine{Type: protocol.EngineExec, Command: b.command},
@@ -229,6 +234,47 @@ func TestCredentialsAreCachedAndRetried(t *testing.T) {
 	}
 	if n := b.credReqs.Load(); n != 5 {
 		t.Errorf("restore credentials must not be cached: %d requests", n)
+	}
+}
+
+func TestWarmVolumeWaitsForWriterClaimBeforeStartup(t *testing.T) {
+	c, b := setup(t)
+	c.IntervalOverride = time.Hour
+	b.denySnapshot.Store(true)
+	write(t, MarkerPath(c.Dir), "previous Pod initialized this volume\n")
+	write(t, filepath.Join(c.Dir, "work.txt"), "keep this work")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.RunSidecar(ctx) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for b.credReqs.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if b.credReqs.Load() == 0 {
+		t.Fatal("sidecar did not ask the broker for writer credentials")
+	}
+	if err := StartupReady(c.StateDir); err == nil {
+		t.Fatal("startup probe passed while the broker denied writer ownership")
+	}
+	if err := Ready(c.Dir); err != nil {
+		t.Fatalf("warm volume marker disappeared: %v", err)
+	}
+
+	b.denySnapshot.Store(false)
+	for StartupReady(c.StateDir) != nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := StartupReady(c.StateDir); err != nil {
+		t.Fatalf("startup did not become ready after the broker accepted the writer: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(c.Dir, "work.txt")); err != nil || string(got) != "keep this work" {
+		t.Fatalf("warm volume data changed: %q, %v", got, err)
+	}
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("RunSidecar: %v", err)
 	}
 }
 
