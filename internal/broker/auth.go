@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -18,6 +19,11 @@ type Identity struct {
 	PodName        string
 	PodUID         string
 }
+
+// ErrAuthUnavailable marks an authentication that could not run, as
+// opposed to a token that was rejected. Callers answer it with 503, which
+// agents retry, and never cache it.
+var ErrAuthUnavailable = errors.New("authentication unavailable")
 
 // Authenticator validates agent tokens.
 type Authenticator interface {
@@ -47,7 +53,8 @@ func (a TokenReviewAuthenticator) Authenticate(ctx context.Context, token string
 		Spec: authnv1.TokenReviewSpec{Token: token, Audiences: []string{a.Audience}},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return Identity{}, fmt.Errorf("token review: %w", err)
+		// The API server did not answer; this says nothing about the token.
+		return Identity{}, fmt.Errorf("%w: token review: %w", ErrAuthUnavailable, err)
 	}
 	if !review.Status.Authenticated {
 		return Identity{}, fmt.Errorf("token rejected: %s", review.Status.Error)

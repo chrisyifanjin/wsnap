@@ -43,7 +43,9 @@ const (
 	// AnnotationRescue on a protected PV tracks the rescue of a released
 	// volume. See RescuePhase.
 	AnnotationRescue = "wsnap.dev/rescue"
-	// AnnotationVolumeName on a mover Job names the PV it snapshots.
+	// AnnotationVolumeName on a mover Job names the PV it snapshots. On a
+	// WorkspaceSnapshot it targets that PV instead of the writer's volume
+	// (the broker uses it to save a stopped writer's volume).
 	AnnotationVolumeName = "wsnap.dev/volume-name"
 	// AnnotationRequest on a mover Job names the WorkspaceSnapshot it
 	// serves.
@@ -197,6 +199,14 @@ type RetentionSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	KeepLast int32 `json:"keepLast,omitempty"`
+	// keepDaily also keeps the newest snapshot of each of the last
+	// keepDaily days (UTC). It bounds what a burst of snapshots can push
+	// out of history: keepLast alone counts snapshots, and the workload
+	// can trigger snapshots.
+	// +kubebuilder:default=7
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	KeepDaily *int32 `json:"keepDaily,omitempty"`
 	// maintenanceEvery runs a maintenance Job after this many snapshots.
 	// 0 disables maintenance.
 	// +kubebuilder:default=20
@@ -335,6 +345,11 @@ type SnapshotRecord struct {
 	// final is true for the last snapshot of a Pod's life.
 	// +optional
 	Final bool `json:"final,omitempty"`
+	// epoch is the writer epoch of the data in this snapshot: the
+	// workspace's writerEpoch for a sidecar, the volume's epoch for a Job.
+	// A snapshot of an older epoch never replaces lastSnapshot.
+	// +optional
+	Epoch int64 `json:"epoch,omitempty"`
 }
 
 // RestoreRecord describes the last restore.
@@ -358,8 +373,20 @@ type WorkspaceStatus struct {
 	// from this Pod (or from a mover).
 	// +optional
 	WriterPod *PodRef `json:"writerPod,omitempty"`
+	// writerEpoch increases each time another Pod becomes the writer. The
+	// broker stamps it on the writer's PV, so data on a volume can be
+	// ordered against the snapshot history.
+	// +optional
+	WriterEpoch int64 `json:"writerEpoch,omitempty"`
 	// +optional
 	LastSnapshot *SnapshotRecord `json:"lastSnapshot,omitempty"`
+	// supersededSnapshots are rescue snapshots of older writer epochs: data
+	// of a volume that was saved after a newer writer had already
+	// snapshotted. Restores never pick them, but maintenance keeps them, so
+	// an operator can restore one by ID. The newest 10 are kept here;
+	// remove an entry to let maintenance delete that snapshot.
+	// +optional
+	SupersededSnapshots []SnapshotRecord `json:"supersededSnapshots,omitempty"`
 	// +optional
 	LastRestore *RestoreRecord `json:"lastRestore,omitempty"`
 	// +optional

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -66,9 +67,9 @@ type Engine interface {
 	Latest(ctx context.Context, t Target) (*Snapshot, error)
 	// Restore writes snapshot id into dir, which should be empty.
 	Restore(ctx context.Context, t Target, id, dir string) error
-	// Maintain keeps the newest keepLast snapshots, deletes the rest and
-	// frees unreferenced data.
-	Maintain(ctx context.Context, t Target, keepLast int) error
+	// Maintain applies the retention policy: it deletes the snapshots the
+	// policy does not keep and frees their storage.
+	Maintain(ctx context.Context, t Target, p Retention) error
 	// WriterDeletePrefixes lists repository sub-prefixes that a writer must
 	// be able to delete during a normal snapshot. Credential providers allow
 	// delete on these prefixes only.
@@ -170,4 +171,49 @@ func repoKey(b protocol.Backend) string {
 // writeSecretFile writes a credential file readable only by the agent.
 func writeSecretFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+// Retention says which snapshots maintenance keeps: the newest KeepLast,
+// the newest of each of the last KeepDaily days (UTC), and every snapshot
+// in Keep. A Keep entry may be a prefix of an ID (a short ID).
+type Retention struct {
+	KeepLast  int
+	KeepDaily int
+	Keep      []string
+}
+
+type snapRef struct {
+	id string
+	t  time.Time
+}
+
+// forgettable returns the IDs to delete from snaps (oldest first).
+func forgettable(snaps []snapRef, p Retention, now time.Time) []string {
+	keepLast := max(p.KeepLast, 1)
+	kept := map[int]bool{}
+	for i := max(len(snaps)-keepLast, 0); i < len(snaps); i++ {
+		kept[i] = true
+	}
+	if p.KeepDaily > 0 {
+		// Days count back from today; snapshots are oldest first, so the
+		// last one seen for a day is its newest.
+		cutoff := now.UTC().Truncate(24*time.Hour).AddDate(0, 0, -(p.KeepDaily - 1))
+		newestOfDay := map[time.Time]int{}
+		for i, s := range snaps {
+			if day := s.t.UTC().Truncate(24 * time.Hour); !day.Before(cutoff) {
+				newestOfDay[day] = i
+			}
+		}
+		for _, i := range newestOfDay {
+			kept[i] = true
+		}
+	}
+	var out []string
+	for i, s := range snaps {
+		if kept[i] || slices.ContainsFunc(p.Keep, func(k string) bool { return k != "" && strings.HasPrefix(s.id, k) }) {
+			continue
+		}
+		out = append(out, s.id)
+	}
+	return out
 }

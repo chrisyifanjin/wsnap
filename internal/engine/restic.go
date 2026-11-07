@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -212,15 +211,29 @@ func (r *Restic) Restore(ctx context.Context, t Target, id, dir string) error {
 	return nil
 }
 
-func (r *Restic) Maintain(ctx context.Context, t Target, keepLast int) error {
-	if keepLast < 1 {
-		keepLast = 1
-	}
+func (r *Restic) Maintain(ctx context.Context, t Target, p Retention) error {
 	// Locks left by a killed sidecar would block prune.
 	if _, err := r.restic(ctx, t, "", "unlock"); err != nil {
 		return fmt.Errorf("restic unlock: %w", err)
 	}
-	if _, err := r.restic(ctx, t, "", "forget", "--keep-last="+strconv.Itoa(keepLast), "--prune"); err != nil {
+	list, err := r.list(ctx, t)
+	if err != nil {
+		return err
+	}
+	snaps := make([]snapRef, len(list))
+	for i, s := range list {
+		snaps[i] = snapRef{s.ID, s.Time}
+	}
+	// Explicit IDs, not --keep-last: restic has no "keep this ID" policy,
+	// and tagging a snapshot to keep it would change its ID.
+	forget := forgettable(snaps, p, time.Now())
+	if len(forget) == 0 {
+		if _, err := r.restic(ctx, t, "", "prune"); err != nil {
+			return fmt.Errorf("restic prune: %w", err)
+		}
+		return nil
+	}
+	if _, err := r.restic(ctx, t, "", append([]string{"forget", "--prune"}, forget...)...); err != nil {
 		return fmt.Errorf("restic forget: %w", err)
 	}
 	return nil

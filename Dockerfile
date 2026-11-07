@@ -7,9 +7,10 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=-s -o /out/wsnap-controller ./cmd/wsnap-controller && \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=-s -o /out/wsnap-agent ./cmd/wsnap-agent
+ARG TARGETOS TARGETARCH VERSION=dev
+RUN LDFLAGS="-s -X github.com/chrisyifanjin/wsnap/internal/version.Version=${VERSION}"; \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="$LDFLAGS" -o /out/wsnap-controller ./cmd/wsnap-controller && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="$LDFLAGS" -o /out/wsnap-agent ./cmd/wsnap-agent
 
 # Engine CLIs, pinned and checked against the published checksums.
 FROM alpine:3.22 AS engines
@@ -33,9 +34,9 @@ FROM gcr.io/distroless/static-debian12:nonroot AS controller
 COPY --from=build /out/wsnap-controller /wsnap-controller
 ENTRYPOINT ["/wsnap-controller"]
 
-# The agent runs as root by default because it must read and restore files
-# owned by any user in the workspace. Set runAsUser in the pod spec when all
-# workspace files belong to one user.
+# The agent runs as root: it must read and restore files owned by any user
+# in the workspace. The webhook and the Job template pin uid 0 even when the
+# Pod sets runAsUser, so every agent on a volume trusts the same .wsnap.
 FROM alpine:3.22 AS agent
 RUN apk add --no-cache ca-certificates tar gzip
 COPY --from=engines /usr/local/bin/kopia /usr/local/bin/restic /usr/local/bin/

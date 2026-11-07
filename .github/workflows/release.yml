@@ -1,0 +1,47 @@
+name: Release
+
+# Push a tag such as v0.1.0 to publish multi-arch images to GHCR and a
+# GitHub release with install.yaml pinned to those images.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit tests
+        run: make vet test
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push images (linux/amd64, linux/arm64)
+        run: |
+          for target in controller agent; do
+            docker buildx build --platform linux/amd64,linux/arm64 --target "$target" \
+              --build-arg VERSION="$VERSION" --provenance=true --sbom=true \
+              -t "$REGISTRY/wsnap-$target:$VERSION" --push .
+          done
+      - name: Render install.yaml
+        run: make install-manifest REGISTRY="$REGISTRY" VERSION="$VERSION"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$VERSION" install.yaml config/prometheus/rules.yaml --generate-notes --verify-tag

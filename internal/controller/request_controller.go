@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
+	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -60,7 +62,7 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	sr := request{obj}
 	switch sr.Status().Phase {
 	case wsnapv1.SnapshotSucceeded, wsnapv1.SnapshotFailed:
-		return ctrl.Result{}, nil
+		return r.cleanupFinishedJob(ctx, sr)
 	}
 	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" &&
 		time.Since(sr.GetCreationTimestamp().Time) > RunningTimeout {
@@ -85,12 +87,30 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if sr.Status().Phase == wsnapv1.SnapshotRunning && sr.Status().Executor == r.jobKind() {
 		return r.checkJob(ctx, sr, recheck)
 	}
+	targeted := sr.obj.GetAnnotations()[wsnapv1.AnnotationVolumeName] != "" && !r.Restore
+	// Live: routing on a stale writer could start a Job beside a sidecar.
 	var ws wsnapv1.Workspace
-	if err := r.Get(ctx, types.NamespacedName{Namespace: sr.GetNamespace(), Name: sr.GetWorkspaceName()}, &ws); err != nil {
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: sr.GetNamespace(), Name: sr.GetWorkspaceName()}, &ws); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, r.finish(ctx, sr, "workspace not found")
 		}
 		return ctrl.Result{}, err
+	}
+	if targeted {
+		// A specific volume (a stopped writer's): only a Job can reach it.
+		return r.startJob(ctx, sr, &ws, recheck)
+	}
+	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" {
+		// A terminating sidecar still finishes what it claimed (queued
+		// snapshot requests are answered by its final snapshot). Wait for
+		// its report while its Pod exists.
+		alive, err := r.claimantAlive(ctx, sr.GetNamespace(), ws.Name, st.ClaimedBy)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if alive {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 	live, err := r.liveWriter(ctx, &ws)
 	if err != nil {
@@ -115,6 +135,53 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, sr.obj)
 	}
 	return r.startJob(ctx, sr, &ws, recheck)
+}
+
+// claimantAlive reports whether the Pod with UID uid of workspace wsName
+// still exists and has not stopped. It reads live.
+func (r *RequestReconciler) claimantAlive(ctx context.Context, namespace, wsName, uid string) (bool, error) {
+	if uid == "" {
+		return false, nil
+	}
+	var pods corev1.PodList
+	if err := r.Reader.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: wsName}); err != nil {
+		return false, err
+	}
+	for _, p := range pods.Items {
+		if string(p.UID) == uid {
+			return p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed, nil
+		}
+	}
+	return false, nil
+}
+
+// cleanupFinishedJob releases a request's PVC as soon as the agent exits.
+// A completed Job's Pod still counts as a PVC user until the Job is removed;
+// leaving it for the one-hour TTL can block claim deletion and reprovisioning.
+// Wait for the Job to finish because the agent reports before its final local
+// cleanup (for example, a restorer writes the initialized marker).
+func (r *RequestReconciler) cleanupFinishedJob(ctx context.Context, sr request) (ctrl.Result, error) {
+	if sr.Status().Executor != r.jobKind() {
+		return ctrl.Result{}, nil
+	}
+	var job batchv1.Job
+	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: sr.GetNamespace(), Name: requestJobName(sr)}, &job)
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if job.Labels[wsnapv1.LabelJob] != r.jobKind() || job.Annotations[wsnapv1.AnnotationRequest] != sr.GetName() {
+		// Not this request's Job (see createJob for same-name Jobs wsnap
+		// did not create). Leave it; retrying would never succeed.
+		return ctrl.Result{}, nil
+	}
+	if !jobFinished(&job) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	bg := metav1.DeletePropagationBackground
+	return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, &job, &client.DeleteOptions{PropagationPolicy: &bg}))
 }
 
 // request wraps a request object for brevity.
@@ -152,6 +219,19 @@ func (r *RequestReconciler) liveWriter(ctx context.Context, ws *wsnapv1.Workspac
 
 func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv1.Workspace, recheck ctrl.Result) (ctrl.Result, error) {
 	vol := ws.Status.Volume
+	if pvName := sr.obj.GetAnnotations()[wsnapv1.AnnotationVolumeName]; pvName != "" && !r.Restore {
+		var pv corev1.PersistentVolume
+		if err := r.Reader.Get(ctx, types.NamespacedName{Name: pvName}, &pv); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("volume %s no longer exists", pvName))
+			}
+			return ctrl.Result{}, err
+		}
+		if pv.Annotations[wsnapv1.AnnotationWorkspaceRef] != ws.Namespace+"/"+ws.Name || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Namespace != ws.Namespace {
+			return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("volume %s is not bound to a claim of workspace %s", pvName, ws.Name))
+		}
+		vol = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: pv.Spec.ClaimRef.Name, VolumeName: pvName}
+	}
 	if vol == nil || vol.ClaimName == "" || vol.Kind == workspace.KindEmptyDir {
 		return ctrl.Result{}, r.finish(ctx, sr, "no pod is running and the workspace has no persistent volume")
 	}
@@ -165,6 +245,11 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 	if claim.DeletionTimestamp != nil {
 		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("volume claim %s is being deleted", vol.ClaimName))
 	}
+	// The snapshot and restore reconcilers run at the same time in the
+	// leader. Without this lock both could pass otherJobOnVolume and start
+	// a mover beside a restorer on one volume.
+	unlock := volumeLocks.lock(claim.Spec.VolumeName)
+	defer unlock()
 	// A Pod without a sidecar may still mount the claim; a mover on
 	// another node could not attach a ReadWriteOnce volume, and writes
 	// from that Pod would race the snapshot.
@@ -179,11 +264,23 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.Labels[wsnapv1.LabelJob] != "" {
 			continue
 		}
-		for _, v := range p.Spec.Volumes {
-			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == vol.ClaimName {
-				return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("pod %s mounts the volume but has no running sidecar", p.Name))
-			}
+		if !mountsClaim(&p, vol.ClaimName) {
+			continue
 		}
+		if p.Labels[wsnapv1.LabelWorkspace] != "" {
+			// A wsnap Pod that is starting (its sidecar may be restoring)
+			// or stopping (its sidecar takes the final snapshot). A Job now
+			// would work under the sidecar; wait for the Pod.
+			st := sr.Status()
+			if msg := "waiting for pod " + p.Name; st.Message != msg {
+				st.Phase, st.Message = wsnapv1.SnapshotPending, msg
+				if err := r.Status().Update(ctx, sr.obj); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("pod %s mounts the volume but has no running sidecar", p.Name))
 	}
 	// One wsnap Job per volume: two restorers, or a restorer and a mover,
 	// would share .wsnap/staging and interleave their writes.
@@ -215,7 +312,8 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 		[]corev1.VolumeMount{{Name: "workspace", MountPath: dataMountPath}})
 	// The writer recorded now is the one whose data the Job captures.
 	job.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: claim.Spec.VolumeName, wsnapv1.AnnotationRequest: sr.GetName(),
-		workspace.AnnotationWriterPod: pv.Annotations[workspace.AnnotationWriterPod]}
+		workspace.AnnotationWriterPod:   pv.Annotations[workspace.AnnotationWriterPod],
+		workspace.AnnotationWriterEpoch: pv.Annotations[workspace.AnnotationWriterEpoch]}
 	// Mark the request Running before the Job exists: the broker lets a
 	// restorer serve only a Running request, and a fast Job Pod must not
 	// arrive first. checkJob recreates the Job if this create fails.
@@ -274,6 +372,37 @@ func (r *RequestReconciler) otherJobOnVolume(ctx context.Context, namespace, vol
 	}
 	return "", nil
 }
+
+// mountsClaim reports whether p uses the claim: as a persistentVolumeClaim
+// volume, or as a generic ephemeral volume, whose claim is named
+// <pod>-<volume>.
+func mountsClaim(p *corev1.Pod, claim string) bool {
+	for _, v := range p.Spec.Volumes {
+		if (v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim) ||
+			(v.Ephemeral != nil && p.Name+"-"+v.Name == claim) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripedMutex serializes work per key within this process, with fixed
+// memory: keys share one of a fixed set of locks.
+type stripedMutex [64]sync.Mutex
+
+func (k *stripedMutex) lock(key string) (unlock func()) {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	m := &k[h.Sum32()%uint32(len(k))]
+	m.Lock()
+	return m.Unlock
+}
+
+// volumeLocks covers "check for another Job on the volume, then create
+// one". Reconcilers run only in the leader, so a process-wide lock is
+// enough; the check reads the API server, so it sees a Job created a
+// moment ago under the same lock.
+var volumeLocks stripedMutex
 
 // finish marks a request failed. Successes are recorded by the broker.
 func (r *RequestReconciler) finish(ctx context.Context, sr request, msg string) error {

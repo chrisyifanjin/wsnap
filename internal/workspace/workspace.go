@@ -5,8 +5,10 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,7 +77,7 @@ func ResolveVolume(ctx context.Context, r client.Reader, pod *corev1.Pod) (wsnap
 		}
 	}
 	if vol == nil {
-		return wsnapv1.VolumeRef{}, fmt.Errorf("pod %s/%s has no volume %q (set annotation %s)", pod.Namespace, pod.Name, name, wsnapv1.AnnotationVolume)
+		return wsnapv1.VolumeRef{}, fmt.Errorf("%w: pod %s/%s has no volume %q (set annotation %s)", ErrBadVolume, pod.Namespace, pod.Name, name, wsnapv1.AnnotationVolume)
 	}
 	var ref wsnapv1.VolumeRef
 	switch {
@@ -87,7 +89,7 @@ func ResolveVolume(ctx context.Context, r client.Reader, pod *corev1.Pod) (wsnap
 	case vol.EmptyDir != nil:
 		return wsnapv1.VolumeRef{Kind: KindEmptyDir}, nil
 	default:
-		return wsnapv1.VolumeRef{}, fmt.Errorf("volume %q must be a persistentVolumeClaim, ephemeral or emptyDir volume", name)
+		return wsnapv1.VolumeRef{}, fmt.Errorf("%w: volume %q must be a persistentVolumeClaim, ephemeral or emptyDir volume", ErrBadVolume, name)
 	}
 	var pvc corev1.PersistentVolumeClaim
 	err := r.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: ref.ClaimName}, &pvc)
@@ -138,10 +140,22 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 const (
 	AnnotationWriterPod = "wsnap.dev/writer-pod-uid"
 	AnnotationFinalPod  = "wsnap.dev/final-pod-uid"
+	// AnnotationWriterEpoch is the Workspace writerEpoch of the last Pod
+	// that the broker admitted as writer on this volume.
+	AnnotationWriterEpoch = "wsnap.dev/writer-epoch"
 )
+
+// ErrBadVolume marks a Pod whose workspace volume wsnap cannot use, as
+// opposed to an API error while resolving it.
+var ErrBadVolume = errors.New("unusable workspace volume")
 
 // MarkPV sets one bookkeeping annotation on the PV.
 func MarkPV(ctx context.Context, c client.Client, r client.Reader, volumeName, key, value string) error {
+	return MarkPVAll(ctx, c, r, volumeName, map[string]string{key: value})
+}
+
+// MarkPVAll sets several bookkeeping annotations on the PV in one patch.
+func MarkPVAll(ctx context.Context, c client.Client, r client.Reader, volumeName string, marks map[string]string) error {
 	if volumeName == "" {
 		return nil
 	}
@@ -149,15 +163,29 @@ func MarkPV(ctx context.Context, c client.Client, r client.Reader, volumeName, k
 	if err := r.Get(ctx, client.ObjectKey{Name: volumeName}, &pv); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	if pv.Annotations[key] == value {
+	patch := client.MergeFrom(pv.DeepCopy())
+	changed := false
+	for k, v := range marks {
+		if pv.Annotations[k] != v {
+			if pv.Annotations == nil {
+				pv.Annotations = map[string]string{}
+			}
+			pv.Annotations[k], changed = v, true
+		}
+	}
+	if !changed {
 		return nil
 	}
-	patch := client.MergeFrom(pv.DeepCopy())
-	if pv.Annotations == nil {
-		pv.Annotations = map[string]string{}
-	}
-	pv.Annotations[key] = value
 	return c.Patch(ctx, &pv, patch)
+}
+
+// Epoch parses a writer epoch annotation; a missing or invalid one is 0.
+func Epoch(annotations map[string]string) int64 {
+	n, err := strconv.ParseInt(annotations[AnnotationWriterEpoch], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // Backend resolves the repository backend for one workspace. Every
@@ -244,6 +272,14 @@ func KeepLast(repo *wsnapv1.SnapshotRepository) int {
 		return int(n)
 	}
 	return 10
+}
+
+// KeepDaily returns retention.keepDaily with its default (7).
+func KeepDaily(repo *wsnapv1.SnapshotRepository) int {
+	if n := repo.Spec.Retention.KeepDaily; n != nil {
+		return int(*n)
+	}
+	return 7
 }
 
 // TTL returns the credential lifetime with its default.

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -115,7 +116,9 @@ func stores(t *testing.T) map[string]store {
 		const account = "devstoreaccount1"
 		p := credentials.AzureSAS{ServiceURL: "https://" + account + ".blob." + suffix}
 		secret := map[string][]byte{credentials.KeyAzureAccountKey: []byte(os.Getenv("WSNAP_TEST_AZURE_KEY"))}
-		run := strings.ToLower(time.Now().UTC().Format("20060102t150405"))
+		// stores is called once per engine, including engines skipped by -run.
+		// A seconds-only name collides when those calls happen together.
+		run := strconv.FormatInt(time.Now().UnixNano(), 36)
 		// With the static provider the admin pre-creates the container, as
 		// with an S3 bucket; nothing in wsnap creates it.
 		staticContainer := "static-" + run
@@ -343,7 +346,7 @@ func TestRoundTrip(t *testing.T) {
 				}
 				if sname == "s3-sts" {
 					// The snapshot credential must not be able to delete.
-					if err := eng.Maintain(ctx, target(protocol.RoleSnapshot), 1); err == nil {
+					if err := eng.Maintain(ctx, target(protocol.RoleSnapshot), engine.Retention{KeepLast: 1}); err == nil {
 						t.Errorf("Maintain with the snapshot credential succeeded")
 					}
 				}
@@ -352,12 +355,29 @@ func TestRoundTrip(t *testing.T) {
 				if err := eng.Init(ctx, m); err != nil {
 					t.Fatalf("maintenance Init: %v", err)
 				}
-				if err := eng.Maintain(ctx, m, 1); err != nil {
+				time.Sleep(1100 * time.Millisecond)
+				writeFile(t, filepath.Join(src, "c.txt"), "four")
+				if err := eng.Init(ctx, w); err != nil {
+					t.Fatalf("third Init: %v", err)
+				}
+				third, err := eng.Snapshot(ctx, w, src)
+				if err != nil {
+					t.Fatalf("third Snapshot: %v", err)
+				}
+				// keepLast 1 keeps the third; the pinned first survives too
+				// (reviewer #3 finding 8); the second goes.
+				if err := eng.Maintain(ctx, m, engine.Retention{KeepLast: 1, Keep: []string{first.ID}}); err != nil {
 					t.Fatalf("Maintain: %v", err)
 				}
 				latest, err = eng.Latest(ctx, m)
-				if err != nil || latest == nil || latest.ID != second.ID {
-					t.Fatalf("after Maintain, Latest = %v, %v; want %s", latest, err, second.ID)
+				if err != nil || latest == nil || latest.ID != third.ID {
+					t.Fatalf("after Maintain, Latest = %v, %v; want %s", latest, err, third.ID)
+				}
+				if err := eng.Restore(ctx, m, first.ID, t.TempDir()); err != nil {
+					t.Errorf("the pinned snapshot was deleted: %v", err)
+				}
+				if err := eng.Restore(ctx, m, second.ID, t.TempDir()); err == nil {
+					t.Errorf("the unpinned old snapshot survived maintenance")
 				}
 			})
 		}
@@ -431,5 +451,31 @@ func TestUnreadableFileDoesNotFailTheSnapshot(t *testing.T) {
 				t.Errorf("ok.txt = %q", got)
 			}
 		})
+	}
+}
+
+// TestKopiaWriterDoesNotOwnMaintenance: "repository create" makes the
+// creator the maintenance owner, and Kopia then runs automatic maintenance
+// as the writer, whose credential cannot delete (reviewer #3 suspicion).
+func TestKopiaWriterDoesNotOwnMaintenance(t *testing.T) {
+	if _, err := exec.LookPath("kopia"); err != nil {
+		t.Skip(err)
+	}
+	ctx := context.Background()
+	tgt := engine.Target{Backend: protocol.Backend{Filesystem: &protocol.FilesystemBackend{Path: filepath.Join(t.TempDir(), "repo")}},
+		Password: "pw-0123456789", Workspace: "ws1", StateDir: t.TempDir()}
+	k := &engine.Kopia{Binary: "kopia"}
+	if err := k.Init(ctx, tgt); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("kopia", "maintenance", "info", "--json")
+	cmd.Env = append(os.Environ(), "KOPIA_CONFIG_PATH="+filepath.Join(tgt.StateDir, "kopia", "repository.config"), "KOPIA_PASSWORD="+tgt.Password,
+		"KOPIA_CACHE_DIRECTORY="+t.TempDir(), "KOPIA_LOG_DIR="+t.TempDir(), "KOPIA_CHECK_FOR_UPDATES=false")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("maintenance info: %v", err)
+	}
+	if !strings.Contains(string(out), `"owner":"wsnap-maintenance@ws1"`) {
+		t.Fatalf("maintenance owner is not the maintenance identity:\n%s", out)
 	}
 }

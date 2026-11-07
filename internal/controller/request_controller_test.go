@@ -2,6 +2,10 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"k8s.io/utils/ptr"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,6 +144,46 @@ func TestTerminalRequestIsLeftAlone(t *testing.T) {
 	r, c := requestEnv(t, sr)
 	if got := reconcileReq(t, r, c); got.Status.Phase != wsnapv1.SnapshotSucceeded || got.Status.SnapshotID != "s1" {
 		t.Fatalf("terminal request changed: %+v", got.Status)
+	}
+}
+
+func TestTerminalRequestReleasesFinishedJobPVC(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		name := "snapshot"
+		var obj requestObj = snapReq(time.Now(), wsnapv1.SnapshotSucceeded, "mover")
+		if restore {
+			name = "restore"
+			obj = &wsnapv1.WorkspaceRestore{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "req", UID: "req-uid", CreationTimestamp: metav1.Now()},
+				Spec:   wsnapv1.WorkspaceRestoreSpec{WorkspaceName: "ws1"},
+				Status: wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotSucceeded, Executor: "restorer"}}
+		}
+		t.Run(name, func(t *testing.T) {
+			kind := "mover"
+			if restore {
+				kind = "restorer"
+			}
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: requestJobName(request{obj}),
+				Labels:      map[string]string{wsnapv1.LabelJob: kind},
+				Annotations: map[string]string{wsnapv1.AnnotationRequest: "req"}}}
+			r, c := requestEnv(t, obj, job)
+			r.Restore = restore
+			if result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "req"}}); err != nil || result.RequeueAfter == 0 {
+				t.Fatalf("running job must stay until its agent exits: result=%+v err=%v", result, err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batchv1.Job{}); err != nil {
+				t.Fatalf("job removed before it completed: %v", err)
+			}
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+			if err := c.Status().Update(context.Background(), job); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "req"}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batchv1.Job{}); err == nil {
+				t.Fatal("finished job still holds the PVC")
+			}
+		})
 	}
 }
 
@@ -309,5 +353,178 @@ func TestJobsAreRegisteredInWorkspaceStatus(t *testing.T) {
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: requestJobName(request{sr})}, &job)
 	if len(ws.Status.Jobs) != 1 || ws.Status.Jobs[0].UID != string(job.UID) || ws.Status.Jobs[0].Kind != "mover" {
 		t.Fatalf("job not registered: %+v (job uid %s)", ws.Status.Jobs, job.UID)
+	}
+}
+
+// TestTerminatingClaimantKeepsItsClaim (reviewer #3 finding 6): a sidecar
+// that is shutting down still finishes and reports what it claimed; the
+// controller must not fail or reroute the request meanwhile.
+func TestTerminatingClaimantKeepsItsClaim(t *testing.T) {
+	sr := snapReq(time.Now(), wsnapv1.SnapshotRunning, "sidecar")
+	sr.Status.ClaimedBy = "u1"
+	pod := runningPod("w1", "u1", "data")
+	pod.Labels = map[string]string{wsnapv1.LabelWorkspace: "ws1"}
+	pod.DeletionTimestamp = ptr.To(metav1.Now())
+	pod.Finalizers = []string{"test/keep"}
+	r, c := requestEnv(t, sr, pod, wsWith(pvcVol, &wsnapv1.PodRef{Name: "w1", UID: "u1"}), boundClaim())
+	got := reconcileReq(t, r, c)
+	if got.Status.Phase != wsnapv1.SnapshotRunning || got.Status.ClaimedBy != "u1" || got.Status.Executor != "sidecar" {
+		t.Fatalf("claim taken from a terminating sidecar: %+v", got.Status)
+	}
+	var jobs batchv1.JobList
+	_ = c.List(context.Background(), &jobs)
+	if len(jobs.Items) != 0 {
+		t.Fatal("a Job was started beside the terminating sidecar")
+	}
+}
+
+// TestUnregisteredJobWithOurNameIsReplaced (reviewer #3 finding 3): a Job
+// a namespace user created under wsnap's predictable name must never be
+// registered, so its Pods never get credentials.
+func TestUnregisteredJobWithOurNameIsReplaced(t *testing.T) {
+	sr := snapReq(time.Now(), "", "")
+	squatter := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: requestJobName(request{sr}), UID: "evil",
+		Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "mover", wsnapv1.LabelJobWorkspace: "ws1"}}}
+	r, c := requestEnv(t, sr, squatter, wsWith(pvcVol, nil), boundClaim())
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "req"}}); err == nil {
+		t.Fatal("reconcile accepted an unregistered Job")
+	}
+	var ws wsnapv1.Workspace
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "ws1"}, &ws)
+	if len(ws.Status.Jobs) != 0 {
+		t.Fatalf("squatter registered: %+v", ws.Status.Jobs)
+	}
+	// The squatter is deleted; the next reconcile creates and registers wsnap's own Job.
+	got := reconcileReq(t, r, c)
+	var job batchv1.Job
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: requestJobName(request{sr})}, &job)
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "ws1"}, &ws)
+	if job.UID == "evil" || len(ws.Status.Jobs) != 1 || ws.Status.Jobs[0].UID != string(job.UID) || got.Status.Phase != wsnapv1.SnapshotRunning {
+		t.Fatalf("job %s, registered %+v, phase %s", job.UID, ws.Status.Jobs, got.Status.Phase)
+	}
+}
+
+// TestSnapshotAndRestoreNeverStartTwoJobsOnOneVolume: the snapshot and
+// restore reconcilers run concurrently in the leader. A slow Create widens
+// the window between "no other Job on the volume" and "create mine".
+func TestSnapshotAndRestoreNeverStartTwoJobsOnOneVolume(t *testing.T) {
+	snap := snapReq(time.Now(), "", "")
+	restore := &wsnapv1.WorkspaceRestore{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "req", UID: "rq", CreationTimestamp: metav1.Now()},
+		Spec: wsnapv1.WorkspaceRestoreSpec{WorkspaceName: "ws1", SnapshotID: "s1"}}
+	snapR, c := requestEnv(t, snap, restore, wsWith(pvcVol, nil), boundClaim())
+	slow := &createSpy{Client: c, onCreate: func() { time.Sleep(100 * time.Millisecond) }}
+	snapR.Client = slow
+	restoreR := &RequestReconciler{Client: slow, Reader: c, Restore: true, Jobs: snapR.Jobs}
+	var wg sync.WaitGroup
+	for _, r := range []*RequestReconciler{snapR, restoreR} {
+		wg.Go(func() {
+			_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "req"}})
+		})
+	}
+	wg.Wait()
+	var jobs batchv1.JobList
+	_ = c.List(context.Background(), &jobs)
+	if len(jobs.Items) != 1 {
+		names := []string{}
+		for _, j := range jobs.Items {
+			names = append(names, j.Name)
+		}
+		t.Fatalf("%d Jobs on one volume: %v", len(jobs.Items), names)
+	}
+}
+
+// TestJobWaitsForAStartingOrStoppingWriter (reviewer #4 finding 2): the
+// writer Pod's sidecar may be restoring (Pending) or taking its final
+// snapshot (terminating) on a generic ephemeral volume. No Job may start
+// on that volume until the Pod is gone.
+func TestJobWaitsForAStartingOrStoppingWriter(t *testing.T) {
+	ephemeralVol := &wsnapv1.VolumeRef{Kind: workspace.KindEphemeral, ClaimName: "p-workspace", VolumeName: "pv-1"}
+	for name, mutate := range map[string]func(*corev1.Pod){
+		"pending":     func(p *corev1.Pod) { p.Status.Phase = corev1.PodPending },
+		"terminating": func(p *corev1.Pod) { p.DeletionTimestamp = ptr.To(metav1.Now()); p.Finalizers = []string{"test/keep"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "p", UID: "u", Labels: map[string]string{wsnapv1.LabelWorkspace: "ws1"}},
+				Spec:   corev1.PodSpec{Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{}}}}},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+			mutate(pod)
+			claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "p-workspace"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+			r, c := requestEnv(t, snapReq(time.Now(), "", ""), pod, claim, wsWith(ephemeralVol, &wsnapv1.PodRef{Name: "p", UID: "u"}))
+			got := reconcileReq(t, r, c)
+			var jobs batchv1.JobList
+			_ = c.List(context.Background(), &jobs)
+			if len(jobs.Items) != 0 || got.Status.Phase != wsnapv1.SnapshotPending {
+				t.Fatalf("%d Jobs, phase %q (%s); want none while the writer's sidecar uses the volume", len(jobs.Items), got.Status.Phase, got.Status.Message)
+			}
+		})
+	}
+}
+
+// TestMaintenanceRunsAtMostHourly (reviewer #4 finding 3): the workload
+// can drive the snapshot count, so the count alone must not schedule
+// maintenance.
+func TestMaintenanceRunsAtMostHourly(t *testing.T) {
+	ws := wsWith(pvcVol, nil)
+	ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "s"}
+	ws.Status.SnapshotsSinceMaintenance = 50
+	ws.Status.LastMaintenance = ptr.To(metav1.NewTime(time.Now().Add(-10 * time.Minute)))
+	r, c := requestEnv(t, ws)
+	repo := &wsnapv1.SnapshotRepository{}
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "repo"}, repo)
+	repo.Spec.Retention.MaintenanceEvery = 20
+	_ = c.Update(context.Background(), repo)
+	wr := &WorkspaceReconciler{Client: c, Reader: c, Jobs: r.Jobs}
+	res, err := wr.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "ws1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobs batchv1.JobList
+	_ = c.List(context.Background(), &jobs)
+	if len(jobs.Items) != 0 || res.RequeueAfter < 45*time.Minute {
+		t.Fatalf("%d maintenance Jobs 10 minutes after the last run, requeue %s", len(jobs.Items), res.RequeueAfter)
+	}
+}
+
+// TestTargetedRequestSnapshotsThatVolume (reviewer #4 finding 5): the
+// broker's rescue request names a stopped writer's PV; the mover must run
+// on that PV's claim, not on status.volume.
+func TestTargetedRequestSnapshotsThatVolume(t *testing.T) {
+	sr := snapReq(time.Now(), "", "")
+	sr.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: "pv-a"}
+	pvA := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-a", Annotations: map[string]string{
+		wsnapv1.AnnotationWorkspaceRef: testNS + "/ws1", workspace.AnnotationWriterPod: "uA"}},
+		Spec: corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: testNS, Name: "a-workspace"}}}
+	failedA := runningPod("a", "uA", "a-workspace")
+	failedA.Status.Phase = corev1.PodFailed
+	claimA := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "a-workspace"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-a"}}
+	r, c := requestEnv(t, sr, pvA, claimA, failedA, wsWith(pvcVol, &wsnapv1.PodRef{Name: "b", UID: "uB"}), runningPod("b", "uB", "data"), boundClaim())
+	got := reconcileReq(t, r, c)
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: requestJobName(request{sr})}, &job); err != nil {
+		t.Fatalf("no mover job (%s: %s): %v", got.Status.Phase, got.Status.Message, err)
+	}
+	if got := job.Spec.Template.Spec.Volumes[2].PersistentVolumeClaim.ClaimName; got != "a-workspace" || job.Annotations[workspace.AnnotationWriterPod] != "uA" {
+		t.Fatalf("mover mounts %q (writer %q); want the stopped writer's claim a-workspace", got, job.Annotations[workspace.AnnotationWriterPod])
+	}
+}
+
+// TestJobRegistryKeepsRunningJobs (reviewer #4 suspicion): when the list
+// is full, entries of Jobs that are gone go first, never a running Job's.
+func TestJobRegistryKeepsRunningJobs(t *testing.T) {
+	running := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "running", UID: "run-uid"}}
+	ws := wsWith(pvcVol, nil)
+	ws.Status.Jobs = []wsnapv1.JobRef{{Name: "running", UID: "run-uid", Kind: "maintenance"}}
+	for i := range maxRecordedJobs - 1 {
+		ws.Status.Jobs = append(ws.Status.Jobs, wsnapv1.JobRef{Name: fmt.Sprintf("gone-%d", i), UID: fmt.Sprintf("g%d", i), Kind: "mover"})
+	}
+	r, c := requestEnv(t, running, ws)
+	job := r.Jobs.newAgentJob("mover", "new-job", ws, &wsnapv1.SnapshotRepository{}, nil, nil, nil)
+	if err := createJob(context.Background(), c, c, job, "ws1"); err != nil {
+		t.Fatal(err)
+	}
+	var got wsnapv1.Workspace
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "ws1"}, &got)
+	if !slices.ContainsFunc(got.Status.Jobs, func(j wsnapv1.JobRef) bool { return j.UID == "run-uid" }) {
+		t.Fatalf("the running Job's entry was dropped: %+v", got.Status.Jobs)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,8 +35,10 @@ type fakeBroker struct {
 	reports      []protocol.Report
 	// restore overrides for pinned and fork restores
 	restoreID, restoreSource string
+	latestID                 string // LatestSnapshotID for restores
 	restoreRepo              string
 	waitQueue                chan string
+	failReports              atomic.Bool // answer reports with 503
 }
 
 func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +70,7 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Interval:           protocol.Duration{Duration: time.Hour},
 		}
 		if req.Role == protocol.RoleRestore {
-			resp.SnapshotID, resp.SourceWorkspace = b.restoreID, b.restoreSource
+			resp.SnapshotID, resp.SourceWorkspace, resp.LatestSnapshotID = b.restoreID, b.restoreSource, b.latestID
 			if b.restoreRepo != "" {
 				resp.Backend.Filesystem.Path = b.restoreRepo
 				resp.RestoreFromGeneration = 7
@@ -85,6 +88,10 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(protocol.WaitResponse{Requests: names})
 	case "/v1/report":
+		if b.failReports.Load() {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		var rep protocol.Report
 		_ = json.NewDecoder(r.Body).Decode(&rep)
 		b.mu.Lock()
@@ -700,14 +707,10 @@ func TestPinnedRollbackSurvivesAnIdlePod(t *testing.T) {
 func TestMoverSavesNothingFromAnUninitializedVolume(t *testing.T) {
 	for name, prepare := range map[string]func(c *Config){
 		"empty volume": func(c *Config) {},
+		// A first restore cut off: "restoring" without "initialized".
 		"restore interrupted": func(c *Config) {
-			write(t, MarkerPath(c.Dir), "x")
 			write(t, markerPath(c.Dir, "restoring"), "id")
 			write(t, filepath.Join(c.Dir, "half.txt"), "partial")
-		},
-		"swap interrupted": func(c *Config) {
-			write(t, MarkerPath(c.Dir), "x")
-			write(t, markerPath(c.Dir, "swap"), "1")
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -716,15 +719,17 @@ func TestMoverSavesNothingFromAnUninitializedVolume(t *testing.T) {
 			if err := c.RunMover(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			if reps := b.snapshotReports(); len(reps) != 0 {
-				t.Fatalf("the mover snapshotted a volume without workspace data: %+v", reps)
+			// One NoData report (so the broker marks the volume final), and
+			// no snapshot.
+			if reps := b.snapshotReports(); len(reps) != 1 || !reps[0].NoData || !reps[0].Final || reps[0].SnapshotID != "" {
+				t.Fatalf("want one NoData report and no snapshot, got %+v", reps)
 			}
 			c.Request = "req-1"
 			if err := c.RunMover(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			reps := b.snapshotReports()
-			if len(reps) != 1 || reps[0].Request != "req-1" || reps[0].Error == "" || reps[0].SnapshotID != "" {
+			if len(reps) != 2 || reps[1].Request != "req-1" || reps[1].Error == "" || reps[1].SnapshotID != "" || !reps[1].NoData {
 				t.Fatalf("a request on such a volume must fail with the reason, got %+v", reps)
 			}
 		})
@@ -895,4 +900,270 @@ func TestWarmVolumeWaitsForWriterClaimBeforeStartup(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("RunSidecar: %v", err)
 	}
+}
+
+// TestMoverFailsClosed: when the mover cannot tell what the volume holds,
+// it must fail the Job (the PV is then kept as RescueFailed), never report
+// "nothing to save" and let the controller reclaim unsaved data (reviewer
+// #3 finding 1).
+func TestMoverFailsClosed(t *testing.T) {
+	c, b := setup(t)
+	write(t, filepath.Join(c.Dir, "work.txt"), "unsaved")
+	// .wsnap replaced by a file: openVolume refuses it.
+	if err := os.RemoveAll(filepath.Join(c.Dir, ".wsnap")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(c.Dir, ".wsnap"), "not a directory")
+	if err := c.RunMover(context.Background()); err == nil {
+		t.Fatal("RunMover succeeded on a volume it could not check; the PV would be reclaimed unsaved")
+	}
+	if reps := b.snapshotReports(); len(reps) != 0 {
+		t.Fatalf("reports: %+v", reps)
+	}
+}
+
+// TestMoverSavesAfterCrashBetweenMarkers: "initialized" is written before
+// "restoring" is removed. A crash between the two must not make every
+// later rescue skip the volume (reviewer #3 finding 1), and the next
+// sidecar removes the stale marker.
+func TestMoverSavesAfterCrashBetweenMarkers(t *testing.T) {
+	c, b := setup(t)
+	write(t, MarkerPath(c.Dir), "x")
+	write(t, markerPath(c.Dir, "restoring"), "id")
+	write(t, filepath.Join(c.Dir, "work.txt"), "written after the restore")
+	if err := c.RunMover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reps := b.snapshotReports(); len(reps) != 1 || reps[0].Error != "" || !reps[0].Final {
+		t.Fatalf("want one final snapshot, got %+v", reps)
+	}
+	if _, err := c.initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(markerPath(c.Dir, "restoring")); !os.IsNotExist(err) {
+		t.Fatalf("stale restoring marker survived a warm start: %v", err)
+	}
+}
+
+// TestMoverFinishesAnInterruptedSwap: a volume left mid-swap is completed
+// and saved, not skipped.
+func TestMoverFinishesAnInterruptedSwap(t *testing.T) {
+	c, b := setup(t)
+	write(t, MarkerPath(c.Dir), "x")
+	write(t, filepath.Join(c.Dir, "old.txt"), "old")
+	write(t, filepath.Join(markerPath(c.Dir, "staging"), "new.txt"), "restored")
+	write(t, markerPath(c.Dir, "swap"), "1")
+	if err := os.MkdirAll(markerPath(c.Dir, "trash"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RunMover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(c.Dir, "new.txt")); string(got) != "restored" {
+		t.Fatalf("swap not finished: new.txt = %q", got)
+	}
+	if reps := b.snapshotReports(); len(reps) != 1 || reps[0].Error != "" {
+		t.Fatalf("want one snapshot of the restored tree, got %+v", reps)
+	}
+}
+
+// TestRollbackSavesLiveWorkFirst (reviewer #3 finding 7): a rollback must
+// not destroy work done since the last snapshot, and the request is
+// reported only after the restored state is in a snapshot.
+func TestRollbackSavesLiveWorkFirst(t *testing.T) {
+	c, b := setup(t)
+	old := seed(t, c, map[string]string{"a.txt": "old"})
+	st, err := c.initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	write(t, filepath.Join(c.Dir, "a.txt"), "unsaved work")
+	b.restoreID = old
+	if _, _, err := c.restoreInPlace(context.Background(), "rollback-1", st); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	reps := slices.Clone(b.reports)
+	b.mu.Unlock()
+	// Expected order: safety snapshot, post-restore snapshot, restore report.
+	var order []string
+	for _, r := range reps {
+		if r.Operation == protocol.OpRestore && r.Request == "" {
+			continue // the initial restore in seed/initialize
+		}
+		order = append(order, string(r.Operation))
+	}
+	if !slices.Equal(order[len(order)-3:], []string{"snapshot", "snapshot", "restore"}) {
+		t.Fatalf("report order %v, want a safety snapshot, then the post-restore snapshot, then the restore", order)
+	}
+	safety := reps[len(reps)-3]
+	if safety.SnapshotID == "" || safety.SnapshotID == old {
+		t.Fatalf("no new safety snapshot: %+v", safety)
+	}
+	// The unsaved work is in the safety snapshot: restore it elsewhere.
+	b.restoreID = safety.SnapshotID
+	next, _ := setup(t)
+	next.BrokerURL, next.HTTP = c.BrokerURL, c.HTTP
+	if _, err := next.initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(next.Dir, "a.txt")); string(got) != "unsaved work" {
+		t.Fatalf("safety snapshot holds %q; the rollback destroyed live work", got)
+	}
+}
+
+// TestCredentialsAreReusedWithDefaults (reviewer #3 finding 9): with a 1h
+// credential and the default 30m operation limit, the cache must work.
+func TestCredentialsAreReusedWithDefaults(t *testing.T) {
+	c, b := setup(t)
+	c.OperationTimeout = 30 * time.Minute
+	for range 3 {
+		if _, err := c.credentials(context.Background(), protocol.RoleSnapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := b.credReqs.Load(); n != 1 {
+		t.Fatalf("%d credential requests for 3 uses; the cache is dead", n)
+	}
+}
+
+// TestRootAgentTakesOverForeignStateDir (reviewer #3 finding 1): a .wsnap
+// created by an agent under another uid must not block every later agent.
+// Runs only as root (the Linux agent image).
+func TestRootAgentTakesOverForeignStateDir(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".wsnap"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(filepath.Join(dir, ".wsnap"), 1000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	v, err := openVolume(dir)
+	if err != nil {
+		t.Fatalf("root agent refused a .wsnap owned by uid 1000: %v", err)
+	}
+	v.Close()
+	info, _ := os.Lstat(filepath.Join(dir, ".wsnap"))
+	if uid, _ := ownerUID(info); uid != 0 || info.Mode().Perm() != 0o755 {
+		t.Fatalf("after take-over: uid %d mode %v; the workload could still rename entries", uid, info.Mode().Perm())
+	}
+	// A symlink is still refused.
+	dir2 := t.TempDir()
+	if err := os.Symlink("/etc", filepath.Join(dir2, ".wsnap")); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := openVolume(dir2); err == nil {
+		v.Close()
+		t.Fatal("a .wsnap symlink was accepted")
+	}
+}
+
+// TestNotWorkspaceDataReportsErrorsAsErrors: a check that fails is an
+// error, never a reason to save nothing (reviewer #3 finding 1; before the
+// fix, the error text was returned as the reason).
+func TestNotWorkspaceDataReportsErrorsAsErrors(t *testing.T) {
+	c, _ := setup(t)
+	if err := os.RemoveAll(filepath.Join(c.Dir, ".wsnap")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(c.Dir, ".wsnap"), "not a directory")
+	reason, err := c.notWorkspaceData()
+	if err == nil {
+		t.Fatalf("no error; reason %q would let the controller reclaim unsaved data", reason)
+	}
+}
+
+// TestJobFailsWhenItsReportIsLost (reviewer #4 finding 1): a mover whose
+// snapshot report never reaches the broker must fail, or the controller
+// reclaims the volume while lastSnapshot still names older data.
+func TestJobFailsWhenItsReportIsLost(t *testing.T) {
+	c, b := setup(t)
+	write(t, filepath.Join(c.Dir, "work.txt"), "unsaved")
+	b.failReports.Store(true)
+	defer func(d time.Duration) { strictReportFor = d }(strictReportFor)
+	strictReportFor = 2 * time.Second
+	if err := c.RunMover(context.Background()); err == nil {
+		t.Fatal("RunMover succeeded although no report reached the broker")
+	}
+}
+
+// TestMissingRepositoryWithRecordedSnapshotFails (reviewer #4 finding 7):
+// the broker recorded a snapshot, so a missing repository must stop the
+// start, not begin an empty workspace.
+func TestMissingRepositoryWithRecordedSnapshotFails(t *testing.T) {
+	c, b := setup(t)
+	b.latestID = "recorded-snap"
+	if _, err := c.initialize(context.Background()); err == nil {
+		t.Fatal("initialize started an empty workspace although the broker recorded a snapshot")
+	}
+	if Ready(c.Dir) == nil {
+		t.Fatal("the volume was marked initialized")
+	}
+}
+
+// TestRollbackKeepsWritesMadeDuringTheDownload (reviewer #4 finding 4):
+// the agent writes while the restore downloads; those writes must be in
+// the safety snapshot.
+func TestRollbackKeepsWritesMadeDuringTheDownload(t *testing.T) {
+	wrapper := filepath.Join(t.TempDir(), "engine.sh")
+	// On "restore", write into the live volume (two levels above
+	// .wsnap/staging) before the real restore.
+	script := "#!/bin/sh\nif [ \"$1\" = restore ]; then echo during > \"$(dirname \"$(dirname \"$WSNAP_DIR\")\")/during.txt\"; fi\nexec " + tarEngine(t) + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, b := setup(t, wrapper)
+	old := seed(t, c, map[string]string{"a.txt": "old"})
+	st, err := c.initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.restoreID = old
+	if _, _, err := c.restoreInPlace(context.Background(), "rollback-1", st); err != nil {
+		t.Fatal(err)
+	}
+	snaps := b.snapshotReports()
+	safety := snaps[len(snaps)-2]
+	// Check with the plain engine, which writes nothing by itself.
+	b.restoreID, b.command = safety.SnapshotID, []string{tarEngine(t)}
+	next, _ := setup(t)
+	next.BrokerURL, next.HTTP = c.BrokerURL, c.HTTP
+	if _, err := next.initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(next.Dir, "during.txt")); string(got) != "during\n" {
+		t.Fatalf("a write made during the download is in no snapshot (safety snapshot %s holds %q)", safety.SnapshotID, got)
+	}
+}
+
+// TestRequestFilesAreSpaced (reviewer #4 finding 3): the workload cannot
+// trigger snapshots faster than FileRequestSpacing.
+func TestRequestFilesAreSpaced(t *testing.T) {
+	c, _ := setup(t)
+	c.IntervalOverride = time.Hour
+	c.TriggerPoll = 20 * time.Millisecond
+	c.FileRequestSpacing = 2 * time.Second
+	seed(t, c, map[string]string{"a.txt": "one"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- c.RunSidecar(ctx) }()
+	for StartupReady(c.StateDir) != nil {
+		time.Sleep(20 * time.Millisecond)
+	}
+	reqDir := markerPath(c.Dir, "requests")
+	start := time.Now()
+	write(t, filepath.Join(reqDir, "r1"), "")
+	readResult(t, c, "r1")
+	write(t, filepath.Join(reqDir, "r2"), "")
+	readResult(t, c, "r2")
+	if elapsed := time.Since(start); elapsed < 2*time.Second {
+		t.Fatalf("two request files answered within %s; want at least the 2s spacing", elapsed)
+	}
+	cancel()
+	<-errc
 }

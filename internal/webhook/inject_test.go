@@ -1,8 +1,10 @@
 package webhook
 
 import (
+	"github.com/chrisyifanjin/wsnap/internal/workspace"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -143,13 +145,107 @@ func TestEphemeralContainersCannotReachTheSidecar(t *testing.T) {
 			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", VolumeMounts: mounts}}}
 		return q
 	}
-	if err := ValidateEphemeral(debug("agent"), "wsnap", "wsnap"); err != nil {
+	if err := ValidateEphemeral(debug("agent"), "wsnap", false); err != nil {
 		t.Errorf("debugging the workload was refused: %v", err)
 	}
-	if err := ValidateEphemeral(debug("wsnap"), "wsnap", "wsnap"); err == nil {
+	if err := ValidateEphemeral(debug("wsnap"), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may share the sidecar's process namespace")
 	}
-	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: tokenVolume, MountPath: "/t"}), "wsnap", "wsnap"); err == nil {
+	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: tokenVolume, MountPath: "/t"}), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may mount the wsnap token")
+	}
+}
+
+// TestSidecarIsRootWhateverThePodSays (reviewer #3 finding 1): with a
+// Pod-level runAsUser the sidecar would create .wsnap as that uid, and
+// root mover Jobs would then refuse the volume.
+func TestSidecarIsRootWhateverThePodSays(t *testing.T) {
+	p := labeledPod(func(p *corev1.Pod) {
+		p.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsUser: ptr.To[int64](1000), RunAsNonRoot: ptr.To(true)}
+	})
+	if err := Mutate(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	sc := p.Spec.InitContainers[0].SecurityContext
+	if sc == nil || ptr.Deref(sc.RunAsUser, -1) != 0 || ptr.Deref(sc.RunAsNonRoot, true) {
+		t.Fatalf("sidecar security context %+v; want runAsUser 0 overriding the Pod", sc)
+	}
+	// A failed startup probe restarts the restore from zero; it must
+	// outlast a mover Job (2 h) plus the restore.
+	pr := p.Spec.InitContainers[0].StartupProbe
+	if limit := time.Duration(pr.PeriodSeconds*pr.FailureThreshold) * time.Second; limit < 4*time.Hour {
+		t.Fatalf("startup probe gives up after %s", limit)
+	}
+}
+
+// TestWorkloadCannotReachAgentSecretsOrTheAPI (reviewer #4 finding 9).
+func TestWorkloadCannotReachAgentSecretsOrTheAPI(t *testing.T) {
+	vaultToken := corev1.Volume{Name: "vault", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "vault", Path: "token"}}}}}}
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*corev1.Pod)
+		allowed bool
+	}{
+
+		{"a token for another audience", func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, vaultToken)
+			p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "vault", MountPath: "/vault"})
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := labeledPod(tc.mutate)
+			if err := Mutate(p, cfg); (err == nil) != tc.allowed {
+				t.Fatalf("Mutate err = %v, want allowed=%v", err, tc.allowed)
+			}
+		})
+	}
+	// The sidecar's state volume holds the engine configuration with
+	// storage credentials. Inject first, then let the workload mount it.
+	p := labeledPod()
+	if err := Mutate(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: stateVolume, MountPath: "/steal"})
+	p.Annotations = map[string]string{AnnotationInject: "false"}
+	if err := Mutate(p, cfg); err == nil {
+		t.Fatal("a workload container that mounts the sidecar's state volume was admitted")
+	}
+}
+
+// TestAdmissionPluginTokenIsRemoved: the ServiceAccount admission plugin
+// runs before webhooks and has already mounted kube-api-access into every
+// container (found by the e2e suite). The webhook removes it, as
+// automountServiceAccountToken: false would have, and the result passes
+// the isolation check that the broker also applies.
+func TestAdmissionPluginTokenIsRemoved(t *testing.T) {
+	apiToken := corev1.Volume{Name: "kube-api-access-4lnmt", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token"}}}}}}
+	p := labeledPod(func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, apiToken)
+		p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: apiToken.Name, MountPath: "/var/run/secrets/kubernetes.io/serviceaccount"})
+	})
+	if err := Mutate(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range p.Spec.Volumes {
+		if v.Name == apiToken.Name {
+			t.Fatal("the API token volume is still in the Pod")
+		}
+	}
+	for _, m := range p.Spec.Containers[0].VolumeMounts {
+		if m.Name == apiToken.Name {
+			t.Fatal("the agent container still mounts the API token")
+		}
+	}
+	// Without the webhook (or with it bypassed), the broker's check refuses it.
+	q := labeledPod()
+	if err := Mutate(q, cfg); err != nil {
+		t.Fatal(err)
+	}
+	q.Spec.Volumes = append(q.Spec.Volumes, apiToken)
+	q.Spec.Containers[0].VolumeMounts = append(q.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: apiToken.Name, MountPath: "/t"})
+	if err := workspace.CheckIsolation(q, "wsnap", false); err == nil {
+		t.Fatal("the isolation check accepted a workload that mounts an API token")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -136,9 +137,29 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 		if !apierrors.IsAlreadyExists(err) {
 			return err
 		}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(job), job); err != nil {
+		var existing batchv1.Job
+		if err := r.Get(ctx, client.ObjectKeyFromObject(job), &existing); err != nil {
 			return err
 		}
+		var ws wsnapv1.Workspace
+		if err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: wsName}, &ws); err != nil {
+			return err
+		}
+		if slices.ContainsFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool { return j.UID == string(existing.UID) }) {
+			*job = existing
+			return nil
+		}
+		// A Job with this name that wsnap never registered: a namespace
+		// user may have created it to run their own Pod spec with wsnap's
+		// credentials, or wsnap crashed between create and register.
+		// Either way it is not trusted: delete it and create a new one on
+		// the next reconcile. Foreground, so its Pods are gone first.
+		fg := metav1.DeletePropagationForeground
+		if err := c.Delete(ctx, &existing, &client.DeleteOptions{PropagationPolicy: &fg,
+			Preconditions: &metav1.Preconditions{UID: &existing.UID}}); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+		return fmt.Errorf("job %s/%s existed but was not registered by wsnap; deleted it, will create it again", job.Namespace, job.Name)
 	}
 	ref := wsnapv1.JobRef{Name: job.Name, UID: string(job.UID), Kind: job.Labels[wsnapv1.LabelJob]}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -152,6 +173,18 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 			}
 		}
 		ws.Status.Jobs = append(ws.Status.Jobs, ref)
+		if len(ws.Status.Jobs) > maxRecordedJobs {
+			// Drop entries of Jobs that are gone first: dropping a running
+			// Job's entry would make the broker refuse it.
+			ws.Status.Jobs = slices.DeleteFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool {
+				if j.UID == ref.UID {
+					return false
+				}
+				var cur batchv1.Job
+				err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: j.Name}, &cur)
+				return apierrors.IsNotFound(err) || (err == nil && string(cur.UID) != j.UID)
+			})
+		}
 		if n := len(ws.Status.Jobs); n > maxRecordedJobs {
 			ws.Status.Jobs = ws.Status.Jobs[n-maxRecordedJobs:]
 		}

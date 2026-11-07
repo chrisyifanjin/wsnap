@@ -34,9 +34,19 @@ restore)
 	tar -C "$WSNAP_DIR" -xzf "$repo/snapshots/$WSNAP_SNAPSHOT_ID.tar.gz"
 	;;
 maintain)
-	ls "$repo/snapshots" | grep '\.tar\.gz$' | sort |
-		awk -v keep="$WSNAP_KEEP_LAST" '{ f[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print f[i] }' |
-		while read -r f; do rm -f "$repo/snapshots/$f"; done
+	# Keep: the newest WSNAP_KEEP_LAST, the newest of each of the last
+	# WSNAP_KEEP_DAILY days that have snapshots (IDs start with the UTC
+	# date), and the pinned WSNAP_KEEP_IDS. Delete the rest.
+	all=$(ls "$repo/snapshots" | grep '\.tar\.gz$' | sed 's/\.tar\.gz$//' | sort)
+	keep=$(
+		printf '%s\n' "$all" | tail -n "$WSNAP_KEEP_LAST"
+		printf '%s\n' "$all" | awk '{ last[substr($0, 1, 8)] = $0 } END { for (d in last) print d, last[d] }' |
+			sort -r | head -n "${WSNAP_KEEP_DAILY:-0}" | cut -d' ' -f2
+		printf '%s\n' "${WSNAP_KEEP_IDS:-}"
+	)
+	printf '%s\n' "$all" | grep -vxF -e "$keep" -e '' | while read -r id; do
+		rm -f "$repo/snapshots/$id.tar.gz"
+	done
 	;;
 *)
 	echo "unknown verb $1" >&2; exit 2

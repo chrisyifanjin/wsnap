@@ -2,15 +2,6 @@
 # STS credentials. For AWS, set credentials.sts.roleARN and leave the
 # endpoint at its default. For MinIO or Ceph RGW, the broker calls STS on the
 # S3 endpoint; the admin user must not be the MinIO root user.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: wsnap-creds
-stringData:
-  WSNAP_MASTER_KEY: change-me-to-32-random-bytes-0000000
-  AWS_ACCESS_KEY_ID: broker
-  AWS_SECRET_ACCESS_KEY: change-me
----
 apiVersion: wsnap.dev/v1alpha1
 kind: SnapshotRepository
 metadata:

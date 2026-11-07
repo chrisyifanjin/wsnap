@@ -7,9 +7,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/chrisyifanjin/wsnap/internal/version"
 	"net"
 	"net/http"
 	"os"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -58,12 +60,18 @@ func main() {
 		namespace   = flag.String("namespace", "wsnap-system", "namespace the controller runs in")
 		release     = flag.Bool("release-volumes", false, "restore the reclaim policy of every protected PV and exit (run before uninstalling)")
 		force       = flag.Bool("force", false, "with --release-volumes, also release PVs whose data is in no snapshot")
+		showVersion = flag.Bool("version", false, "print the version and exit")
 	)
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	log := ctrl.Log.WithName("setup")
+	log.Info("starting", "version", version.Version)
 
 	scheme := runtime.NewScheme()
 	must(clientgoscheme.AddToScheme(scheme))
@@ -120,7 +128,7 @@ func main() {
 
 	jobs := controller.JobConfig{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA}
 	mgr.GetWebhookServer().Register("/mutate-pods", &admission.Webhook{Handler: &webhook.Handler{
-		Config:  webhook.Config{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA},
+		Config:  webhook.Config{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA, AllowAPIToken: *allowAPITok},
 		Decoder: admission.NewDecoder(scheme),
 	}})
 	reader := mgr.GetAPIReader()
@@ -188,6 +196,8 @@ func main() {
 		log.Info("broker serves plain HTTP; credentials cross the Pod network unencrypted (set --tls-cert-file)")
 	}
 	// The broker serves on every replica; it does not need the leader lock.
+	// Health gauges for alerts (config/prometheus), read from the cache.
+	ctrlmetrics.Registry.MustRegister(controller.StateCollector{Reader: mgr.GetCache()})
 	must(mgr.Add(brokerRunnable{addr: *brokerAddr, handler: srv.Handler(), tls: tlsConfig}))
 	if *manageCerts {
 		// Uncached: the RBAC allows get/update of this one webhook

@@ -5,8 +5,12 @@ wsnap.
 
 ## Requirements
 
-- Kubernetes 1.29 or later (native sidecars). Tested on 1.37.
-- A StorageClass for workspace volumes. For node-local disks, use a dynamic
+- Kubernetes 1.30 or later: native sidecars, and the `sleep` preStop
+  action of the controller (on by default from 1.30). Tested on 1.37.
+- A Pod Security level of `baseline` or `privileged` in workspace
+  namespaces: the agent runs as root with a few capabilities.
+- A default dynamic StorageClass for the sample Pod, or set
+  `storageClassName` in its volume claim. For node-local disks, use a dynamic
   local provisioner (TopoLVM, OpenEBS LVM LocalPV, rancher local-path) with
   `volumeBindingMode: WaitForFirstConsumer`.
 - Object storage: S3-compatible, Google Cloud Storage, or Azure Blob. A
@@ -14,10 +18,26 @@ wsnap.
 
 ## Install
 
+There is no published release yet. Install from source on a kind cluster:
+
 ```sh
-make images            # or build: docker build --target controller / --target agent
+kind create cluster --name wsnap
+make images
+kind load docker-image wsnap-controller:dev wsnap-agent:dev --name wsnap
 kubectl apply -k config/default
+kubectl -n wsnap-system rollout status deployment/wsnap-controller
 ```
+
+If you already have a cluster, build and push both images to a registry
+that its nodes can pull from. Change the controller image and its
+`--agent-image` argument in `config/manager/manager.yaml` before applying
+`config/default`. For a released version, use the `install.yaml` attached
+to the release instead; it pins both image tags.
+
+The sample volume needs a StorageClass. Check yours with
+`kubectl get storageclass` before creating a Pod.
+
+`wsnap-controller --version` and `wsnap-agent version` print the build.
 
 This installs the CRDs, the controller (2 replicas, leader election, PDB),
 the broker Service, the webhook Service, the
@@ -39,10 +59,15 @@ The controller flags:
 
 ## Create a repository
 
-1. Create a Secret with the master key and the backend credential:
+Put the `SnapshotRepository`, its Secret, and every Pod that uses it in
+the **same namespace**. The following examples use `agents`:
+
+1. Create that namespace and a Secret with the master key and backend
+   credential:
 
    ```sh
-   kubectl create secret generic wsnap-creds \
+   kubectl create namespace agents
+   kubectl -n agents create secret generic wsnap-creds \
      --from-literal=WSNAP_MASTER_KEY="$(openssl rand -hex 32)" \
      --from-literal=AWS_ACCESS_KEY_ID=... \
      --from-literal=AWS_SECRET_ACCESS_KEY=...
@@ -50,7 +75,11 @@ The controller flags:
 
    Keep `WSNAP_MASTER_KEY` safe. Without it, no workspace can be restored.
 
-2. Create a `SnapshotRepository`. Choose one backend.
+2. Create a `SnapshotRepository` in `agents`. Choose one backend. The
+   following fragments show the relevant `spec` fields; the S3 example
+   is a complete object. For that example, edit the bucket, region and
+   role ARN in `config/samples/repository-s3-sts.yaml`, then run
+   `kubectl -n agents apply -f config/samples/repository-s3-sts.yaml`.
 
 **AWS S3 with STS (recommended on AWS).** The access key belongs to a user
 that may assume `roleARN`.
@@ -109,13 +138,17 @@ See `internal/engine/exec.go` for the contract.
 3. Check it:
 
    ```sh
-   kubectl get snaprepo
+   kubectl -n agents get snaprepo
    # NAME      ENGINE   PROVIDER   READY
    # default   kopia    s3-sts     True
    ```
 
-   `Ready=False` explains the problem: a missing Secret, a short master key,
-   or an engine and provider that do not work together.
+   `Ready=False` explains a configuration problem: for example, a missing
+   Secret, a short master key, or an incompatible engine and provider.
+   `Ready=True` does **not** test access to object storage; the first
+   snapshot does that. Check `CredentialsScoped=True` to confirm that
+   the agent receives scoped credentials. The `static` provider reports
+   `CredentialsScoped=False` because it gives the agent the admin key.
 
 ### Schedule and retention
 
@@ -123,12 +156,25 @@ See `internal/engine/exec.go` for the contract.
 |---|---|---|
 | `schedule.interval` | `15m` | Time between snapshots. Minimum `10s`. Idle workspaces skip the snapshot. |
 | `retention.keepLast` | `10` | Snapshots that maintenance keeps. |
-| `retention.maintenanceEvery` | `20` | Run maintenance after this many new snapshots. `0` turns it off. |
-| `credentials.ttl` | `1h` | Lifetime of issued credentials. AWS STS needs at least `15m`. |
+| `retention.keepDaily` | `7` | Also keep the newest snapshot of each of the last N days (UTC). A burst of snapshots cannot push older days out. |
+| `retention.maintenanceEvery` | `20` | Run maintenance after this many new snapshots, at most once an hour. `0` turns it off. |
+| `credentials.ttl` | `1h` | Lifetime of issued credentials. AWS STS needs at least `15m`. Keep it at least 5 minutes longer than the agent's `--operation-timeout` (default `30m`); raise both for very large workspaces. |
 
 ## Protect a workload
 
-Add two labels and a volume named `workspace`:
+The simplest example is [pod.yaml](https://github.com/chrisyifanjin/wsnap/blob/main/config/samples/pod.yaml), which
+uses a generic ephemeral volume. Apply it in the same namespace as the
+repository:
+
+```sh
+kubectl -n agents apply -f config/samples/pod.yaml
+kubectl -n agents wait --for=condition=Ready pod/my-agent --timeout=5m
+kubectl -n agents get workspace user-42-project-x
+```
+
+The webhook adds the sidecar and waits for the restore before starting
+the workload. To protect your own Pod, add the same two labels and mount
+a volume named `workspace`:
 
 ```yaml
 metadata:
@@ -158,7 +204,17 @@ The webhook adds the sidecar. Optional annotations:
 | `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 For agent-sandbox, put the labels in `Sandbox.spec.podTemplate.metadata`
-and the volume in `volumeClaimTemplates`.
+and the volume in `volumeClaimTemplates`, as in
+[sandbox.yaml](https://github.com/chrisyifanjin/wsnap/blob/main/config/samples/sandbox.yaml). Install agent-sandbox
+before applying that sample. The webhook injects the sidecar for both
+samples.
+
+Use a generic ephemeral PVC, or a standalone PVC whose PV is retained,
+when a mover must rescue a volume after its PVC is deleted without a final
+snapshot. With `emptyDir`, wsnap can take a final
+snapshot during a normal stop, but it cannot rescue data after the Pod
+disappears. If the underlying disk is lost, any volume type can restore
+only the last completed snapshot.
 
 ### Quiesce handshake
 
@@ -218,8 +274,37 @@ Metrics on `:8081/metrics`:
 | `wsnap_credential_issue_seconds` | `role` | Time to issue a credential, including STS. |
 | `wsnap_agent_reports_total` | `operation`, `result` | Snapshots, restores and maintenance: `ok`, `reused` or `error`. |
 
-Alert on a rising `result="error"` rate, and on workspaces whose
-`status.lastSnapshot.time` is older than a few intervals.
+Health gauges, computed from the informer cache at each scrape. Every
+replica serves them; use `max()`:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `wsnap_workspaces_failing` | — | Workspaces with `status.lastError` set. |
+| `wsnap_volumes_rescue` | `phase` (`running`, `failed`) | Protected PVs being rescued, or kept after a failed rescue. |
+| `wsnap_build_info` | `version` | Always 1. |
+
+No metric carries a workspace or Pod name, so the series count stays
+fixed as workspaces grow. `config/prometheus/rules.yaml` holds ready
+alerts (Prometheus Operator): a failed rescue (critical: unsaved data
+waits for an operator), a stuck rescue, failing workspaces, a high agent
+error rate, and broker 503s.
+
+Do not alert on the age of `status.lastSnapshot.time`: an idle workspace
+skips its snapshots on purpose.
+
+## Upgrade
+
+Apply the new `install.yaml`. The controller rolls one replica at a time
+(PDB), and the webhook stays available. Running sidecars keep their old
+image until their Pods restart; the broker accepts older agents within one
+minor version.
+
+Upgrading to the release with writer epochs: existing PVs have no
+`wsnap.dev/writer-epoch` annotation and count as epoch 0, and existing
+snapshot records count as epoch 0. PVs that an earlier version marked
+`wsnap.dev/rescue=skipped-newer-writer` stay as they are; remove the
+annotation to rescue them (their data is kept without replacing newer
+history).
 
 ## Troubleshoot
 
@@ -228,8 +313,9 @@ Alert on a rising `result="error"` rate, and on workspaces whose
 | Pod stays in `PodInitializing` | The sidecar waits until the broker admits the Pod as the writer. Read `kubectl logs <pod> -c wsnap`. A `409` means another Pod still writes the workspace, a rescue runs, or a Job works on the volume; it ends by itself. |
 | Pod refused at creation | The webhook explains why in the error message. |
 | `Ready=False` on a repository | Read the condition message. |
-| PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed or ran out of time (2 h). Fix the cause, then remove the annotation to retry. |
-| PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | A newer Pod already writes the workspace elsewhere. The PV holds older, unsaved data; recover it by hand or delete it. |
+| PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed, ran out of time (2 h), or could not check the volume. Read the mover Pod's log, fix the cause, then remove the annotation to retry. |
+| PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | Set only by versions before writer epochs. Remove the annotation; the PV is then rescued, and its data is kept without replacing newer history. |
+| The broker logs "snapshot of an older writer epoch kept, but not as the newest" | A rescue saved an older writer's volume after a newer writer's snapshot. The data is in the repository under the logged snapshot ID; restore it with a `WorkspaceRestore` if you need it. |
 | A writer on a lost node blocks a new Pod | The block ends 2 minutes after the old Pod's deletion deadline. |
 
 ## Uninstall

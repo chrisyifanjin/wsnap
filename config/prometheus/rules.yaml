@@ -1,0 +1,54 @@
+# Alerts for wsnap. Needs the Prometheus Operator (PrometheusRule CRD) and a
+# scrape of the controller's :8081/metrics on every replica. The gauges are
+# served by every replica, so the rules take max() across them.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: wsnap
+  namespace: wsnap-system
+spec:
+  groups:
+  - name: wsnap
+    rules:
+    - alert: WsnapRescueFailed
+      expr: max(wsnap_volumes_rescue{phase="failed"}) > 0
+      for: 5m
+      labels: {severity: critical}
+      annotations:
+        summary: A released workspace volume holds data that is in no snapshot.
+        description: >-
+          {{ $value }} PV(s) carry wsnap.dev/rescue=failed. wsnap keeps them
+          (reclaim policy Retain). Read the mover Pod's log, fix the cause,
+          then remove the annotation to retry. See docs/operations.md.
+    - alert: WsnapRescueStuck
+      expr: max(wsnap_volumes_rescue{phase="running"}) > 0
+      for: 3h
+      labels: {severity: warning}
+      annotations:
+        summary: A volume rescue has run for more than 3 hours.
+        description: Mover Jobs stop after 2 hours; a rescue that runs longer is stuck.
+    - alert: WsnapWorkspacesFailing
+      expr: max(wsnap_workspaces_failing) > 0
+      for: 30m
+      labels: {severity: warning}
+      annotations:
+        summary: Workspace snapshots, restores or maintenance are failing.
+        description: >-
+          {{ $value }} workspace(s) have status.lastError set for 30 minutes.
+          Run: kubectl get workspaces -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,ERROR:.status.lastError
+    - alert: WsnapAgentErrors
+      expr: sum(rate(wsnap_agent_reports_total{result="error"}[15m])) / clamp_min(sum(rate(wsnap_agent_reports_total[15m])), 1e-9) > 0.1
+      for: 15m
+      labels: {severity: warning}
+      annotations:
+        summary: More than 10% of agent operations fail.
+    - alert: WsnapBrokerUnavailable
+      expr: sum(rate(wsnap_broker_requests_total{code="503"}[5m])) > 0.5
+      for: 10m
+      labels: {severity: warning}
+      annotations:
+        summary: The broker answers 503 often.
+        description: >-
+          The API server, STS or the identity provider does not answer. Agents
+          retry, but final snapshots can miss their deadline and fall back to
+          a rescue.

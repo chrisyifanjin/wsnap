@@ -6,6 +6,7 @@ package webhook
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,6 +40,9 @@ type Config struct {
 	Audience   string
 	// CAConfigMap names the ConfigMap with the broker's CA; empty for HTTP.
 	CAConfigMap string
+	// AllowAPIToken admits workload containers that mount an API server
+	// token (--allow-automounted-tokens).
+	AllowAPIToken bool
 }
 
 const (
@@ -75,6 +79,9 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		return fmt.Errorf("automountServiceAccountToken is true: untrusted containers would hold an API token; remove it or set it to false")
 	}
 	pod.Spec.AutomountServiceAccountToken = ptr.To(false)
+	if !cfg.AllowAPIToken {
+		removeAPITokens(pod)
+	}
 
 	finalTimeout := defaultFinalTimeout
 	if v := pod.Annotations[AnnotationFinalTimeout]; v != "" {
@@ -111,7 +118,7 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		return fmt.Errorf("container %q is a regular container; the wsnap sidecar must be a native sidecar (an init container with restartPolicy: Always) so it restores before the workload starts", sidecarName)
 	}
 	if pod.Annotations[AnnotationInject] == "false" || existing != nil {
-		return validate(pod, sidecarName, cfg.Audience)
+		return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
 	}
 
 	ensureVolume(pod, corev1.Volume{Name: tokenVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
@@ -139,12 +146,14 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		Image:         cfg.AgentImage,
 		Args:          args,
 		RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
-		// The workload starts only after the volume is restored. 30 minutes
-		// covers a large cold restore.
+		// The workload starts only after the volume is restored. A failed
+		// probe restarts the sidecar, which starts the restore again from
+		// zero, so the limit (4 hours) must exceed any wait for a previous
+		// writer or a rescue (a mover Job has 2 hours) plus the restore.
 		StartupProbe: &corev1.Probe{
 			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/usr/local/bin/wsnap-agent", "ready", "--state-dir=/var/lib/wsnap"}}},
 			PeriodSeconds:    1,
-			FailureThreshold: 1800,
+			FailureThreshold: 4 * 3600,
 		},
 		VolumeMounts: mounts,
 		Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
@@ -154,7 +163,7 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 	// First, so the restore finishes before any other init container (which
 	// might write to the workspace) starts.
 	pod.Spec.InitContainers = append([]corev1.Container{sidecar}, pod.Spec.InitContainers...)
-	return validate(pod, sidecarName, cfg.Audience)
+	return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
 }
 
 // AgentSecurityContext hardens the agent container. Its root filesystem
@@ -163,6 +172,12 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 // every workspace file and restore owners and modes.
 func AgentSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
+		// Always root, whatever the Pod-level runAsUser: the agent must read
+		// and restore every file, and every agent on a volume (sidecar,
+		// mover, restorer) must be the same uid to trust .wsnap.
+		RunAsUser:                ptr.To[int64](0),
+		RunAsGroup:               ptr.To[int64](0),
+		RunAsNonRoot:             ptr.To(false),
 		ReadOnlyRootFilesystem:   ptr.To(true),
 		AllowPrivilegeEscalation: ptr.To(false),
 		Capabilities: &corev1.Capabilities{
@@ -173,7 +188,7 @@ func AgentSecurityContext() *corev1.SecurityContext {
 }
 
 // validate checks a Pod that already has its sidecar.
-func validate(pod *corev1.Pod, sidecarName, audience string) error {
+func validate(pod *corev1.Pod, sidecarName, audience string, allowAPIToken bool) error {
 	sc := findContainer(pod.Spec.InitContainers, sidecarName)
 	if sc == nil {
 		return fmt.Errorf("annotation %s=false, but the pod has no %q init container", AnnotationInject, sidecarName)
@@ -184,59 +199,47 @@ func validate(pod *corev1.Pod, sidecarName, audience string) error {
 	if sc.StartupProbe == nil {
 		return fmt.Errorf("container %q needs a startupProbe, or the workload starts before the restore finishes", sidecarName)
 	}
-	tokenVols := map[string]bool{}
-	for _, v := range pod.Spec.Volumes {
-		if v.Projected == nil {
-			continue
-		}
-		for _, src := range v.Projected.Sources {
-			// Tokens for other audiences (e.g. Vault) are the workload's own.
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == audience {
-				tokenVols[v.Name] = true
-			}
-		}
-	}
-	for _, list := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
-		for _, c := range list {
-			if c.Name == sidecarName {
-				continue
-			}
-			for _, m := range c.VolumeMounts {
-				if tokenVols[m.Name] {
-					return fmt.Errorf("container %q mounts the token volume %q; only %q may", c.Name, m.Name, sidecarName)
-				}
-			}
-		}
-	}
-	return ValidateEphemeral(pod, sidecarName, audience)
+	return workspace.CheckIsolation(pod, audience, allowAPIToken)
 }
 
 // ValidateEphemeral refuses ephemeral containers (kubectl debug) that could
 // reach the agent's secrets: one that mounts the token volume, or one that
 // targets the sidecar and so shares its process namespace.
-func ValidateEphemeral(pod *corev1.Pod, sidecarName, audience string) error {
-	tokenVols := map[string]bool{}
-	for _, v := range pod.Spec.Volumes {
+func ValidateEphemeral(pod *corev1.Pod, audience string, allowAPIToken bool) error {
+	return workspace.CheckIsolation(pod, audience, allowAPIToken)
+}
+
+// removeAPITokens takes API server tokens out of the Pod. The
+// ServiceAccount admission plugin runs before mutating webhooks, so when a
+// Pod does not set automountServiceAccountToken itself, its
+// kube-api-access volume is already mounted into every container by the
+// time this webhook sets the field to false. Removing the projected volumes
+// that carry an API token (no audience), and their mounts, gives the Pod
+// what automountServiceAccountToken: false would have given it.
+func removeAPITokens(pod *corev1.Pod) {
+	drop := map[string]bool{}
+	pod.Spec.Volumes = slices.DeleteFunc(pod.Spec.Volumes, func(v corev1.Volume) bool {
 		if v.Projected == nil {
-			continue
+			return false
 		}
 		for _, src := range v.Projected.Sources {
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == audience {
-				tokenVols[v.Name] = true
+			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == "" {
+				drop[v.Name] = true
+				return true
 			}
 		}
+		return false
+	})
+	if len(drop) == 0 {
+		return
 	}
-	for _, ec := range pod.Spec.EphemeralContainers {
-		if ec.TargetContainerName == sidecarName {
-			return fmt.Errorf("ephemeral container %q targets %q and would share its process namespace", ec.Name, sidecarName)
-		}
-		for _, m := range ec.VolumeMounts {
-			if tokenVols[m.Name] {
-				return fmt.Errorf("ephemeral container %q mounts the token volume %q", ec.Name, m.Name)
-			}
+	strip := func(cs []corev1.Container) {
+		for i := range cs {
+			cs[i].VolumeMounts = slices.DeleteFunc(cs[i].VolumeMounts, func(m corev1.VolumeMount) bool { return drop[m.Name] })
 		}
 	}
-	return nil
+	strip(pod.Spec.InitContainers)
+	strip(pod.Spec.Containers)
 }
 
 func hasVolume(pod *corev1.Pod, name string) bool {

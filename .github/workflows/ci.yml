@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Format, vet, and unit tests
+        run: make vet test
+      - name: Race detector
+        run: go test -race ./internal/...
+      - name: Known vulnerabilities (Go code and dependencies)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - name: Release manifest renders
+        run: make install-manifest VERSION=v0.0.0-ci && rm install.yaml
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install kind and kubectl
+        run: |
+          go install sigs.k8s.io/kind@v0.33.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSLo "$RUNNER_TEMP/bin/kubectl" https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl
+          chmod +x "$RUNNER_TEMP/bin/kubectl"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Create three-node cluster
+        run: kind create cluster --name wsnap --config test/e2e/kind-multinode.yaml
+      - name: Check every end-to-end scenario
+        run: |
+          git clone --branch v1.0.10 --depth 1 https://github.com/kubernetes-sigs/agent-sandbox.git "$RUNNER_TEMP/agent-sandbox"
+          AGENT_SANDBOX_DIR="$RUNNER_TEMP/agent-sandbox" test/e2e/run.sh

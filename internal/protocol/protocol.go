@@ -151,14 +151,25 @@ type CredentialsResponse struct {
 
 	// Interval is how often the sidecar takes a periodic snapshot.
 	Interval Duration `json:"interval"`
-	// KeepLast is the retention for maintenance.
-	KeepLast int `json:"keepLast"`
+	// KeepLast and KeepDaily are the retention for maintenance.
+	KeepLast  int `json:"keepLast"`
+	KeepDaily int `json:"keepDaily,omitempty"`
 
 	// For the restore role: SnapshotID pins the snapshot to restore (empty
 	// means latest). SourceWorkspace is set for a fork; Backend,
 	// Credentials and RepositoryPassword then describe the source.
 	SnapshotID      string `json:"snapshotID,omitempty"`
 	SourceWorkspace string `json:"sourceWorkspace,omitempty"`
+	// LatestSnapshotID is the newest snapshot the broker recorded, sent
+	// when SnapshotID is empty. The agent restores it instead of the
+	// engine's newest, which a deposed writer may have written after it
+	// lost the writer role. Empty: the broker has no record; use the
+	// engine's newest.
+	LatestSnapshotID string `json:"latestSnapshotID,omitempty"`
+	// KeepIDs, for the maintenance role, are snapshots that retention
+	// must keep whatever their age: the recorded newest snapshot and every
+	// snapshot a fork or a rollback pins.
+	KeepIDs []string `json:"keepIDs,omitempty"`
 	// RestoreFromGeneration is echoed in the restore report when the
 	// restore used Workspace.spec.restoreFrom, so it is applied only once.
 	RestoreFromGeneration int64 `json:"restoreFromGeneration,omitempty"`
@@ -194,6 +205,10 @@ type Report struct {
 	// a rescue Job. The controller releases protected volumes only after a
 	// final snapshot.
 	Final bool `json:"final,omitempty"`
+	// NoData, from a mover, means the volume holds no workspace data (empty,
+	// or its first restore was cut off), so there is nothing to save. The
+	// broker marks the volume final without recording a snapshot.
+	NoData bool `json:"noData,omitempty"`
 	// Reused means the agent found no change since snapshot SnapshotID and
 	// is confirming it instead of taking a new one. The broker records it
 	// but does not count it toward maintenance.

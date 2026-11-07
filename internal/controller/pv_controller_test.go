@@ -149,7 +149,9 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 		t.Error("mover pod automounts the API token")
 	}
 
-	// The Job completes: the rescue is done and its objects are removed.
+	// The broker records the mover's final snapshot, then the Job
+	// completes: the rescue is done and its objects are removed.
+	markFinal(t, c, "u2")
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	if err := c.Status().Update(context.Background(), &job); err != nil {
 		t.Fatal(err)
@@ -169,25 +171,30 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 	}
 }
 
-func TestRescueSkippedWhenNewerPodWritesElsewhere(t *testing.T) {
+// TestOlderEpochVolumeIsRescued: a newer writer exists, but the older
+// volume's unsaved data is still saved. The mover Job carries the volume's
+// epoch, so the broker keeps the snapshot without making it the newest
+// (reviewer #3 finding 2 replaced the history-based skip).
+func TestOlderEpochVolumeIsRescued(t *testing.T) {
 	newer := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "new-pod", UID: "u9"}}
 	ws := testWorkspace(func(ws *wsnapv1.Workspace) {
 		ws.Status.WriterPod = &wsnapv1.PodRef{Name: "new-pod", UID: "u9"}
+		ws.Status.WriterEpoch = 2
 		ws.Status.Volume = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: "new", VolumeName: "pv-2"}
+		ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "b1", Executor: "sidecar", Epoch: 2, Pod: &wsnapv1.PodRef{Name: "new-pod", UID: "u9"}}
 	})
-	r, c := newPVReconciler(t, newer, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
+	r, c := newPVReconciler(t, newer, ws, releasedPV(map[string]string{
+		workspace.AnnotationWriterPod: "u2", workspace.AnnotationWriterEpoch: "1"}))
 	reconcilePV(t, r)
-	pv := getPV(t, c)
-	if pv.Annotations[wsnapv1.AnnotationRescue] != RescueSkipped {
-		t.Fatalf("rescue = %q, want %q", pv.Annotations[wsnapv1.AnnotationRescue], RescueSkipped)
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {
+		t.Fatalf("rescue = %q, want running", a)
 	}
-	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
-		t.Error("skipped volume must stay Retain for manual recovery")
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job); err != nil {
+		t.Fatal(err)
 	}
-	var jobs batchv1.JobList
-	_ = c.List(context.Background(), &jobs)
-	if len(jobs.Items) != 0 {
-		t.Error("started a rescue that would roll back the newer pod's work")
+	if got := job.Annotations[workspace.AnnotationWriterEpoch]; got != "1" {
+		t.Fatalf("mover job epoch = %q, want the volume's epoch 1", got)
 	}
 }
 
@@ -229,6 +236,7 @@ func TestStaleCacheDoesNotUndoRescue(t *testing.T) {
 	}
 	var job batchv1.Job
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job)
+	markFinal(t, c, "u2")
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	_ = c.Status().Update(context.Background(), &job)
 	reconcilePV(t, r)
@@ -256,7 +264,7 @@ func TestMissingMoverJobIsRecreated(t *testing.T) {
 // TestLostAnnotationHeals: a PV bound to its rescue claim but with an empty
 // rescue phase (the stranded state of the old bug) still finishes.
 func TestLostAnnotationHeals(t *testing.T) {
-	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: ""})
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: "", workspace.AnnotationFinalPod: "mover"})
 	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName("pv-1"), UID: "c"}
 	pv.Status.Phase = corev1.VolumeBound
 	done := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: moverJobName("pv-1")},
@@ -361,17 +369,29 @@ func TestStaleWorkspaceCacheDoesNotReclaim(t *testing.T) {
 	}
 }
 
-// TestLateRescueDoesNotRollBackNewerHistory (reviewer #2 finding 2): the
-// newer writer already stopped; its snapshots are still newer than this
-// volume's data.
-func TestLateRescueDoesNotRollBackNewerHistory(t *testing.T) {
-	ws := testWorkspace(func(ws *wsnapv1.Workspace) {
-		ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "b-final", Executor: "sidecar", Final: true,
-			Pod: &wsnapv1.PodRef{Name: "pod-b", UID: "uB"}}
-	})
-	r, c := newPVReconciler(t, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "uA"}))
+// markFinal does what the broker does when it records a mover's snapshot.
+func markFinal(t *testing.T, c client.Client, uid string) {
+	t.Helper()
+	pv := getPV(t, c)
+	pv.Annotations[workspace.AnnotationFinalPod] = uid
+	if err := c.Update(context.Background(), pv); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCompleteJobWithoutRecordedSnapshotKeepsTheVolume (reviewer #4
+// finding 1): the mover's report was lost, so the Job completed but the
+// broker never recorded the snapshot. The volume must be kept.
+func TestCompleteJobWithoutRecordedSnapshotKeepsTheVolume(t *testing.T) {
+	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
 	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueSkipped {
-		t.Fatalf("rescue = %q; a late rescue would roll back pod B's newer work", a)
+	var job batchv1.Job
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job)
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	_ = c.Status().Update(context.Background(), &job)
+	reconcilePV(t, r)
+	pv := getPV(t, c)
+	if a := pv.Annotations[wsnapv1.AnnotationRescue]; a != RescueFailed || pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		t.Fatalf("rescue %q, policy %s; an unrecorded rescue must keep the volume", a, pv.Spec.PersistentVolumeReclaimPolicy)
 	}
 }

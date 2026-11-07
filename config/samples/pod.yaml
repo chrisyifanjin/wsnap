@@ -1,0 +1,24 @@
+# Put this Pod in the same namespace as the SnapshotRepository and its
+# Secret. The wsnap webhook injects the sidecar before the Pod starts.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-agent
+  labels:
+    wsnap.dev/workspace: user-42-project-x
+    wsnap.dev/repository: default
+spec:
+  automountServiceAccountToken: false
+  containers:
+  - name: agent
+    image: alpine:3.22
+    command: [sleep, infinity]
+    volumeMounts:
+    - {name: workspace, mountPath: /workspace}
+  volumes:
+  - name: workspace
+    ephemeral:
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources: {requests: {storage: 10Gi}}

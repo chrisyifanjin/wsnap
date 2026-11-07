@@ -53,8 +53,31 @@ func (v *volume) checkStateDir() error {
 	if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("refusing to use %s: it is not a plain directory (mode %s); the workload may have replaced it", engine.StateDirName, info.Mode())
 	}
-	if uid, ok := ownerUID(info); ok && uid != os.Geteuid() {
+	uid, ok := ownerUID(info)
+	if !ok || uid == os.Geteuid() {
+		return nil
+	}
+	if os.Geteuid() != 0 {
 		return fmt.Errorf("refusing to use %s: owned by uid %d, not by the agent (uid %d); the workload may have replaced it", engine.StateDirName, uid, os.Geteuid())
+	}
+	// A root agent takes the directory over instead of failing: an agent
+	// that ran under another uid (an older version, or a Pod-level
+	// runAsUser) created it, and a refusal would block every later sidecar
+	// and mover on this volume. Lchown never follows a symlink, and the
+	// check below runs again on the result. After this, a non-root
+	// workload can no longer rename entries inside it.
+	if err := v.root.Lchown(engine.StateDirName, 0, 0); err != nil {
+		return fmt.Errorf("take over %s: %w", engine.StateDirName, err)
+	}
+	if err := v.root.Chmod(engine.StateDirName, 0o755); err != nil {
+		return fmt.Errorf("take over %s: %w", engine.StateDirName, err)
+	}
+	info, err = v.root.Lstat(engine.StateDirName)
+	if err != nil {
+		return err
+	}
+	if uid, ok := ownerUID(info); info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() || (ok && uid != 0) {
+		return fmt.Errorf("refusing to use %s: it changed while the agent took it over", engine.StateDirName)
 	}
 	return nil
 }

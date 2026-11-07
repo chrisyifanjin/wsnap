@@ -5,6 +5,10 @@
 API group `wsnap.dev`, version `v1alpha1`. The group name is a placeholder
 and can change before `v1beta1`.
 
+All four custom resources are namespaced. Put a `SnapshotRepository`, its
+Secret, and the Pods and request objects that use it in the same namespace.
+The controller creates a `Workspace` when the first labeled Pod starts.
+
 ### SnapshotRepository
 
 Where and how workspaces are stored.
@@ -24,6 +28,7 @@ Where and how workspaces are stored.
 | `spec.credentials.ttl` | duration | Credential lifetime. Default `1h`. |
 | `spec.schedule.interval` | duration | Snapshot interval. Default `15m`, minimum `10s`. |
 | `spec.retention.keepLast` | int | Snapshots kept by maintenance. Default `10`. |
+| `spec.retention.keepDaily` | int | Also keep the newest snapshot of each of the last N days. Default `7`. |
 | `spec.retention.maintenanceEvery` | int | New snapshots between maintenance runs. Default `20`; `0` turns it off. |
 | `spec.jobs.image` | string | Image for Jobs. Default: the controller's `--agent-image`. |
 | `spec.jobs.volumes`, `spec.jobs.volumeMounts` | lists | Extra volumes for Jobs, for example an NFS backend. |
@@ -46,8 +51,10 @@ first Pod. You can create it first, to set `restoreFrom`.
 | `spec.restoreFrom.snapshotID` | Restore this snapshot instead of the newest. |
 | `status.volume` | `kind` (`persistentVolumeClaim`, `ephemeral`, `emptyDir`), `claimName`, `volumeName` of the writer's volume. |
 | `status.writerPod` | The Pod that writes the workspace. |
-| `status.lastSnapshot` | `id`, `time`, `executor` (`sidecar`, `mover`, `restorer`), `pod`, `volumeName`, `final`. |
+| `status.writerEpoch` | Increases each time another Pod becomes the writer. |
+| `status.lastSnapshot` | `id`, `time`, `executor` (`sidecar`, `mover`), `pod`, `volumeName`, `final`, `epoch`. Restores use `id`. A snapshot of an older `epoch` never replaces it. |
 | `status.lastRestore` | `snapshotID`, `sourceWorkspace`, `time`, `pod`. |
+| `status.supersededSnapshots` | Rescue snapshots of older writer epochs (newest 10). Maintenance keeps them; restore one by ID with a `WorkspaceRestore`. |
 | `status.lastError` | The last failure. |
 | `status.snapshotsSinceMaintenance`, `status.lastMaintenance` | Maintenance bookkeeping. |
 | `status.restoreFromGeneration` | The generation whose `restoreFrom` was used (or skipped because the volume already had data). |
@@ -67,7 +74,10 @@ the same workspace).
 | `snapshotID` | The snapshot taken, or the snapshot restored. |
 | `message` | The reason for a failure or a wait. |
 
-A request fails after 10 minutes without an executor.
+A request fails after 10 minutes without an executor. A request that a
+sidecar claimed fails after 2 hours without a report, or is routed again
+when the claimant Pod is gone. A restore request succeeds only after the
+restored state is in a new snapshot.
 
 ### Labels and annotations
 
@@ -79,7 +89,7 @@ A request fails after 10 minutes without an executor.
 | `wsnap.dev/sidecar` | Pod | Sidecar container name. Default `wsnap`. |
 | `wsnap.dev/inject` | Pod | `"false"`: the Pod brings its own sidecar. |
 | `wsnap.dev/quiesce-timeout`, `wsnap.dev/final-timeout`, `wsnap.dev/workload-grace` | Pod | Sidecar timing and the grace period. |
-| `wsnap.dev/protected`, `wsnap.dev/workspace-ref`, `wsnap.dev/original-reclaim-policy`, `wsnap.dev/writer-pod-uid`, `wsnap.dev/final-pod-uid`, `wsnap.dev/rescue` | PV | wsnap's bookkeeping. Do not edit, except to retry a failed rescue (remove `wsnap.dev/rescue`). |
+| `wsnap.dev/protected`, `wsnap.dev/workspace-ref`, `wsnap.dev/original-reclaim-policy`, `wsnap.dev/writer-pod-uid`, `wsnap.dev/writer-epoch`, `wsnap.dev/final-pod-uid`, `wsnap.dev/rescue` | PV | wsnap's bookkeeping. Do not edit, except to retry a failed rescue (remove `wsnap.dev/rescue`). |
 | `wsnap.dev/requested-by` | request | The user that created it through the gateway API. |
 
 ## Broker HTTP API
@@ -93,9 +103,13 @@ Agents authenticate with a projected service account token (audience
 
 | Method and path | Body | Answer |
 |---|---|---|
-| `POST /v1/credentials` | `{"role": "restore"\|"snapshot"\|"mover"\|"maintenance", "request": "<WorkspaceRestore>"}` | Engine, backend, scoped credential, repository password, interval, retention. |
+| `POST /v1/credentials` | `{"role": "restore"\|"snapshot"\|"mover"\|"maintenance", "request": "<WorkspaceRestore>"}` | Engine, backend, scoped credential, repository password, interval, retention. For `restore`: `snapshotID` (pinned) or `latestSnapshotID` (recorded newest). For `maintenance`: `keepIDs`. |
 | `POST /v1/report` | operation, role, snapshot ID, final, reused, request, error | `204`. |
-| `POST /v1/wait` | `{}` | Long poll (up to 50 s): `{"requests": [...], "restores": [...]}` for the caller's workspace. |
+| `POST /v1/wait` | `{}` | Long poll (up to 50 s): `{"requests": [...], "restores": [...]}` for the caller's workspace: new claims, and the caller's own unfinished claims again. |
+
+Errors: 4xx means "refused; do not retry" (409: wait for another writer,
+a rescue, or a Job). 503 means "try again": the API server, STS, or an
+identity provider did not answer.
 
 ### Gateway endpoints
 
@@ -125,7 +139,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -d '{"wait":true}' \
 The agent runs `<command> <verb>`, with the verb `init`, `snapshot`,
 `latest`, `restore` or `maintain`. The environment holds `WSNAP_WORKSPACE`,
 `WSNAP_DIR`, `WSNAP_SNAPSHOT_ID`, `WSNAP_KEEP_LAST`, `WSNAP_READ_ONLY`,
-`WSNAP_STATE_DIR`, `WSNAP_PASSWORD`, `WSNAP_BACKEND` (JSON),
+`WSNAP_STATE_DIR`, `WSNAP_PASSWORD`, `WSNAP_KEEP_IDS` (one snapshot ID
+per line; `maintain` must keep them), `WSNAP_KEEP_DAILY` (`maintain` also
+keeps the newest snapshot of each of the last N days), `WSNAP_BACKEND` (JSON),
 `WSNAP_CREDENTIALS` (JSON), `WSNAP_EXCLUDE`, and the `AWS_*`,
 `GOOGLE_ACCESS_TOKEN` or `AZURE_*` variables of the backend.
 

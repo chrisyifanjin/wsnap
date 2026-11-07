@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"sync"
 	"time"
 
@@ -83,6 +84,9 @@ func (c *CachingAuthenticator) Authenticate(ctx context.Context, token string) (
 	}
 	c.mu.Unlock()
 	id, err := c.Next.Authenticate(ctx, token)
+	if errors.Is(err, ErrAuthUnavailable) {
+		return id, err // an outage, not a verdict on the token
+	}
 	if err != nil {
 		c.mu.Lock()
 		if c.cache == nil {

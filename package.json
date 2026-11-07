@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "check:mermaid": "mermaid-lint --no-semantic README.md 'docs/**/*.md'"
+  },
+  "devDependencies": {
+    "@mermaid-lint/cli": "0.53.1"
+  }
+}

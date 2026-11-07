@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"github.com/chrisyifanjin/wsnap/internal/version"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,10 +23,14 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|mover|restorer|maintain|ready [flags]")
+		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|mover|restorer|maintain|ready|version [flags]")
 		os.Exit(2)
 	}
 	mode := os.Args[1]
+	if mode == "version" {
+		fmt.Println(version.Version)
+		return
+	}
 	fs := flag.NewFlagSet(mode, flag.ExitOnError)
 	cfg := agent.Config{}
 	fs.StringVar(&cfg.BrokerURL, "broker-url", envOr("WSNAP_BROKER_URL", "http://wsnap-broker.wsnap-system.svc:8080"), "broker URL")
@@ -37,7 +42,8 @@ func main() {
 	caFile := fs.String("ca-file", os.Getenv("WSNAP_CA_FILE"), "CA bundle that signs the broker's TLS certificate")
 	fs.DurationVar(&cfg.QuiesceTimeout, "quiesce-timeout", 0, "ask the workload to quiesce before each snapshot and wait this long for its ack (0 disables)")
 	fs.StringVar(&cfg.Request, "request", "", "WorkspaceSnapshot or WorkspaceRestore served by this Job")
-	fs.DurationVar(&cfg.OperationTimeout, "operation-timeout", time.Hour, "time limit for one snapshot or restore")
+	fs.DurationVar(&cfg.FileRequestSpacing, "file-request-spacing", 30*time.Second, "shortest time between snapshots triggered by request files")
+	fs.DurationVar(&cfg.OperationTimeout, "operation-timeout", 30*time.Minute, "time limit for one snapshot or restore; keep it at least 5m below the repository's credentials.ttl")
 	_ = fs.Parse(os.Args[2:])
 	// A credential request includes the broker's STS round trip.
 	cfg.HTTP = &http.Client{Timeout: 60 * time.Second}
