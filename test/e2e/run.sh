@@ -416,6 +416,11 @@ scenario_singlewriter() {
 	((SECONDS - stopped <= 20)) || die "second Pod took $((SECONDS - stopped))s to start after the first stopped"
 	[[ $(read_file one-2 /workspace/owner.txt) == first-writer ]] || die "second Pod did not restore the first Pod's final snapshot"
 	pass "after the first Pod stopped, the second restored its final snapshot within $((SECONDS - stopped))s"
+	local epoch pv_epoch
+	epoch=$(kubectl -n "$NS" get workspace ws-one -o jsonpath='{.status.writerEpoch}')
+	pv_epoch=$(kubectl get pv "$(kubectl -n "$NS" get pvc one-b -o jsonpath='{.spec.volumeName}')" -o jsonpath='{.metadata.annotations.wsnap\.dev/writer-epoch}')
+	[[ $epoch == 2 && $pv_epoch == 2 ]] || die "writer epoch $epoch, one-b PV epoch $pv_epoch; want 2 and 2"
+	pass "writer epochs: the second writer runs in epoch 2, stamped on its PV"
 	kubectl -n "$NS" delete pod one-2 --wait=true >/dev/null
 	kubectl -n "$NS" delete pvc one-a one-b >/dev/null
 }
@@ -448,7 +453,12 @@ scenario_requests() {
 	[[ $(read_file req-1 /workspace/state.txt) == v1 ]] || die "rollback did not restore v1"
 	kubectl -n "$NS" exec req-1 -c agent -- test ! -e /workspace/added-later.txt || die "rollback kept a file created after the snapshot"
 	wait_for 30 "post-rollback snapshot" ws_changed ws-req .status.lastSnapshot.id "$v2"
-	pass "WorkspaceRestore on a live Pod: rolled back to $v1 in place, then re-snapshotted"
+	# The live v3 is saved before the swap: "snapshot taken" comes before
+	# "restored in place" in the sidecar log.
+	kubectl -n "$NS" logs req-1 -c wsnap | grep -E '"msg":"(snapshot taken|restored in place)"' | tail -3 |
+		grep -o '"msg":"[a-z ]*"' | tr '\n' ' ' | grep -q '"msg":"snapshot taken" "msg":"restored in place" "msg":"snapshot taken"' ||
+		die "the rollback did not snapshot the live data first"
+	pass "WorkspaceRestore on a live Pod: saved the live data, rolled back to $v1 in place, then re-snapshotted"
 
 	kubectl -n "$NS" delete pod req-1 --wait=true >/dev/null
 	apply_request wssnap snap-idle ws-req >/dev/null
