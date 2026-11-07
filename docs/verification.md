@@ -276,6 +276,18 @@ Found by the fourth independent review, and fixed:
   completion markers, and a full Job registry drops entries of Jobs that
   are gone before those of running Jobs (`TestJobRegistryKeepsRunningJobs`).
 
+Found by follow-up Kopia probes, and fixed:
+
+- Kopia's built-in retention removed older snapshots after a burst of
+  saves, before wsnap could apply its own retention or protect a fork or
+  rollback target. Every Kopia snapshot is now pinned at creation; wsnap's
+  maintenance explicitly deletes those outside its retention set
+  (`TestKopiaKeepsSnapshotsUntilWsnapMaintenance`).
+- A crash after Kopia created a repository but before it set the ignore
+  policy left later snapshots capturing `.wsnap` state. A writer now
+  finishes policy and maintenance-owner setup when it reconnects to an
+  existing repository (`TestKopiaRepairsInterruptedInitialization`).
+
 ## Known limits
 
 - A root workload can race the staging directory during an in-place

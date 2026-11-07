@@ -155,7 +155,7 @@ func (k *Kopia) Init(ctx context.Context, t Target) error {
 	}
 	_, err = k.kopia(ctx, t, "", connect...)
 	if err == nil {
-		return nil
+		return k.ensurePolicy(ctx, t)
 	}
 	if !kopiaNotInitialized(err) {
 		return fmt.Errorf("kopia connect: %w", err)
@@ -166,6 +166,15 @@ func (k *Kopia) Init(ctx context.Context, t Target) error {
 	create := append(append([]string{"repository", "create"}, storage...), common...)
 	if _, err := k.kopia(ctx, t, "", create...); err != nil {
 		return fmt.Errorf("kopia create: %w", err)
+	}
+	return k.ensurePolicy(ctx, t)
+}
+
+// Repository creation and policy setup are separate writes. If the process
+// stops between them, the next writer must finish setup before it snapshots.
+func (k *Kopia) ensurePolicy(ctx context.Context, t Target) error {
+	if t.ReadOnly {
+		return nil
 	}
 	// Unreadable files are recorded in the snapshot manifest instead of
 	// failing it: a partial snapshot beats none for a final snapshot or a
@@ -208,7 +217,10 @@ type kopiaSnapshot struct {
 }
 
 func (k *Kopia) Snapshot(ctx context.Context, t Target, dir string) (Snapshot, error) {
-	out, err := k.kopia(ctx, t, dir, "snapshot", "create", dir, "--json")
+	// Kopia's built-in retention runs after snapshot creation. Pin every
+	// snapshot so wsnap's retention and cross-workspace references decide
+	// what can be deleted. Maintain explicitly deletes expired snapshots.
+	out, err := k.kopia(ctx, t, dir, "snapshot", "create", dir, "--json", "--pin=wsnap")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("kopia snapshot: %w", err)
 	}
