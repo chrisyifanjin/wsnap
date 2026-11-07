@@ -25,6 +25,18 @@ func TestKopiaKeepsSnapshotsUntilWsnapMaintenance(t *testing.T) {
 	if err := k.Init(ctx, tg); err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < 3; i++ {
+		if err := k.Init(ctx, tg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy, err := k.kopia(ctx, tg, "", "policy", "show", "--global", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(policy), `"/.wsnap"`); n != 1 {
+		t.Fatalf("expected one .wsnap ignore rule after repeated Init, got %d: %s", n, policy)
+	}
 	dir := t.TempDir()
 	var ids []string
 	for i := 0; i < 14; i++ {
