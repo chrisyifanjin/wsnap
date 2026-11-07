@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -66,9 +67,9 @@ type Engine interface {
 	Latest(ctx context.Context, t Target) (*Snapshot, error)
 	// Restore writes snapshot id into dir, which should be empty.
 	Restore(ctx context.Context, t Target, id, dir string) error
-	// Maintain keeps the newest keepLast snapshots, deletes the rest and
-	// frees unreferenced data.
-	Maintain(ctx context.Context, t Target, keepLast int) error
+	// Maintain keeps the newest keepLast snapshots and every snapshot in
+	// keep, deletes the rest and frees their storage.
+	Maintain(ctx context.Context, t Target, keepLast int, keep []string) error
 	// WriterDeletePrefixes lists repository sub-prefixes that a writer must
 	// be able to delete during a normal snapshot. Credential providers allow
 	// delete on these prefixes only.
@@ -170,4 +171,19 @@ func repoKey(b protocol.Backend) string {
 // writeSecretFile writes a credential file readable only by the agent.
 func writeSecretFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+// forgettable returns the IDs to delete from ids (oldest first): all but
+// the newest keepLast and the ones in keep. A keep entry may be a prefix
+// of an ID (a short ID).
+func forgettable(ids []string, keepLast int, keep []string) []string {
+	keepLast = max(keepLast, 1)
+	var out []string
+	for i, id := range ids {
+		if i >= len(ids)-keepLast || slices.ContainsFunc(keep, func(k string) bool { return k != "" && strings.HasPrefix(id, k) }) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }

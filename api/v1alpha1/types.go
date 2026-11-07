@@ -335,6 +335,11 @@ type SnapshotRecord struct {
 	// final is true for the last snapshot of a Pod's life.
 	// +optional
 	Final bool `json:"final,omitempty"`
+	// epoch is the writer epoch of the data in this snapshot: the
+	// workspace's writerEpoch for a sidecar, the volume's epoch for a Job.
+	// A snapshot of an older epoch never replaces lastSnapshot.
+	// +optional
+	Epoch int64 `json:"epoch,omitempty"`
 }
 
 // RestoreRecord describes the last restore.
@@ -358,6 +363,11 @@ type WorkspaceStatus struct {
 	// from this Pod (or from a mover).
 	// +optional
 	WriterPod *PodRef `json:"writerPod,omitempty"`
+	// writerEpoch increases each time another Pod becomes the writer. The
+	// broker stamps it on the writer's PV, so data on a volume can be
+	// ordered against the snapshot history.
+	// +optional
+	WriterEpoch int64 `json:"writerEpoch,omitempty"`
 	// +optional
 	LastSnapshot *SnapshotRecord `json:"lastSnapshot,omitempty"`
 	// +optional

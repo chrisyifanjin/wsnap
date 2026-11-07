@@ -169,25 +169,30 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 	}
 }
 
-func TestRescueSkippedWhenNewerPodWritesElsewhere(t *testing.T) {
+// TestOlderEpochVolumeIsRescued: a newer writer exists, but the older
+// volume's unsaved data is still saved. The mover Job carries the volume's
+// epoch, so the broker keeps the snapshot without making it the newest
+// (reviewer #3 finding 2 replaced the history-based skip).
+func TestOlderEpochVolumeIsRescued(t *testing.T) {
 	newer := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "new-pod", UID: "u9"}}
 	ws := testWorkspace(func(ws *wsnapv1.Workspace) {
 		ws.Status.WriterPod = &wsnapv1.PodRef{Name: "new-pod", UID: "u9"}
+		ws.Status.WriterEpoch = 2
 		ws.Status.Volume = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: "new", VolumeName: "pv-2"}
+		ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "b1", Executor: "sidecar", Epoch: 2, Pod: &wsnapv1.PodRef{Name: "new-pod", UID: "u9"}}
 	})
-	r, c := newPVReconciler(t, newer, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
+	r, c := newPVReconciler(t, newer, ws, releasedPV(map[string]string{
+		workspace.AnnotationWriterPod: "u2", workspace.AnnotationWriterEpoch: "1"}))
 	reconcilePV(t, r)
-	pv := getPV(t, c)
-	if pv.Annotations[wsnapv1.AnnotationRescue] != RescueSkipped {
-		t.Fatalf("rescue = %q, want %q", pv.Annotations[wsnapv1.AnnotationRescue], RescueSkipped)
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {
+		t.Fatalf("rescue = %q, want running", a)
 	}
-	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
-		t.Error("skipped volume must stay Retain for manual recovery")
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job); err != nil {
+		t.Fatal(err)
 	}
-	var jobs batchv1.JobList
-	_ = c.List(context.Background(), &jobs)
-	if len(jobs.Items) != 0 {
-		t.Error("started a rescue that would roll back the newer pod's work")
+	if got := job.Annotations[workspace.AnnotationWriterEpoch]; got != "1" {
+		t.Fatalf("mover job epoch = %q, want the volume's epoch 1", got)
 	}
 }
 
@@ -358,20 +363,5 @@ func TestStaleWorkspaceCacheDoesNotReclaim(t *testing.T) {
 	reconcilePV(t, r)
 	if p := getPV(t, c).Spec.PersistentVolumeReclaimPolicy; p != corev1.PersistentVolumeReclaimRetain {
 		t.Fatalf("PV reclaim policy %s after a stale cache read; the data would be deleted", p)
-	}
-}
-
-// TestLateRescueDoesNotRollBackNewerHistory (reviewer #2 finding 2): the
-// newer writer already stopped; its snapshots are still newer than this
-// volume's data.
-func TestLateRescueDoesNotRollBackNewerHistory(t *testing.T) {
-	ws := testWorkspace(func(ws *wsnapv1.Workspace) {
-		ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "b-final", Executor: "sidecar", Final: true,
-			Pod: &wsnapv1.PodRef{Name: "pod-b", UID: "uB"}}
-	})
-	r, c := newPVReconciler(t, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "uA"}))
-	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueSkipped {
-		t.Fatalf("rescue = %q; a late rescue would roll back pod B's newer work", a)
 	}
 }

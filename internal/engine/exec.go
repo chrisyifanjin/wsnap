@@ -20,6 +20,7 @@ import (
 //	WSNAP_DIR               directory to snapshot or restore into
 //	WSNAP_SNAPSHOT_ID       snapshot to restore (restore)
 //	WSNAP_KEEP_LAST         retention (maintain)
+//	WSNAP_KEEP_IDS          newline-separated snapshot IDs to keep (maintain)
 //	WSNAP_READ_ONLY         "true" for the restore role
 //	WSNAP_STATE_DIR         private writable directory
 //	WSNAP_PASSWORD          repository password
@@ -82,11 +83,12 @@ func (e *Exec) env(t Target, dir, id string, keepLast int) ([]string, error) {
 	return env, nil
 }
 
-func (e *Exec) call(ctx context.Context, t Target, verb, dir, id string, keepLast int) ([]byte, error) {
+func (e *Exec) call(ctx context.Context, t Target, verb, dir, id string, keepLast int, extra ...string) ([]byte, error) {
 	env, err := e.env(t, dir, id, keepLast)
 	if err != nil {
 		return nil, err
 	}
+	env = append(env, extra...)
 	args := append(append([]string{}, e.Command[1:]...), verb)
 	return run(ctx, dir, env, e.Command[0], args...)
 }
@@ -147,7 +149,7 @@ func (e *Exec) Restore(ctx context.Context, t Target, id, dir string) error {
 	return err
 }
 
-func (e *Exec) Maintain(ctx context.Context, t Target, keepLast int) error {
-	_, err := e.call(ctx, t, "maintain", "", "", keepLast)
+func (e *Exec) Maintain(ctx context.Context, t Target, keepLast int, keep []string) error {
+	_, err := e.call(ctx, t, "maintain", "", "", keepLast, "WSNAP_KEEP_IDS="+strings.Join(keep, "\n"))
 	return err
 }

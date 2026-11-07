@@ -139,12 +139,14 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		Image:         cfg.AgentImage,
 		Args:          args,
 		RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
-		// The workload starts only after the volume is restored. 30 minutes
-		// covers a large cold restore.
+		// The workload starts only after the volume is restored. A failed
+		// probe restarts the sidecar, which starts the restore again from
+		// zero, so the limit (4 hours) must exceed any wait for a previous
+		// writer or a rescue (a mover Job has 2 hours) plus the restore.
 		StartupProbe: &corev1.Probe{
 			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/usr/local/bin/wsnap-agent", "ready", "--state-dir=/var/lib/wsnap"}}},
 			PeriodSeconds:    1,
-			FailureThreshold: 1800,
+			FailureThreshold: 4 * 3600,
 		},
 		VolumeMounts: mounts,
 		Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
@@ -163,6 +165,12 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 // every workspace file and restore owners and modes.
 func AgentSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
+		// Always root, whatever the Pod-level runAsUser: the agent must read
+		// and restore every file, and every agent on a volume (sidecar,
+		// mover, restorer) must be the same uid to trust .wsnap.
+		RunAsUser:                ptr.To[int64](0),
+		RunAsGroup:               ptr.To[int64](0),
+		RunAsNonRoot:             ptr.To(false),
 		ReadOnlyRootFilesystem:   ptr.To(true),
 		AllowPrivilegeEscalation: ptr.To(false),
 		Capabilities: &corev1.Capabilities{

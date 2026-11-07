@@ -159,6 +159,16 @@ type CredentialsResponse struct {
 	// Credentials and RepositoryPassword then describe the source.
 	SnapshotID      string `json:"snapshotID,omitempty"`
 	SourceWorkspace string `json:"sourceWorkspace,omitempty"`
+	// LatestSnapshotID is the newest snapshot the broker recorded, sent
+	// when SnapshotID is empty. The agent restores it instead of the
+	// engine's newest, which a deposed writer may have written after it
+	// lost the writer role. Empty: the broker has no record; use the
+	// engine's newest.
+	LatestSnapshotID string `json:"latestSnapshotID,omitempty"`
+	// KeepIDs, for the maintenance role, are snapshots that retention
+	// must keep whatever their age: the recorded newest snapshot and every
+	// snapshot a fork or a rollback pins.
+	KeepIDs []string `json:"keepIDs,omitempty"`
 	// RestoreFromGeneration is echoed in the restore report when the
 	// restore used Workspace.spec.restoreFrom, so it is applied only once.
 	RestoreFromGeneration int64 `json:"restoreFromGeneration,omitempty"`

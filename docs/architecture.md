@@ -118,19 +118,22 @@ sequenceDiagram
   else empty volume
     S->>B: credentials(role=restore)
     B->>B: TokenReview, Pod checks, single-writer check
-    B-->>S: read-only credential for this workspace
-    S->>O: restore newest snapshot into .wsnap/staging
+    B-->>S: read-only credential and the recorded newest snapshot ID
+    S->>O: restore that snapshot into .wsnap/staging
     S->>S: rename staged entries into place
     S->>S: write .wsnap/initialized
   end
-  S->>B: credentials(role=snapshot); claim writer
+  S->>B: credentials(role=snapshot); claim writer, new writer epoch
   S->>S: write private startup-ready marker
   K->>S: startupProbe: wsnap-agent ready
   K->>A: start (only after the probe passes)
 ```
 
 The agent container cannot start before the restore ends and the broker
-accepts this Pod as the workspace writer. The startup probe checks a marker
+accepts this Pod as the workspace writer. The sidecar restores the snapshot
+that the broker recorded as newest (`status.lastSnapshot`), not the
+engine's newest snapshot. A deposed writer can still upload, but the
+broker never records its snapshots, so they are never restored. The startup probe checks a marker
 on the sidecar's private volume, not the reusable workspace volume. A restore
 that stops halfway leaves the `.wsnap/restoring` marker. The next attempt
 deletes the partial data and restores again.
@@ -164,20 +167,35 @@ stateDiagram-v2
   Bound --> Released: PVC deleted
   Released --> Reclaimed: last writer took a final snapshot
   Released --> Running: no final snapshot
-  Running --> Done: mover Job saved the data
-  Running --> Failed: mover Job failed or timed out (2 h)
+  Running --> Done: mover Job saved the data, or found none
+  Running --> Failed: mover Job failed, timed out (2 h), or could not check the volume
   Done --> Reclaimed
-  Released --> Skipped: a newer Pod already writes this workspace elsewhere
   Reclaimed --> [*]: original reclaim policy restored
   Failed --> [*]: kept for an operator
-  Skipped --> [*]: kept for an operator
 ```
 
 During a rescue, wsnap binds the released PV to a new "rescue" PVC and runs
-a mover Job on it. The mover saves nothing if the volume was never
-initialized, or if a restore stopped halfway. Such a volume holds no
-workspace data, and saving it would replace the newest snapshot with an
-empty tree.
+a mover Job on it. The mover saves nothing if the volume is empty, or if
+its first restore stopped halfway (`restoring` without `initialized`).
+Such a volume holds no workspace data. Any other doubt fails the Job, so
+the PV is kept: a mover never lets wsnap delete data it did not save.
+
+### Writer epochs
+
+Two volumes of one workspace can be released in any order: a Pod on a lost
+node, then its replacement that crashed before its first snapshot. wsnap
+orders their data with **writer epochs**:
+
+1. Each time another Pod becomes the writer, the broker increases
+   `status.writerEpoch` (in the same compare-and-set) and stamps the epoch
+   on the writer's PV (`wsnap.dev/writer-epoch`).
+2. A sidecar's snapshot record carries the current epoch. A mover's record
+   carries its volume's epoch, copied to the Job when it is created.
+3. A record of an older epoch never replaces `status.lastSnapshot`.
+
+So every released volume is rescued, and the data of the newest writer
+always ends up as `lastSnapshot`, which restores use. An older volume's
+data stays in the repository, reachable by its snapshot ID.
 
 ### 5. A client asks for a snapshot or a restore
 
@@ -209,11 +227,19 @@ Each sidecar keeps one long-poll connection to the broker. An informer
 event wakes only the waiters of that workspace. No component polls the API
 server, and no component uses `kubectl exec`.
 
-An in-place restore uses two phases recorded in `.wsnap/swap`. Phase 1 moves
-the live entries to `.wsnap/trash`. Phase 2 moves the staged entries into
-place. A sidecar that crashes at any point finishes the swap when it starts
-again. After a restore, the sidecar takes a new snapshot. Then the newest
-snapshot always matches the volume.
+Each sidecar keeps one long-poll connection. If the answer to a poll is
+lost, the next poll delivers the same claimed requests again; the sidecar
+ignores the names it is serving or just served. A claim stays while the
+claimant Pod exists, so a terminating sidecar can finish it.
+
+An in-place restore first snapshots the live data, so a rollback never
+destroys unsaved work. Then it uses two phases recorded in `.wsnap/swap`.
+Phase 1 moves the live entries to `.wsnap/trash`. Phase 2 moves the staged
+entries into place. A sidecar (or mover) that crashes at any point
+finishes the swap when it starts again. After the swap, the sidecar takes
+a new snapshot, and only then reports the request. Then the newest
+snapshot always matches the volume, and `Succeeded` means the restored
+state is durable.
 
 ### 6. Fork and rollback
 
@@ -244,7 +270,13 @@ See [security.md](security.md) for how each provider limits a credential.
 - **One writer.** Only one live Pod writes a workspace. The broker sets the
   writer with a compare-and-set on the Workspace status.
 - **One Job per volume.** A writer waits while a mover or restorer works on
-  its volume. A second request waits for the first Job.
+  its volume. A second request waits for the first Job. The leader
+  serializes "check, then create a Job" per volume.
+- **History moves forward.** `status.lastSnapshot` only takes snapshots of
+  the same or a newer writer epoch.
+- **Pinned snapshots stay.** Maintenance keeps the recorded newest
+  snapshot and every snapshot that a fork, a rollback, or an unfinished
+  restore names.
 - **Restore after rescue.** A restore waits while a released volume of the
   workspace waits for its rescue snapshot.
 - **Truthful history.** After any restore, the newest snapshot matches the

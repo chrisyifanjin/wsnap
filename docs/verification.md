@@ -15,7 +15,7 @@ tests found.
 | Engine, Azure | see below (Azurite over TLS) | Kopia with an account key and with `azure-sas`; restic with an account key. Production-style URLs. |
 | Credentials | `go test ./internal/credentials` | Session policies, Credential Access Boundaries, Azure SAS against Azurite. |
 | Race detector | `go test -race ./internal/...` | No data races in the agent, broker, controller and providers. |
-| Mutation checks | by hand, one guard at a time | Each test fails when the guard it covers is removed. |
+| Mutation checks | a script that removes one guard at a time | Each test fails when the guard it covers is removed. |
 | End to end | `test/e2e/run.sh` | The whole system on kind, with agent-sandbox, MinIO, and failures injected. |
 
 ## How to run the store tests
@@ -119,9 +119,10 @@ Found by the second independent review, and fixed:
   the sidecar's private volume, written only after writer credentials are
   granted (`TestWarmVolumeWaitsForWriterClaimBeforeStartup`).
 - A late rescue could roll back a newer writer that had already stopped.
-  The controller now decides by snapshot history, not by running Pods.
+  The controller then decided by snapshot history. (The third review
+  replaced this with writer epochs.)
 - The mover trusted a marker file the workload can delete. It now skips
-  only an empty volume or an interrupted restore.
+  only an empty volume or an interrupted first restore.
 - A namespace user could forge a wsnap Job and get the delete credential.
   The broker now serves only Jobs that the controller recorded in the
   Workspace status, and marks only PVs of the caller's workspace as saved.
@@ -146,6 +147,81 @@ Found by the second independent review, and fixed:
 - Rejected tokens caused a TokenReview each time. They are remembered for
   10 seconds.
 
+Found by the third independent review, and fixed. Five of these were
+first shown by the reviewer's own probe tests.
+
+- **The mover failed open.** Any error while it checked the volume, for
+  example `.wsnap` owned by another uid because the workload Pod set
+  `runAsUser`, meant "nothing to save", and the controller then reclaimed
+  the PV. Now an error fails the Job, and the PV stays `RescueFailed`
+  (`TestMoverFailsClosed`, `TestNotWorkspaceDataReportsErrorsAsErrors`).
+  Every agent runs as uid 0, whatever the Pod says, and a root agent takes
+  over a `.wsnap` that another uid created
+  (`TestRootAgentTakesOverForeignStateDir`, run as root in the agent image).
+- **A stale `restoring` marker** (a crash between two marker writes) made
+  every later rescue skip the volume. The mover now skips only when
+  `restoring` exists without `initialized`, and a warm start removes the
+  stale marker (`TestMoverSavesAfterCrashBetweenMarkers`). A volume left
+  mid-swap is finished and saved, not skipped.
+- **The history-based rescue skip lost work.** If the newest writer
+  crashed before its first snapshot, its volume was skipped, and the next
+  Pod restored the previous writer's data. Now each new writer starts a
+  **writer epoch**. The broker stamps it on the writer's PV and on each
+  snapshot record, and a snapshot of an older epoch never replaces
+  `lastSnapshot`. Every released volume is rescued, and restores use the
+  broker's `lastSnapshot`, not the engine's newest snapshot
+  (`TestWriterEpochs`, `TestOlderEpochNeverReplacesLatest`,
+  `TestOlderEpochVolumeIsRescued`). This also fences a deposed writer: its
+  late uploads are never restored.
+- **The forged-Job fix was bypassable.** A bare Pod with an
+  `ownerReference` to a registered Job got the Job's role, even after the
+  Job finished. A Job pre-created under wsnap's predictable name was
+  registered. Now a Job Pod must run the Job's template (every container
+  that can read the token, every template volume), and the Job must be
+  unfinished. A same-name Job that wsnap never registered is deleted and
+  created again (`TestJobPodMustRunTheJobTemplate`,
+  `TestUnregisteredJobWithOurNameIsReplaced`).
+- **Transient API errors became final 4xx answers.** A TokenReview outage
+  gave 401 and was cached; a failed Pod read gave 403; a failed Secret read
+  gave 424. The agent does not retry 4xx, so a final snapshot was lost.
+  Upstream failures now answer 503, and outages are never cached
+  (`TestTransientAPIErrorsAreRetryable`).
+- **A claimed request whose answer was lost stayed Running for 2 hours.**
+  The long poll now delivers the caller's own Running claims again; the
+  sidecar ignores names it is serving or just served
+  (`TestWaitAndCompleteRequests`).
+- **The controller failed a request that a terminating sidecar was still
+  completing.** A claim now stays while the claimant Pod exists
+  (`TestTerminatingClaimantKeepsItsClaim`).
+- **A rollback destroyed unsaved work, and Succeeded came too early.** An
+  in-place restore and a restorer Job now snapshot the live data first,
+  and report the request only after the restored state is in a snapshot
+  (`TestRollbackSavesLiveWorkFirst`).
+- **Maintenance could delete a pinned snapshot.** A fork's or rollback's
+  pinned snapshot, an unfinished `WorkspaceRestore`'s snapshot, and the
+  recorded newest snapshot are now kept by all three engines
+  (`TestMaintenanceKeepsPinnedSnapshots`; `TestRoundTrip` with real Kopia,
+  restic and the exec example).
+- **The credential cache never hit** with the defaults (1 h credentials,
+  1 h operation limit). The default operation limit is now 30 minutes
+  (`TestCredentialsAreReusedWithDefaults`).
+- **Kopia made the writer the maintenance owner** at `repository create`
+  (measured with Kopia 0.23.1). The agent now hands ownership to the
+  maintenance identity at once (`TestKopiaWriterDoesNotOwnMaintenance`).
+- **A long restore could never finish.** The startup probe gave up after
+  30 minutes and restarted the restore from zero. It now allows 4 hours.
+- **Two Jobs could start on one volume** (the reviewer's suspicion,
+  confirmed with a test): the snapshot and restore reconcilers run at the
+  same time, and both could pass "no other Job on this volume". Job
+  creation is now serialized per volume in the leader
+  (`TestSnapshotAndRestoreNeverStartTwoJobsOnOneVolume`: 2 Jobs without the
+  lock, 1 with it).
+
+Each fix was checked with a mutation: with the fix removed, its test
+fails. 22 mutations are killed. One mutation first survived, because
+another guard caught the same input earlier; a direct test of the guard
+now kills it.
+
 ## Known limits
 
 - A root workload can race the staging directory during an in-place
@@ -153,3 +229,9 @@ Found by the second independent review, and fixed:
 - Gateway requests are created by the controller's service account after a
   SubjectAccessReview of the caller, so admission policies that target the
   caller do not apply to them.
+- If a Workspace moves to another `SnapshotRepository`, its
+  `lastSnapshot` names a snapshot in the old repository. Clear
+  `status.lastSnapshot` when you move a workspace.
+- A restore must finish within `--operation-timeout` (default 30 minutes),
+  and the repository's `credentials.ttl` must be at least 5 minutes longer.
+  Raise both for very large workspaces.

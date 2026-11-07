@@ -61,9 +61,18 @@ sequenceDiagram
 | `mover` | Pods of wsnap mover and restorer Jobs | as `snapshot` |
 | `maintenance` | Pods of wsnap maintenance Jobs | read, write, delete |
 
-A Job's labels can be copied. So the controller records each Job it
-creates in the Workspace status, which namespace users cannot write, and the
-broker serves only Jobs recorded there.
+A Job's labels and a Pod's `ownerReference` can be copied. So the broker
+serves a Job Pod only when all of these are true:
+
+1. The Job is recorded in the Workspace status, which only wsnap writes.
+   The controller records only Jobs it created; a Job that already has
+   wsnap's name but is not recorded is deleted and created again.
+2. The Job has not finished.
+3. The Pod runs the Job's template: every container that can read the
+   wsnap token is a template container, unchanged (image, command,
+   arguments, environment, mounts, security context), and every template
+   volume is unchanged. Containers that an admission webhook adds (a
+   service mesh proxy) are allowed if they cannot read the token.
 
 Engine scratch objects:
 
@@ -97,6 +106,8 @@ prefix would also match a sibling workspace, for example `ns/ws2`.
 | Unlabeled Pod | The webhook never sees it (`objectSelector`). |
 | Broker not reachable when a Pod starts | The agent container does not start. |
 | Broker not reachable when a Pod stops | The final snapshot fails. The PV stays `Retain` and is rescued later. |
+| API server or STS briefly down | The broker answers 503, which agents retry. It never turns an outage into a 4xx, and never caches it. |
+| Mover cannot check a volume | The Job fails and the PV is kept (`wsnap.dev/rescue=failed`). |
 | Any credential request | Refused unless every check passes. |
 
 The webhook refuses a labeled Pod that:
@@ -119,10 +130,16 @@ every file. So the sidecar treats `.wsnap` as hostile:
 
 1. Every file operation on the volume goes through Go's `os.Root`. A
    symlink that points out of the volume fails.
-2. `.wsnap` must be a plain directory owned by the agent. The agent refuses
-   a symlink, a file, or a directory owned by another user.
-3. The injected sidecar has a read-only root filesystem. It keeps only
-   `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER` and `FSETID`.
+2. `.wsnap` must be a plain directory. The agent refuses a symlink or a
+   file. A directory owned by another uid is taken over (owner root, mode
+   `0755`, checked again after the change), so a non-root workload cannot
+   rename entries inside it.
+3. Every agent (sidecar and Jobs) runs as uid 0, whatever the Pod-level
+   `runAsUser` says, so all agents on a volume agree on who owns `.wsnap`.
+   The root filesystem is read-only, and the agent keeps only `CHOWN`,
+   `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER` and `FSETID`. Namespaces with
+   the Pod Security `restricted` level refuse such a container; use
+   `baseline` or an exemption for wsnap.
 
 **Known limit.** Kopia and restic resolve the staging path themselves. A
 workload that swaps the staging directory after the agent checked it, and

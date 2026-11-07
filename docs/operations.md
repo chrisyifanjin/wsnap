@@ -5,7 +5,10 @@ wsnap.
 
 ## Requirements
 
-- Kubernetes 1.29 or later (native sidecars). Tested on 1.37.
+- Kubernetes 1.30 or later: native sidecars, and the `sleep` preStop
+  action of the controller (on by default from 1.30). Tested on 1.37.
+- A Pod Security level of `baseline` or `privileged` in workspace
+  namespaces: the agent runs as root with a few capabilities.
 - A StorageClass for workspace volumes. For node-local disks, use a dynamic
   local provisioner (TopoLVM, OpenEBS LVM LocalPV, rancher local-path) with
   `volumeBindingMode: WaitForFirstConsumer`.
@@ -124,7 +127,7 @@ See `internal/engine/exec.go` for the contract.
 | `schedule.interval` | `15m` | Time between snapshots. Minimum `10s`. Idle workspaces skip the snapshot. |
 | `retention.keepLast` | `10` | Snapshots that maintenance keeps. |
 | `retention.maintenanceEvery` | `20` | Run maintenance after this many new snapshots. `0` turns it off. |
-| `credentials.ttl` | `1h` | Lifetime of issued credentials. AWS STS needs at least `15m`. |
+| `credentials.ttl` | `1h` | Lifetime of issued credentials. AWS STS needs at least `15m`. Keep it at least 5 minutes longer than the agent's `--operation-timeout` (default `30m`); raise both for very large workspaces. |
 
 ## Protect a workload
 
@@ -228,8 +231,9 @@ Alert on a rising `result="error"` rate, and on workspaces whose
 | Pod stays in `PodInitializing` | The sidecar waits until the broker admits the Pod as the writer. Read `kubectl logs <pod> -c wsnap`. A `409` means another Pod still writes the workspace, a rescue runs, or a Job works on the volume; it ends by itself. |
 | Pod refused at creation | The webhook explains why in the error message. |
 | `Ready=False` on a repository | Read the condition message. |
-| PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed or ran out of time (2 h). Fix the cause, then remove the annotation to retry. |
-| PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | A newer Pod already writes the workspace elsewhere. The PV holds older, unsaved data; recover it by hand or delete it. |
+| PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed, ran out of time (2 h), or could not check the volume. Read the mover Pod's log, fix the cause, then remove the annotation to retry. |
+| PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | Set only by versions before writer epochs. Remove the annotation; the PV is then rescued, and its data is kept without replacing newer history. |
+| The broker logs "snapshot of an older writer epoch kept, but not as the newest" | A rescue saved an older writer's volume after a newer writer's snapshot. The data is in the repository under the logged snapshot ID; restore it with a `WorkspaceRestore` if you need it. |
 | A writer on a lost node blocks a new Pod | The block ends 2 minutes after the old Pod's deletion deadline. |
 
 ## Uninstall

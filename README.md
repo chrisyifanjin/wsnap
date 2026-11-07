@@ -26,7 +26,7 @@ Pods, Deployments, StatefulSets, and [agent-sandbox](https://github.com/kubernet
 | Triggers | Schedule, Pod shutdown, `WorkspaceSnapshot`/`WorkspaceRestore` objects, an HTTP gateway API, a file the agent writes |
 | Restore | Newest snapshot, a pinned snapshot (rollback), or another workspace's snapshot (fork); at start or in a running Pod |
 
-wsnap needs no cloud-specific API. It needs Kubernetes 1.29 or later.
+wsnap needs no cloud-specific API. It needs Kubernetes 1.30 or later.
 
 ## How it works
 

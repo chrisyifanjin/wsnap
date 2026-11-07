@@ -3,6 +3,7 @@ package webhook
 import (
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -151,5 +152,27 @@ func TestEphemeralContainersCannotReachTheSidecar(t *testing.T) {
 	}
 	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: tokenVolume, MountPath: "/t"}), "wsnap", "wsnap"); err == nil {
 		t.Error("an ephemeral container may mount the wsnap token")
+	}
+}
+
+// TestSidecarIsRootWhateverThePodSays (reviewer #3 finding 1): with a
+// Pod-level runAsUser the sidecar would create .wsnap as that uid, and
+// root mover Jobs would then refuse the volume.
+func TestSidecarIsRootWhateverThePodSays(t *testing.T) {
+	p := labeledPod(func(p *corev1.Pod) {
+		p.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsUser: ptr.To[int64](1000), RunAsNonRoot: ptr.To(true)}
+	})
+	if err := Mutate(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	sc := p.Spec.InitContainers[0].SecurityContext
+	if sc == nil || ptr.Deref(sc.RunAsUser, -1) != 0 || ptr.Deref(sc.RunAsNonRoot, true) {
+		t.Fatalf("sidecar security context %+v; want runAsUser 0 overriding the Pod", sc)
+	}
+	// A failed startup probe restarts the restore from zero; it must
+	// outlast a mover Job (2 h) plus the restore.
+	pr := p.Spec.InitContainers[0].StartupProbe
+	if limit := time.Duration(pr.PeriodSeconds*pr.FailureThreshold) * time.Second; limit < 4*time.Hour {
+		t.Fatalf("startup probe gives up after %s", limit)
 	}
 }

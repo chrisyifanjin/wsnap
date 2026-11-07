@@ -202,6 +202,13 @@ spec:
               lastSnapshot:
                 description: SnapshotRecord describes one snapshot.
                 properties:
+                  epoch:
+                    description: |-
+                      epoch is the writer epoch of the data in this snapshot: the
+                      workspace's writerEpoch for a sidecar, the volume's epoch for a Job.
+                      A snapshot of an older epoch never replaces lastSnapshot.
+                    format: int64
+                    type: integer
                   executor:
                     description: executor is sidecar or mover.
                     type: string
@@ -257,6 +264,13 @@ spec:
                 required:
                 - kind
                 type: object
+              writerEpoch:
+                description: |-
+                  writerEpoch increases each time another Pod becomes the writer. The
+                  broker stamps it on the writer's PV, so data on a volume can be
+                  ordered against the snapshot history.
+                format: int64
+                type: integer
               writerPod:
                 description: |-
                   writerPod is the last Pod that received a writing credential. The

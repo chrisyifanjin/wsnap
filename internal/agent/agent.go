@@ -5,6 +5,7 @@ package agent
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -68,6 +69,9 @@ const (
 	// unexpiringReuse bounds reuse of credentials without an expiry (static
 	// provider), so repository changes reach running sidecars.
 	unexpiringReuse = 10 * time.Minute
+	// redeliveryQuiet is how long a finished request is not run again when
+	// the broker delivers it again.
+	redeliveryQuiet = time.Minute
 	// conflictPoll is the retry interval while the broker answers 409.
 	conflictPoll = 3 * time.Second
 )
@@ -184,8 +188,14 @@ func (c *Config) credentials(ctx context.Context, role protocol.Role) (*protocol
 		until := time.Now().Add(unexpiringReuse)
 		if exp := resp.Credentials.ExpiresAt; !exp.IsZero() {
 			// An operation started with this credential may run for
-			// OperationTimeout; it must not expire halfway.
+			// OperationTimeout; it must not expire halfway. With the
+			// defaults (1h credential, 30m operations) one credential
+			// serves 25 minutes of snapshots.
 			until = exp.Add(-max(credentialMargin, c.OperationTimeout+credentialMargin))
+			if time.Until(exp) < c.OperationTimeout {
+				c.Log.Warn("credentials expire before an operation's time limit; raise credentials.ttl or lower --operation-timeout",
+					"expiresIn", time.Until(exp).Round(time.Second), "operationTimeout", c.OperationTimeout)
+			}
 		}
 		c.mu.Lock()
 		if c.cache == nil {
@@ -367,11 +377,17 @@ func (c *Config) initialize(ctx context.Context) (state, error) {
 		return state{}, err
 	}
 	defer v.Close()
+	restoring := markerPath(c.Dir, "restoring")
 	if Ready(c.Dir) == nil {
 		c.Log.Info("volume already initialized; skipping restore")
+		// "initialized" is written before "restoring" is removed; a crash
+		// between the two leaves a stale "restoring" that would make every
+		// later rescue think a restore was cut off.
+		if err := v.Remove(restoring); err != nil && !os.IsNotExist(err) {
+			return state{}, err
+		}
 		return state{}, c.prepareTriggerDirs()
 	}
-	restoring := markerPath(c.Dir, "restoring")
 	if _, err := v.Lstat(restoring); err == nil {
 		c.Log.Warn("a previous restore was interrupted; clearing the partial data")
 		if err := clearWorkspace(v, c.Dir); err != nil {
@@ -462,6 +478,9 @@ func (c *Config) restore(ctx context.Context) (restoreResult, error) {
 		err = nil // a new workspace
 	case err == nil && creds.SnapshotID != "":
 		id = creds.SnapshotID
+		err = c.stageAndMove(ctx, eng, t, id)
+	case err == nil && creds.LatestSnapshotID != "":
+		id = creds.LatestSnapshotID
 		err = c.stageAndMove(ctx, eng, t, id)
 	case err == nil:
 		var latest *engine.Snapshot
@@ -613,6 +632,12 @@ func (c *Config) RunSidecar(ctx context.Context) error {
 		p       *running
 		queue   []trigger
 		tickDue bool
+		// The broker delivers a claimed request again on every poll until
+		// it is complete. inflight and recent keep one request from running
+		// twice: while it is queued or running, and for a short time after,
+		// while the broker's cache may still show it Running.
+		inflight = map[trigger]bool{}
+		recent   = map[trigger]time.Time{}
 	)
 	startNext := func() {
 		if p != nil {
@@ -637,11 +662,26 @@ func (c *Config) RunSidecar(ctx context.Context) error {
 			tickDue = true
 			startNext()
 		case t := <-triggers:
+			if t.object {
+				if inflight[t] || time.Since(recent[t]) < redeliveryQuiet {
+					continue
+				}
+				inflight[t] = true
+			}
 			queue = append(queue, t)
 			startNext()
 		case r := <-done:
 			p.cancel()
 			p = nil
+			if r.trigger.object {
+				delete(inflight, r.trigger)
+				for k, at := range recent {
+					if time.Since(at) >= redeliveryQuiet {
+						delete(recent, k)
+					}
+				}
+				recent[r.trigger] = time.Now()
+			}
 			if r.err != nil {
 				c.Log.Error("snapshot failed", "error", r.err, "request", r.trigger.name)
 			} else {
@@ -851,6 +891,8 @@ func (c *Config) initializeWithRetry(ctx context.Context) (state, error) {
 		if err == nil {
 			// A warm volume skips restore, but it must still claim the writer
 			// role before the startup probe may release workload containers.
+			// The cache is empty in a new process, so this always reaches
+			// the broker, which claims the writer role.
 			_, err = c.credentials(ctx, protocol.RoleSnapshot)
 		}
 		if err == nil {
@@ -879,14 +921,24 @@ func (c *Config) initializeWithRetry(ctx context.Context) (state, error) {
 
 // RunMover takes one final snapshot of a volume whose Pod is gone.
 //
-// A volume that was never initialized, or is in the middle of a restore,
-// holds no workspace data of its own: the workload only starts after
-// initialization. Snapshotting it would store an empty or partial tree as
-// the newest snapshot, and the next restore would bring that back. So the
-// mover saves nothing (the rescue still completes and the PV is
-// reclaimed), and a WorkspaceSnapshot request fails with the reason.
+// A volume whose first restore was cut off holds no workspace data of its
+// own: the workload only starts after initialization. Snapshotting it
+// would store a partial tree as the newest snapshot. So the mover saves
+// nothing (the rescue still completes and the PV is reclaimed), and a
+// WorkspaceSnapshot request fails with the reason. Any other doubt, such as
+// an error while checking, fails the Job: the controller then keeps the PV
+// (RescueFailed) instead of reclaiming data that was never saved.
 func (c *Config) RunMover(ctx context.Context) error {
-	if reason := c.notWorkspaceData(); reason != "" {
+	// An in-place restore cut off mid-swap: finish it, so the volume holds
+	// whole trees. The pre-restore data was snapshotted before the swap.
+	if err := c.recoverSwap(); err != nil {
+		return fmt.Errorf("finish an interrupted swap: %w", err)
+	}
+	reason, err := c.notWorkspaceData()
+	if err != nil {
+		return fmt.Errorf("check the volume: %w", err)
+	}
+	if reason != "" {
 		c.Log.Info("nothing to save", "reason", reason)
 		if c.Request != "" {
 			now := time.Now().UTC()
@@ -895,30 +947,48 @@ func (c *Config) RunMover(ctx context.Context) error {
 		}
 		return nil
 	}
-	_, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{final: true, request: c.Request}, state{})
+	_, _, err = c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{final: true, request: c.Request}, state{})
 	return err
 }
 
 // notWorkspaceData explains why the volume holds no workspace data, or
-// returns "".
-func (c *Config) notWorkspaceData() string {
+// returns "". It returns an error when it cannot tell.
+func (c *Config) notWorkspaceData() (string, error) {
 	v, err := openVolume(c.Dir)
 	if err != nil {
-		return err.Error()
+		return "", err
 	}
 	defer v.Close()
-	if _, err := v.Stat(markerPath(c.Dir, "restoring")); err == nil {
-		return "a restore was interrupted, so the volume holds a partial tree"
+	exists := func(name string) (bool, error) {
+		_, err := v.Lstat(markerPath(c.Dir, name))
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return err == nil, err
 	}
-	if _, err := v.Stat(markerPath(c.Dir, "swap")); err == nil {
-		return "an in-place restore was interrupted mid-swap"
+	restoring, err := exists("restoring")
+	if err != nil {
+		return "", err
+	}
+	initialized, err := exists("initialized")
+	if err != nil {
+		return "", err
+	}
+	// "restoring" with "initialized" is a crash between the two marker
+	// writes: the restore finished and the workload may have run.
+	if restoring && !initialized {
+		return "the first restore was interrupted, so the volume holds a partial tree", nil
 	}
 	// Not the "initialized" marker: the workload can delete .wsnap (for
 	// example with "git clean -fdx"), and its data would then be lost.
-	if empty, err := isEmpty(v, c.Dir); err == nil && empty {
-		return "the volume is empty"
+	empty, err := isEmpty(v, c.Dir)
+	if err != nil {
+		return "", err
 	}
-	return ""
+	if empty {
+		return "the volume is empty", nil
+	}
+	return "", nil
 }
 
 // RunMaintenance applies retention.
@@ -927,7 +997,7 @@ func (c *Config) RunMaintenance(ctx context.Context) error {
 	rep := protocol.Report{Role: protocol.RoleMaintenance, Operation: protocol.OpMaintenance, StartTime: start}
 	creds, eng, t, err := c.open(ctx, protocol.RoleMaintenance)
 	if err == nil {
-		err = eng.Maintain(ctx, t, creds.KeepLast)
+		err = eng.Maintain(ctx, t, creds.KeepLast, creds.KeepIDs)
 	}
 	rep.EndTime = time.Now().UTC()
 	if err != nil {
@@ -938,46 +1008,48 @@ func (c *Config) RunMaintenance(ctx context.Context) error {
 }
 
 // restoreInPlace replaces the live volume contents with a snapshot chosen
-// by WorkspaceRestore request, then snapshots the result so the
-// repository's latest snapshot matches the volume again. Without that, a
-// later restore onto a fresh volume would bring back the pre-restore state.
+// by WorkspaceRestore request. First it snapshots the live data, so a
+// rollback never destroys unsaved work. After the swap it snapshots the
+// result, so the newest snapshot matches the volume again; without that, a
+// later restore onto a fresh volume would bring back the pre-restore
+// state. The request is reported only after that, so Succeeded means the
+// restored state is durable.
 func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) (state, string, error) {
 	if c.QuiesceTimeout > 0 {
 		thaw := c.quiesce(ctx)
 		defer thaw()
 	}
-	id, source, err := c.restoreRequest(ctx, request)
-	if err != nil {
-		return cur, "", err
+	start := time.Now().UTC()
+	rep := protocol.Report{Role: protocol.RoleRestore, Operation: protocol.OpRestore, Request: request, StartTime: start}
+	finish := func(st state, id string, err error) (state, string, error) {
+		rep.EndTime, rep.SnapshotID = time.Now().UTC(), id
+		if err != nil {
+			rep.Error = err.Error()
+		}
+		c.report(context.WithoutCancel(ctx), rep)
+		return st, id, err
 	}
-	c.Log.Info("restored in place", "id", id, "from", source, "request", request)
+	cur, _, err := c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true}, cur)
+	if err != nil {
+		return finish(cur, "", fmt.Errorf("could not save the live data before the restore: %w", err))
+	}
+	creds, err := c.credentialsFor(ctx, protocol.CredentialsRequest{Role: protocol.RoleRestore, Request: request})
+	if err != nil {
+		return finish(cur, "", err)
+	}
+	rep.SourceWorkspace = creds.SourceWorkspace
+	id, err := c.restoreAndSwap(ctx, creds)
+	if err != nil {
+		return finish(cur, id, err)
+	}
+	c.Log.Info("restored in place", "id", id, "from", creds.SourceWorkspace, "request", request)
 	// The restored snapshot is from another repository (fork) or older than
 	// latest (rollback), so always upload: an invalid state forces it.
 	st, _, err := c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true}, state{})
 	if err != nil {
-		return state{}, id, fmt.Errorf("restored %s but could not snapshot the result: %w", id, err)
+		return finish(state{}, id, fmt.Errorf("restored %s but could not snapshot the result: %w", id, err))
 	}
-	return st, id, nil
-}
-
-// restoreRequest restores the snapshot a WorkspaceRestore names into the
-// volume with a crash-safe swap, and reports the outcome.
-func (c *Config) restoreRequest(ctx context.Context, request string) (string, string, error) {
-	start := time.Now().UTC()
-	rep := protocol.Report{Role: protocol.RoleRestore, Operation: protocol.OpRestore, Request: request, StartTime: start}
-	creds, err := c.credentialsFor(ctx, protocol.CredentialsRequest{Role: protocol.RoleRestore, Request: request})
-	var id string
-	if err == nil {
-		rep.SourceWorkspace = creds.SourceWorkspace
-		id, err = c.restoreAndSwap(ctx, creds)
-	}
-	rep.EndTime = time.Now().UTC()
-	rep.SnapshotID = id
-	if err != nil {
-		rep.Error = err.Error()
-	}
-	c.report(context.WithoutCancel(ctx), rep)
-	return id, rep.SourceWorkspace, err
+	return finish(st, id, nil)
 }
 
 func (c *Config) restoreAndSwap(ctx context.Context, creds *protocol.CredentialsResponse) (string, error) {
@@ -992,7 +1064,7 @@ func (c *Config) restoreAndSwap(ctx context.Context, creds *protocol.Credentials
 	if err := eng.Init(ctx, t); err != nil {
 		return "", err
 	}
-	id := creds.SnapshotID
+	id := cmp.Or(creds.SnapshotID, creds.LatestSnapshotID)
 	if id == "" {
 		latest, err := eng.Latest(ctx, t)
 		if err != nil {
@@ -1132,27 +1204,55 @@ func clearCollisions(v *volume, src, dst, trash string) error {
 	return nil
 }
 
-// RunRestorer restores an idle volume for a WorkspaceRestore, then
-// snapshots the result, from a Job.
+// RunRestorer restores an idle volume for a WorkspaceRestore from a Job.
+// Like restoreInPlace, it saves the volume's data first, and reports the
+// request only after the restored state is in a snapshot.
 func (c *Config) RunRestorer(ctx context.Context) error {
 	if err := c.recoverSwap(); err != nil {
 		return err
 	}
-	id, _, err := c.restoreRequest(ctx, c.Request)
-	if err != nil {
+	start := time.Now().UTC()
+	rep := protocol.Report{Role: protocol.RoleRestore, Operation: protocol.OpRestore, Request: c.Request, StartTime: start}
+	finish := func(id string, err error) error {
+		rep.EndTime, rep.SnapshotID = time.Now().UTC(), id
+		if err != nil {
+			rep.Error = err.Error()
+		}
+		c.report(context.WithoutCancel(ctx), rep)
 		return err
+	}
+	// The last Pod may have stopped without a final snapshot.
+	reason, err := c.notWorkspaceData()
+	if err != nil {
+		return finish("", fmt.Errorf("check the volume: %w", err))
+	}
+	if reason == "" {
+		if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{}, state{}); err != nil {
+			return finish("", fmt.Errorf("could not save the volume before the restore: %w", err))
+		}
+	}
+	creds, err := c.credentialsFor(ctx, protocol.CredentialsRequest{Role: protocol.RoleRestore, Request: c.Request})
+	if err != nil {
+		return finish("", err)
+	}
+	rep.SourceWorkspace = creds.SourceWorkspace
+	id, err := c.restoreAndSwap(ctx, creds)
+	if err != nil {
+		return finish(id, err)
 	}
 	// Keep the volume's identity: the next Pod must not restore over it.
 	v, err := openVolume(c.Dir)
 	if err != nil {
-		return err
+		return finish(id, err)
 	}
 	err = v.WriteFile(MarkerPath(c.Dir), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644)
 	v.Close()
 	if err != nil {
-		return err
+		return finish(id, err)
 	}
 	c.Log.Info("restored idle volume", "id", id, "request", c.Request)
-	_, _, err = c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{final: true}, state{})
-	return err
+	if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{final: true}, state{}); err != nil {
+		return finish(id, fmt.Errorf("restored %s but could not snapshot the result: %w", id, err))
+	}
+	return finish(id, nil)
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -404,8 +405,14 @@ func TestWaitAndCompleteRequests(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("writer got %v, want r1 and r2 only", got)
 	}
-	if again := wait("token-w1"); len(again) != 0 {
-		t.Errorf("requests handed out twice: %v", again)
+	// Claimed but maybe never delivered (a lost answer, a restarted
+	// sidecar): the claimant gets them again until they complete
+	// (reviewer #3 finding 5). The sidecar ignores names it serves.
+	if again := wait("token-w1"); !slices.Equal(again, got) {
+		t.Errorf("the claimant got %v again, want the same claims %v", again, got)
+	}
+	if got := wait("token-w2"); len(got) != 0 {
+		t.Errorf("a claimed request went to another pod: %v", got)
 	}
 	var r1 wsnapv1.WorkspaceSnapshot
 	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "r1"}, &r1)
@@ -807,4 +814,214 @@ func TestAdmissionConsumesRestoreFrom(t *testing.T) {
 	if got.Status.RestoreFromGeneration != 2 {
 		t.Fatalf("restoreFromGeneration = %d; the unused restoreFrom stays armed", got.Status.RestoreFromGeneration)
 	}
+}
+
+// TestWriterEpochs (reviewer #3 finding 2): each new writer starts a new
+// epoch, stamped on its PV; a sidecar's snapshot carries the epoch.
+func TestWriterEpochs(t *testing.T) {
+	claim := func(pod, pv string) client.Object {
+		return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-" + pod}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: pv}}
+	}
+	vol := func(name string) client.Object {
+		return &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	}
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"), claim("w1", "pv-1"), vol("pv-1"))
+	ws := func() wsnapv1.Workspace {
+		var ws wsnapv1.Workspace
+		_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &ws)
+		return ws
+	}
+	pvEpoch := func(name string) string {
+		var pv corev1.PersistentVolume
+		_ = e.client.Get(context.Background(), types.NamespacedName{Name: name}, &pv)
+		return pv.Annotations[workspace.AnnotationWriterEpoch]
+	}
+	for range 2 {
+		if rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+			t.Fatalf("w1: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	if got := ws().Status.WriterEpoch; got != 1 || pvEpoch("pv-1") != "1" {
+		t.Fatalf("after w1 (asked twice): epoch %d, pv-1 epoch %q; want 1 and \"1\"", got, pvEpoch("pv-1"))
+	}
+	e.call(t, "/v1/report", "token-w1", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "a1"})
+	if last := ws().Status.LastSnapshot; last == nil || last.ID != "a1" || last.Epoch != 1 {
+		t.Fatalf("lastSnapshot %+v, want a1 at epoch 1", last)
+	}
+	// w1 is gone; w2 takes over on another volume.
+	if err := e.client.Delete(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "w1"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []client.Object{workloadPod("w2", "u2", "ws1"), claim("w2", "pv-2"), vol("pv-2")} {
+		if err := e.client.Create(context.Background(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.srv.Auth.(fakeAuth)["token-w2"] = Identity{Namespace: ns, PodName: "w2", PodUID: "u2"}
+	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("w2: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := ws().Status.WriterEpoch; got != 2 || pvEpoch("pv-2") != "2" || pvEpoch("pv-1") != "1" {
+		t.Fatalf("after w2: epoch %d, pv-2 %q, pv-1 %q", got, pvEpoch("pv-2"), pvEpoch("pv-1"))
+	}
+}
+
+// TestOlderEpochNeverReplacesLatest (reviewer #3 finding 2 and the
+// split-brain suspicion): restores read lastSnapshot, so it only moves
+// forward in epochs, whatever order the rescues finish in.
+func TestOlderEpochNeverReplacesLatest(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		lastEpoch          int64
+		jobEpoch           string
+		wantLatest         string
+		wantRequestSucceed bool
+	}{
+		// Pod B (epoch 2) snapshotted; pod A's volume (epoch 1) is rescued late.
+		{"late rescue of an older writer", 2, "1", "b1", true},
+		// Pod B crashed before its first snapshot; its volume (epoch 2) is
+		// rescued while lastSnapshot is still A's (epoch 1).
+		{"rescue of a newer writer with no snapshot", 1, "2", "mover-snap", true},
+		{"same epoch", 1, "1", "mover-snap", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-mover-x", UID: "job-uid",
+				Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "mover",
+					wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"},
+				Annotations: map[string]string{wsnapv1.AnnotationVolumeName: "pv-a", workspace.AnnotationWriterEpoch: tc.jobEpoch}}}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mover-pod", UID: "mp",
+				Labels:          map[string]string{wsnapv1.LabelJob: "mover"},
+				OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-mover-x", UID: "job-uid", Controller: ptr.To(true)}}}}
+			e := newEnv(t, job, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+				Status: wsnapv1.WorkspaceStatus{WriterEpoch: 2, Jobs: []wsnapv1.JobRef{{Name: "wsnap-mover-x", UID: "job-uid", Kind: "mover"}},
+					LastSnapshot: &wsnapv1.SnapshotRecord{ID: map[int64]string{1: "a1", 2: "b1"}[tc.lastEpoch], Epoch: tc.lastEpoch, Executor: "sidecar"}}})
+			if rec, _ := e.call(t, "/v1/report", "token-mover-pod", protocol.Report{Role: protocol.RoleMover, Operation: protocol.OpSnapshot, SnapshotID: "mover-snap", Final: true}); rec.Code != 204 {
+				t.Fatalf("report: %d %s", rec.Code, rec.Body.String())
+			}
+			var ws wsnapv1.Workspace
+			_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &ws)
+			if ws.Status.LastSnapshot.ID != tc.wantLatest {
+				t.Fatalf("lastSnapshot %q, want %q", ws.Status.LastSnapshot.ID, tc.wantLatest)
+			}
+			// A restore reads what the broker recorded, not the engine's newest.
+			e2 := newEnv(t, workloadPod("w9", "u9", "ws1"), &ws)
+			if _, r := e2.call(t, "/v1/credentials", "token-w9", protocol.CredentialsRequest{Role: protocol.RoleRestore}); r.LatestSnapshotID != tc.wantLatest {
+				t.Fatalf("restore got latest %q, want %q", r.LatestSnapshotID, tc.wantLatest)
+			}
+		})
+	}
+}
+
+// TestJobPodMustRunTheJobTemplate (reviewer #3 finding 3): an
+// ownerReference to a registered Job is not enough.
+func TestJobPodMustRunTheJobTemplate(t *testing.T) {
+	agent := corev1.Container{Name: "wsnap", Image: "wsnap-agent:dev", Args: []string{"maintain"},
+		VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-token", MountPath: "/t"}}}
+	tokenVol := corev1.Volume{Name: "wsnap-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "wsnap", Path: "token"}}}}}}
+	tmpl := corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol}}
+	evil := agent
+	evil.Image = "attacker/image"
+	sidecarMesh := corev1.Container{Name: "mesh-proxy", Image: "mesh:1"}
+	stealer := corev1.Container{Name: "stealer", Image: "x", VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-token", MountPath: "/t"}}}
+	for _, tc := range []struct {
+		name string
+		spec corev1.PodSpec
+		done bool
+		want int
+	}{
+		{"the job's own pod", tmpl, false, 200},
+		{"an admission webhook added a container", corev1.PodSpec{Containers: []corev1.Container{agent, sidecarMesh}, Volumes: []corev1.Volume{tokenVol}}, false, 200},
+		{"another image", corev1.PodSpec{Containers: []corev1.Container{evil}, Volumes: []corev1.Volume{tokenVol}}, false, 403},
+		{"an extra container reads the token", corev1.PodSpec{Containers: []corev1.Container{agent, stealer}, Volumes: []corev1.Volume{tokenVol}}, false, 403},
+		{"shared process namespace", corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol}, ShareProcessNamespace: ptr.To(true)}, false, 403},
+		{"the job finished", tmpl, true, 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-maint-x", UID: "job-uid",
+				Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "maintenance",
+					wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"}},
+				Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: tmpl}}}
+			if tc.done {
+				job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "maint-pod", UID: "mp",
+				Labels:          map[string]string{wsnapv1.LabelJob: "maintenance"},
+				OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-maint-x", UID: "job-uid", Controller: ptr.To(true)}}},
+				Spec: tc.spec}
+			e := newEnv(t, job, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+				Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "wsnap-maint-x", UID: "job-uid", Kind: "maintenance"}}}})
+			if rec, _ := e.call(t, "/v1/credentials", "token-maint-pod", protocol.CredentialsRequest{Role: protocol.RoleMaintenance}); rec.Code != tc.want {
+				t.Fatalf("status %d, want %d: %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestMaintenanceKeepsPinnedSnapshots (reviewer #3 finding 8).
+func TestMaintenanceKeepsPinnedSnapshots(t *testing.T) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-maint-x", UID: "job-uid",
+		Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "maintenance",
+			wsnapv1.LabelJobWorkspace: "parent", wsnapv1.LabelRepository: "repo"}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "maint-pod", UID: "mp",
+		Labels:          map[string]string{wsnapv1.LabelJob: "maintenance"},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-maint-x", UID: "job-uid", Controller: ptr.To(true)}}}}
+	wsObj := func(name string, rf *wsnapv1.RestoreSource, last string) *wsnapv1.Workspace {
+		w := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo", RestoreFrom: rf}}
+		if last != "" {
+			w.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: last}
+		}
+		return w
+	}
+	parent := wsObj("parent", &wsnapv1.RestoreSource{SnapshotID: "rollback-target"}, "newest")
+	parent.Status.Jobs = []wsnapv1.JobRef{{Name: "wsnap-maint-x", UID: "job-uid", Kind: "maintenance"}}
+	restore := func(name, src, id, phase string) *wsnapv1.WorkspaceRestore {
+		return &wsnapv1.WorkspaceRestore{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+			Spec:   wsnapv1.WorkspaceRestoreSpec{WorkspaceName: "child2", SourceWorkspace: src, SnapshotID: id},
+			Status: wsnapv1.WorkspaceSnapshotStatus{Phase: phase}}
+	}
+	e := newEnv(t, job, pod, parent,
+		wsObj("child", &wsnapv1.RestoreSource{WorkspaceName: "parent", SnapshotID: "fork-point"}, "child-own"),
+		wsObj("other", &wsnapv1.RestoreSource{WorkspaceName: "elsewhere", SnapshotID: "not-ours"}, ""),
+		restore("r1", "parent", "pending-restore", wsnapv1.SnapshotPending),
+		restore("r2", "parent", "finished-restore", wsnapv1.SnapshotSucceeded))
+	rec, r := e.call(t, "/v1/credentials", "token-maint-pod", protocol.CredentialsRequest{Role: protocol.RoleMaintenance})
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	slices.Sort(r.KeepIDs)
+	want := []string{"fork-point", "newest", "pending-restore", "rollback-target"}
+	if !slices.Equal(r.KeepIDs, want) {
+		t.Fatalf("keep %v, want %v", r.KeepIDs, want)
+	}
+}
+
+// TestTransientAPIErrorsAreRetryable (reviewer #3 finding 4).
+func TestTransientAPIErrorsAreRetryable(t *testing.T) {
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
+	e.srv.Auth = failingAuth{}
+	if rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("TokenReview outage answered %d, want 503", rec.Code)
+	}
+	calls := 0
+	c := &CachingAuthenticator{Next: outageAuth{&calls}, TTL: time.Minute}
+	for range 2 {
+		_, _ = c.Authenticate(context.Background(), "t")
+	}
+	if calls != 2 {
+		t.Fatalf("an outage was cached: %d TokenReviews for 2 requests", calls)
+	}
+}
+
+type failingAuth struct{}
+
+func (failingAuth) Authenticate(context.Context, string) (Identity, error) {
+	return Identity{}, fmt.Errorf("%w: connection refused", ErrAuthUnavailable)
+}
+
+type outageAuth struct{ n *int }
+
+func (a outageAuth) Authenticate(context.Context, string) (Identity, error) {
+	*a.n++
+	return Identity{}, fmt.Errorf("%w: timeout", ErrAuthUnavailable)
 }

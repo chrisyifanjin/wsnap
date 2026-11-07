@@ -26,9 +26,9 @@ const (
 	RescueRunning = "running"
 	RescueDone    = "done"
 	RescueFailed  = "failed"
-	// RescueSkipped means another Pod already writes the workspace on a
-	// different volume. A rescue snapshot would become the newest snapshot
-	// and roll that Pod's work back, so the PV is kept for an operator.
+	// RescueSkipped was set by earlier versions when a newer writer
+	// existed. Writer epochs made the skip unnecessary; such PVs are still
+	// left for an operator.
 	RescueSkipped = "skipped-newer-writer"
 )
 
@@ -62,6 +62,7 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 		return ctrl.Result{}, nil
 	}
 	phase := pv.Annotations[wsnapv1.AnnotationRescue]
+	// RescueSkipped is only set by earlier versions.
 	if phase == RescueFailed || phase == RescueSkipped {
 		return ctrl.Result{}, nil // kept for an operator; never retried on its own
 	}
@@ -94,48 +95,12 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 		}
 		return ctrl.Result{}, err
 	}
-	if newer, err := r.newerWriterElsewhere(ctx, &ws, &pv); err != nil {
-		return ctrl.Result{}, err
-	} else if newer {
-		// The newer writer may be known only from history (it already
-		// stopped), so status.writerPod and status.volume can be empty.
-		newerPod := "another pod"
-		if w := ws.Status.WriterPod; w != nil {
-			newerPod = "pod " + w.Name
-		} else if last := ws.Status.LastSnapshot; last != nil && last.Pod != nil {
-			newerPod = "pod " + last.Pod.Name
-		}
-		r.Recorder.Eventf(&ws, corev1.EventTypeWarning, "RescueSkipped",
-			"volume %s was released without a final snapshot, but %s has newer snapshots of this workspace; keeping %s for manual recovery",
-			pv.Name, newerPod, pv.Name)
-		return ctrl.Result{}, r.setRescue(ctx, &pv, RescueSkipped)
-	}
+	// Rescued even when a newer writer exists: the mover's snapshot
+	// carries this volume's writer epoch, and the broker never lets an
+	// older epoch replace lastSnapshot, which restores use. The older data
+	// stays in the repository, reachable by snapshot ID.
 	logger.Info("released volume has no final snapshot; starting rescue", "pv", pv.Name, "workspace", ws.Name)
 	return ctrl.Result{}, r.startRescue(ctx, &pv, &ws)
-}
-
-// newerWriterElsewhere reports whether a Pod other than the PV's writer
-// already writes the workspace on another volume.
-func (r *PVReconciler) newerWriterElsewhere(ctx context.Context, ws *wsnapv1.Workspace, pv *corev1.PersistentVolume) (bool, error) {
-	writer := pv.Annotations[workspace.AnnotationWriterPod]
-	// History, not liveness: once another Pod's sidecar has snapshotted the
-	// workspace, a rescue of this older volume would become the newest
-	// snapshot and roll that work back, even if that Pod already stopped.
-	if last := ws.Status.LastSnapshot; last != nil && last.Executor == "sidecar" && last.Pod != nil && writer != "" && last.Pod.UID != writer {
-		return true, nil
-	}
-	if ws.Status.WriterPod == nil || ws.Status.Volume == nil || ws.Status.Volume.VolumeName == pv.Name {
-		return false, nil
-	}
-	if ws.Status.WriterPod.UID == pv.Annotations[workspace.AnnotationWriterPod] {
-		return false, nil
-	}
-	var pod corev1.Pod
-	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: ws.Namespace, Name: ws.Status.WriterPod.Name}, &pod)
-	if apierrors.IsNotFound(err) {
-		return false, nil
-	}
-	return err == nil && string(pod.UID) == ws.Status.WriterPod.UID, err
 }
 
 func (r *PVReconciler) setRescue(ctx context.Context, pv *corev1.PersistentVolume, phase string) error {
@@ -198,7 +163,8 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName}}}},
 		[]corev1.VolumeMount{{Name: "workspace", MountPath: dataMountPath}})
 	job.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: pv.Name,
-		workspace.AnnotationWriterPod: pv.Annotations[workspace.AnnotationWriterPod]}
+		workspace.AnnotationWriterPod:   pv.Annotations[workspace.AnnotationWriterPod],
+		workspace.AnnotationWriterEpoch: pv.Annotations[workspace.AnnotationWriterEpoch]}
 	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
 		return fmt.Errorf("create mover job: %w", err)
 	}

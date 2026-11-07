@@ -36,7 +36,10 @@ restore)
 maintain)
 	ls "$repo/snapshots" | grep '\.tar\.gz$' | sort |
 		awk -v keep="$WSNAP_KEEP_LAST" '{ f[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print f[i] }' |
-		while read -r f; do rm -f "$repo/snapshots/$f"; done
+		while read -r f; do
+			# Keep pinned snapshots (WSNAP_KEEP_IDS, one ID per line).
+			printf '%s\n' "$WSNAP_KEEP_IDS" | grep -qxF "${f%.tar.gz}" || rm -f "$repo/snapshots/$f"
+		done
 	;;
 *)
 	echo "unknown verb $1" >&2; exit 2

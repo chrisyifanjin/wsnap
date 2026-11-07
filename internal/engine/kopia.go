@@ -179,6 +179,16 @@ func (k *Kopia) Init(ctx context.Context, t Target) error {
 	if _, err := k.kopia(ctx, t, "", ignore...); err != nil {
 		return fmt.Errorf("kopia set ignore policy: %w", err)
 	}
+	// "repository create" makes its caller the maintenance owner, and Kopia
+	// runs automatic maintenance as the owner after snapshots. A writer's
+	// credential cannot delete, so hand ownership to the maintenance
+	// identity at once.
+	if !t.Maintenance {
+		owner := "--owner=" + kopiaMaintenanceUser + "@" + t.Workspace
+		if _, err := k.kopia(ctx, t, "", "maintenance", "set", owner); err != nil {
+			return fmt.Errorf("kopia maintenance set: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -238,16 +248,17 @@ func (k *Kopia) Restore(ctx context.Context, t Target, id, dir string) error {
 	return nil
 }
 
-func (k *Kopia) Maintain(ctx context.Context, t Target, keepLast int) error {
+func (k *Kopia) Maintain(ctx context.Context, t Target, keepLast int, keep []string) error {
 	list, err := k.list(ctx, t)
 	if err != nil {
 		return err
 	}
-	if keepLast < 1 {
-		keepLast = 1
+	ids := make([]string, len(list))
+	for i, s := range list {
+		ids[i] = s.ID
 	}
-	for i := 0; i < len(list)-keepLast; i++ {
-		if _, err := k.kopia(ctx, t, "", "snapshot", "delete", list[i].ID, "--delete"); err != nil {
+	for _, id := range forgettable(ids, keepLast, keep) {
+		if _, err := k.kopia(ctx, t, "", "snapshot", "delete", id, "--delete"); err != nil {
 			return fmt.Errorf("kopia snapshot delete: %w", err)
 		}
 	}

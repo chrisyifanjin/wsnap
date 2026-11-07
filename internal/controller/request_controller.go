@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
+	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -85,12 +87,25 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if sr.Status().Phase == wsnapv1.SnapshotRunning && sr.Status().Executor == r.jobKind() {
 		return r.checkJob(ctx, sr, recheck)
 	}
+	// Live: routing on a stale writer could start a Job beside a sidecar.
 	var ws wsnapv1.Workspace
-	if err := r.Get(ctx, types.NamespacedName{Namespace: sr.GetNamespace(), Name: sr.GetWorkspaceName()}, &ws); err != nil {
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: sr.GetNamespace(), Name: sr.GetWorkspaceName()}, &ws); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, r.finish(ctx, sr, "workspace not found")
 		}
 		return ctrl.Result{}, err
+	}
+	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" {
+		// A terminating sidecar still finishes what it claimed (queued
+		// snapshot requests are answered by its final snapshot). Wait for
+		// its report while its Pod exists.
+		alive, err := r.claimantAlive(ctx, sr.GetNamespace(), ws.Name, st.ClaimedBy)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if alive {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 	live, err := r.liveWriter(ctx, &ws)
 	if err != nil {
@@ -115,6 +130,24 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, sr.obj)
 	}
 	return r.startJob(ctx, sr, &ws, recheck)
+}
+
+// claimantAlive reports whether the Pod with UID uid of workspace wsName
+// still exists and has not stopped. It reads live.
+func (r *RequestReconciler) claimantAlive(ctx context.Context, namespace, wsName, uid string) (bool, error) {
+	if uid == "" {
+		return false, nil
+	}
+	var pods corev1.PodList
+	if err := r.Reader.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: wsName}); err != nil {
+		return false, err
+	}
+	for _, p := range pods.Items {
+		if string(p.UID) == uid {
+			return p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed, nil
+		}
+	}
+	return false, nil
 }
 
 // request wraps a request object for brevity.
@@ -165,6 +198,11 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 	if claim.DeletionTimestamp != nil {
 		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("volume claim %s is being deleted", vol.ClaimName))
 	}
+	// The snapshot and restore reconcilers run at the same time in the
+	// leader. Without this lock both could pass otherJobOnVolume and start
+	// a mover beside a restorer on one volume.
+	unlock := volumeLocks.lock(claim.Spec.VolumeName)
+	defer unlock()
 	// A Pod without a sidecar may still mount the claim; a mover on
 	// another node could not attach a ReadWriteOnce volume, and writes
 	// from that Pod would race the snapshot.
@@ -215,7 +253,8 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 		[]corev1.VolumeMount{{Name: "workspace", MountPath: dataMountPath}})
 	// The writer recorded now is the one whose data the Job captures.
 	job.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: claim.Spec.VolumeName, wsnapv1.AnnotationRequest: sr.GetName(),
-		workspace.AnnotationWriterPod: pv.Annotations[workspace.AnnotationWriterPod]}
+		workspace.AnnotationWriterPod:   pv.Annotations[workspace.AnnotationWriterPod],
+		workspace.AnnotationWriterEpoch: pv.Annotations[workspace.AnnotationWriterEpoch]}
 	// Mark the request Running before the Job exists: the broker lets a
 	// restorer serve only a Running request, and a fast Job Pod must not
 	// arrive first. checkJob recreates the Job if this create fails.
@@ -274,6 +313,24 @@ func (r *RequestReconciler) otherJobOnVolume(ctx context.Context, namespace, vol
 	}
 	return "", nil
 }
+
+// stripedMutex serializes work per key within this process, with fixed
+// memory: keys share one of a fixed set of locks.
+type stripedMutex [64]sync.Mutex
+
+func (k *stripedMutex) lock(key string) (unlock func()) {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	m := &k[h.Sum32()%uint32(len(k))]
+	m.Lock()
+	return m.Unlock
+}
+
+// volumeLocks covers "check for another Job on the volume, then create
+// one". Reconcilers run only in the leader, so a process-wide lock is
+// enough; the check reads the API server, so it sees a Job created a
+// moment ago under the same lock.
+var volumeLocks stripedMutex
 
 // finish marks a request failed. Successes are recorded by the broker.
 func (r *RequestReconciler) finish(ctx context.Context, sr request, msg string) error {
