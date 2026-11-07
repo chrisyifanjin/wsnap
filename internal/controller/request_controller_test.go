@@ -143,6 +143,46 @@ func TestTerminalRequestIsLeftAlone(t *testing.T) {
 	}
 }
 
+func TestTerminalRequestReleasesFinishedJobPVC(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		name := "snapshot"
+		var obj requestObj = snapReq(time.Now(), wsnapv1.SnapshotSucceeded, "mover")
+		if restore {
+			name = "restore"
+			obj = &wsnapv1.WorkspaceRestore{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "req", UID: "req-uid", CreationTimestamp: metav1.Now()},
+				Spec:   wsnapv1.WorkspaceRestoreSpec{WorkspaceName: "ws1"},
+				Status: wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotSucceeded, Executor: "restorer"}}
+		}
+		t.Run(name, func(t *testing.T) {
+			kind := "mover"
+			if restore {
+				kind = "restorer"
+			}
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: requestJobName(request{obj}),
+				Labels:      map[string]string{wsnapv1.LabelJob: kind},
+				Annotations: map[string]string{wsnapv1.AnnotationRequest: "req"}}}
+			r, c := requestEnv(t, obj, job)
+			r.Restore = restore
+			if result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "req"}}); err != nil || result.RequeueAfter == 0 {
+				t.Fatalf("running job must stay until its agent exits: result=%+v err=%v", result, err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batchv1.Job{}); err != nil {
+				t.Fatalf("job removed before it completed: %v", err)
+			}
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+			if err := c.Status().Update(context.Background(), job); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "req"}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batchv1.Job{}); err == nil {
+				t.Fatal("finished job still holds the PVC")
+			}
+		})
+	}
+}
+
 func TestRestoreRouting(t *testing.T) {
 	newReq := func() *wsnapv1.WorkspaceRestore {
 		return &wsnapv1.WorkspaceRestore{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "req", UID: "rq", CreationTimestamp: metav1.Now()},

@@ -65,6 +65,10 @@ req_is() { [[ $(req_phase "$1" "$2") == "$3" ]]; }
 req_field() { kubectl -n "$NS" get "$1" "$2" -o jsonpath="{$3}" 2>/dev/null; }
 
 apply_request() { # kind name workspace [snapshotID] [sourceWorkspace]
+	# Requests are one-shot objects. Reapplying a name from an earlier run
+	# preserves its terminal status and can make a rerun pass or fail against
+	# stale results instead of exercising the agent.
+	kubectl -n "$NS" delete "$1" "$2" --ignore-not-found --wait=true >/dev/null
 	if [[ $1 == wssnap ]]; then
 		printf 'apiVersion: wsnap.dev/v1alpha1\nkind: WorkspaceSnapshot\nmetadata: {name: %s, namespace: %s}\nspec: {workspaceName: %s}\n' "$2" "$NS" "$3" | kubectl apply -f -
 	else
@@ -230,6 +234,7 @@ EOF
 
 pv_of() { kubectl -n "$NS" get pvc "$1" -o jsonpath='{.spec.volumeName}'; }
 pv_gone() { ! kubectl get pv "$1" >/dev/null 2>&1; }
+pvc_gone() { ! kubectl -n "$NS" get pvc "$1" >/dev/null 2>&1; }
 pod_ready() { [[ $(kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]; }
 read_file() { kubectl -n "$NS" exec "$1" -c agent -- cat "$2"; }
 write_file() { kubectl -n "$NS" exec "$1" -c agent -- sh -c "echo '$3' > $2"; }
@@ -248,6 +253,9 @@ setup() {
 	# The setup Job is not idempotent (policy attach fails when attached).
 	kubectl -n storage delete job minio-setup --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	kubectl apply -f "$M/minio.yaml" >/dev/null
+	# The TLS scenario patches the Deployment outside kubectl apply's field
+	# ownership. Recreate it so a later setup really returns to plain HTTP.
+	kubectl -n wsnap-system delete deploy wsnap-controller --ignore-not-found --wait=true >/dev/null
 	kubectl apply -k "$ROOT/config/default" >/dev/null
 	kubectl -n wsnap-system rollout restart deploy/wsnap-controller >/dev/null
 	kubectl -n storage wait --for=condition=complete job/minio-setup --timeout=180s >/dev/null
@@ -422,10 +430,17 @@ scenario_singlewriter() {
 
 scenario_requests() {
 	log "requests: control plane (CRs) and data plane (files); work done by the Pod or a Job"
+	# A failed earlier run may have left the claim and its initialized data.
+	# Start from an empty volume so this scenario tests a fresh restore path.
+	kubectl -n "$NS" delete pod req-1 req-2 fork-1 fork-2 --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc req-a --ignore-not-found --wait=true >/dev/null
 	fresh_workspace ws-req
 	apply_pvc req-a >/dev/null
 	apply_pod req-1 ws-req kopia-keep pvc:req-a yes >/dev/null
 	wait_for 180 "req-1 ready" pod_ready req-1
+	# The repository intentionally survives test runs, so a new PVC may
+	# restore files from the previous run. Establish the baseline explicitly.
+	kubectl -n "$NS" exec req-1 -c agent -- rm -f /workspace/added-later.txt
 	write_file req-1 /workspace/state.txt v1
 
 	apply_request wssnap snap-live ws-req >/dev/null
@@ -485,7 +500,10 @@ scenario_requests() {
 	apply_request wssnap snap-nothing ws-tmp >/dev/null
 	wait_for 60 "request with nothing to act on" req_is wssnap snap-nothing Failed
 	pass "request for an emptyDir workspace with no Pod failed: $(req_field wssnap snap-nothing .status.message)"
-	kubectl -n "$NS" delete pvc req-a >/dev/null
+	wait_for 60 "finished request Job Pods removed" no_pods "$NS" 'wsnap.dev/job-workspace=ws-req,wsnap.dev/job in (mover,restorer)'
+	kubectl -n "$NS" delete pvc req-a --wait=false >/dev/null
+	wait_for 60 "PVC deleted after request Jobs" pvc_gone req-a
+	pass "finished Jobs released the PVC promptly for deletion or reprovisioning"
 }
 
 scenario_chaos() {
