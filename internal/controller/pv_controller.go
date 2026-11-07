@@ -97,9 +97,17 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	if newer, err := r.newerWriterElsewhere(ctx, &ws, &pv); err != nil {
 		return ctrl.Result{}, err
 	} else if newer {
+		// The newer writer may be known only from history (it already
+		// stopped), so status.writerPod and status.volume can be empty.
+		newerPod := "another pod"
+		if w := ws.Status.WriterPod; w != nil {
+			newerPod = "pod " + w.Name
+		} else if last := ws.Status.LastSnapshot; last != nil && last.Pod != nil {
+			newerPod = "pod " + last.Pod.Name
+		}
 		r.Recorder.Eventf(&ws, corev1.EventTypeWarning, "RescueSkipped",
-			"volume %s was released without a final snapshot, but pod %s already writes this workspace on volume %s; keeping %s for manual recovery",
-			pv.Name, ws.Status.WriterPod.Name, ws.Status.Volume.VolumeName, pv.Name)
+			"volume %s was released without a final snapshot, but %s has newer snapshots of this workspace; keeping %s for manual recovery",
+			pv.Name, newerPod, pv.Name)
 		return ctrl.Result{}, r.setRescue(ctx, &pv, RescueSkipped)
 	}
 	logger.Info("released volume has no final snapshot; starting rescue", "pv", pv.Name, "workspace", ws.Name)
@@ -109,6 +117,13 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 // newerWriterElsewhere reports whether a Pod other than the PV's writer
 // already writes the workspace on another volume.
 func (r *PVReconciler) newerWriterElsewhere(ctx context.Context, ws *wsnapv1.Workspace, pv *corev1.PersistentVolume) (bool, error) {
+	writer := pv.Annotations[workspace.AnnotationWriterPod]
+	// History, not liveness: once another Pod's sidecar has snapshotted the
+	// workspace, a rescue of this older volume would become the newest
+	// snapshot and roll that work back, even if that Pod already stopped.
+	if last := ws.Status.LastSnapshot; last != nil && last.Executor == "sidecar" && last.Pod != nil && writer != "" && last.Pod.UID != writer {
+		return true, nil
+	}
 	if ws.Status.WriterPod == nil || ws.Status.Volume == nil || ws.Status.Volume.VolumeName == pv.Name {
 		return false, nil
 	}
@@ -184,7 +199,7 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 		[]corev1.VolumeMount{{Name: "workspace", MountPath: dataMountPath}})
 	job.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: pv.Name,
 		workspace.AnnotationWriterPod: pv.Annotations[workspace.AnnotationWriterPod]}
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
 		return fmt.Errorf("create mover job: %w", err)
 	}
 	r.Recorder.Eventf(pv, corev1.EventTypeNormal, "RescueStarted", "mover job %s/%s snapshots this volume", ws.Namespace, job.Name)

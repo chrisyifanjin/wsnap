@@ -87,11 +87,14 @@ func Ready(dir string) error {
 	return err
 }
 
-// StartupReady is checked by the sidecar's startup probe. Its marker is on
-// the sidecar's private volume, so a marker left on a reused workspace volume
-// cannot start the workload before this Pod is accepted as its writer.
+// startupReadyPath is on the sidecar's private volume, so a marker left on
+// a reused workspace volume cannot start the workload before this Pod is
+// accepted as its writer.
+func startupReadyPath(stateDir string) string { return filepath.Join(stateDir, "startup-ready") }
+
+// StartupReady is checked by the sidecar's startup probe.
 func StartupReady(stateDir string) error {
-	_, err := os.Stat(filepath.Join(stateDir, "startup-ready"))
+	_, err := os.Stat(startupReadyPath(stateDir))
 	return err
 }
 
@@ -232,6 +235,7 @@ func (c *Config) open(ctx context.Context, role protocol.Role) (*protocol.Creden
 	t := engine.Target{
 		Backend: creds.Backend, Credentials: creds.Credentials, Password: creds.RepositoryPassword,
 		Workspace: creds.Workspace, StateDir: c.StateDir, ReadOnly: !role.CanWrite(),
+		Maintenance: role == protocol.RoleMaintenance,
 	}
 	if !creds.Credentials.Scoped {
 		c.Log.Warn("broker issued an unscoped credential; it can reach every workspace in the repository", "role", role)
@@ -567,7 +571,9 @@ func isEmpty(v *volume, dir string) (bool, error) {
 // the broker, and files in .wsnap/requests), and on SIGTERM a final one
 // after any in-flight snapshot finishes.
 func (c *Config) RunSidecar(ctx context.Context) error {
-	readyPath := filepath.Join(c.StateDir, "startup-ready")
+	readyPath := startupReadyPath(c.StateDir)
+	// A restarted sidecar container keeps its state volume; it must be
+	// admitted again before the probe passes.
 	if err := os.Remove(readyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("clear startup readiness: %w", err)
 	}
@@ -907,8 +913,10 @@ func (c *Config) notWorkspaceData() string {
 	if _, err := v.Stat(markerPath(c.Dir, "swap")); err == nil {
 		return "an in-place restore was interrupted mid-swap"
 	}
-	if _, err := v.Lstat(MarkerPath(c.Dir)); err != nil {
-		return "the volume was never initialized, so no workload ever ran on it"
+	// Not the "initialized" marker: the workload can delete .wsnap (for
+	// example with "git clean -fdx"), and its data would then be lost.
+	if empty, err := isEmpty(v, c.Dir); err == nil && empty {
+		return "the volume is empty"
 	}
 	return ""
 }

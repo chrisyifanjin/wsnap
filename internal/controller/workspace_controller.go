@@ -4,7 +4,6 @@ import (
 	"context"
 
 	batchv1 "k8s.io/api/batch/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,7 +51,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 	job := r.Jobs.newAgentJob("maintenance", maintenanceJobName(&ws), &ws, &repo, []string{"maintain"}, nil, nil)
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
 		return ctrl.Result{}, err
 	}
 	log.FromContext(ctx).Info("started maintenance", "workspace", ws.Name, "job", job.Name)

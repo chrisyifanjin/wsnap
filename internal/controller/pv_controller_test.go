@@ -360,3 +360,18 @@ func TestStaleWorkspaceCacheDoesNotReclaim(t *testing.T) {
 		t.Fatalf("PV reclaim policy %s after a stale cache read; the data would be deleted", p)
 	}
 }
+
+// TestLateRescueDoesNotRollBackNewerHistory (reviewer #2 finding 2): the
+// newer writer already stopped; its snapshots are still newer than this
+// volume's data.
+func TestLateRescueDoesNotRollBackNewerHistory(t *testing.T) {
+	ws := testWorkspace(func(ws *wsnapv1.Workspace) {
+		ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "b-final", Executor: "sidecar", Final: true,
+			Pod: &wsnapv1.PodRef{Name: "pod-b", UID: "uB"}}
+	})
+	r, c := newPVReconciler(t, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "uA"}))
+	reconcilePV(t, r)
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueSkipped {
+		t.Fatalf("rescue = %q; a late rescue would roll back pod B's newer work", a)
+	}
+}

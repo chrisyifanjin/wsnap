@@ -58,8 +58,12 @@ sequenceDiagram
 |---|---|---|
 | `restore` | a workspace Pod before any workload container started; after that, only for a `WorkspaceRestore` this Pod claimed | read |
 | `snapshot` | the writer Pod of the workspace | read, write; delete only engine scratch objects |
-| `mover` | Pods of wsnap mover and restorer Jobs (the Job must carry wsnap's labels) | as `snapshot` |
+| `mover` | Pods of wsnap mover and restorer Jobs | as `snapshot` |
 | `maintenance` | Pods of wsnap maintenance Jobs | read, write, delete |
+
+A Job's labels can be copied. So the controller records each Job it
+creates in the Workspace status, which namespace users cannot write, and the
+broker serves only Jobs recorded there.
 
 Engine scratch objects:
 
@@ -151,3 +155,12 @@ resource. The created request records the caller in the
 - **The filesystem backend has no isolation** between workspaces.
 - **The controller can read every Secret** (`get`). Limit it with a Role per
   tenant namespace if needed.
+- **Editing a SnapshotRepository is an administrator right.** A user who can
+  edit one can select the `static` provider (and so get the raw backend
+  keys), set the image, volumes and security context of wsnap Jobs, and
+  point STS or Azure endpoints at any URL. Grant `update` on
+  `snapshotrepositories` only to the people who own the backend
+  credentials.
+- **Gateway requests run as the controller.** The broker checks the caller
+  with a SubjectAccessReview, then creates the request with its own service
+  account. Admission policies that target the caller do not apply.

@@ -223,7 +223,8 @@ func TestJobRoles(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mover-pod", UID: "mp",
 		Labels:          map[string]string{wsnapv1.LabelJob: "mover"},
 		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-mover-x", UID: "job-uid", Controller: ptr.To(true)}}}}
-	e := newEnv(t, job, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"}})
+	e := newEnv(t, job, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "wsnap-mover-x", UID: "job-uid", Kind: "mover"}}}})
 	if rec, r := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != 200 || r.Workspace != "ws1" {
 		t.Fatalf("mover: status %d, workspace %q: %s", rec.Code, r.Workspace, rec.Body.String())
 	}
@@ -483,7 +484,8 @@ func TestRestorerJobRoles(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "restorer-pod", UID: "rp",
 		Labels:          map[string]string{wsnapv1.LabelJob: "restorer"},
 		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-reqr-x", UID: "job-uid", Controller: ptr.To(true)}}}}
-	ws := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"}}
+	ws := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "wsnap-reqr-x", UID: "job-uid", Kind: "restorer"}}}}
 	e := forkEnv(t, job, pod, ws, restoreReq("r", "ws1", wsnapv1.SnapshotRunning, ""), restoreReq("other", "ws1", wsnapv1.SnapshotRunning, ""))
 	for _, tc := range []struct {
 		role protocol.Role
@@ -618,12 +620,14 @@ func TestSingleWriterCompareAndSet(t *testing.T) {
 // TestFinalMarksTheReportersOwnVolume: status.volume may already describe
 // another Pod; the final mark must land on the reporter's PV (finding R4).
 func TestFinalMarksTheReportersOwnVolume(t *testing.T) {
-	pvA := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-a"}}
-	pvB := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-b"}}
+	owned := map[string]string{wsnapv1.AnnotationWorkspaceRef: ns + "/ws1"}
+	pvA := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-a", Annotations: owned}}
+	pvB := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-b", Annotations: map[string]string{wsnapv1.AnnotationWorkspaceRef: ns + "/ws1"}}}
 	claimA := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-w1"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-a"}}
 	e := newEnv(t, workloadPod("w1", "u1", "ws1"), pvA, pvB, claimA,
 		&wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
-			Status: wsnapv1.WorkspaceStatus{Volume: &wsnapv1.VolumeRef{Kind: "persistentVolumeClaim", ClaimName: "other", VolumeName: "pv-b"}}})
+			Status: wsnapv1.WorkspaceStatus{WriterPod: &wsnapv1.PodRef{Name: "w1", UID: "u1"},
+				Volume: &wsnapv1.VolumeRef{Kind: "persistentVolumeClaim", ClaimName: "other", VolumeName: "pv-b"}}})
 	e.call(t, "/v1/report", "token-w1", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "s1", Final: true})
 	var a, b corev1.PersistentVolume
 	_ = e.client.Get(context.Background(), types.NamespacedName{Name: "pv-a"}, &a)
@@ -655,7 +659,7 @@ func TestWritersWaitForAJobOnTheirVolume(t *testing.T) {
 // started on the volume during the mover run is not covered by its snapshot.
 func TestMoverMarksTheWriterRecordedAtJobCreation(t *testing.T) {
 	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-a",
-		Annotations: map[string]string{workspace.AnnotationWriterPod: "newcomer"}}}
+		Annotations: map[string]string{workspace.AnnotationWriterPod: "newcomer", wsnapv1.AnnotationWorkspaceRef: ns + "/ws1"}}}
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-mover-x", UID: "job-uid",
 		Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "mover",
 			wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"},
@@ -663,7 +667,8 @@ func TestMoverMarksTheWriterRecordedAtJobCreation(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mover-pod", UID: "mp",
 		Labels:          map[string]string{wsnapv1.LabelJob: "mover"},
 		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-mover-x", UID: "job-uid", Controller: ptr.To(true)}}}}
-	e := newEnv(t, pv, job, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"}})
+	e := newEnv(t, pv, job, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "wsnap-mover-x", UID: "job-uid", Kind: "mover"}}}})
 	e.call(t, "/v1/report", "token-mover-pod", protocol.Report{Role: protocol.RoleMover, Operation: protocol.OpSnapshot, SnapshotID: "s1", Final: true})
 	var got corev1.PersistentVolume
 	_ = e.client.Get(context.Background(), types.NamespacedName{Name: "pv-a"}, &got)
@@ -718,5 +723,88 @@ func TestWriterStuckOnALostNodeIsGone(t *testing.T) {
 	}
 	if stillWriting(&p, deadline.Add(stuckTerminationMargin+time.Second)) {
 		t.Fatal("a writer stuck terminating past its deadline still counts as live; it would block replacements forever")
+	}
+}
+
+// TestUnregisteredJobGetsNothing: a namespace user copies a wsnap Job's
+// labels into their own Job (reviewer #2 finding 4).
+func TestUnregisteredJobGetsNothing(t *testing.T) {
+	forged := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "evil", UID: "evil-uid",
+		Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "maintenance",
+			wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "evil-pod", UID: "ep",
+		Labels:          map[string]string{wsnapv1.LabelJob: "maintenance"},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "evil", UID: "evil-uid", Controller: ptr.To(true)}}}}
+	e := newEnv(t, forged, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "real", UID: "real-uid", Kind: "maintenance"}}}})
+	if rec, _ := e.call(t, "/v1/credentials", "token-evil-pod", protocol.CredentialsRequest{Role: protocol.RoleMaintenance}); rec.Code == 200 {
+		t.Fatal("a forged maintenance job got the delete credential")
+	}
+}
+
+// TestFinalMarkOnlyOnTheCallersWorkspace (reviewer #2 finding 4).
+func TestFinalMarkOnlyOnTheCallersWorkspace(t *testing.T) {
+	victim := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "victim-pv",
+		Annotations: map[string]string{wsnapv1.AnnotationWorkspaceRef: ns + "/victim", workspace.AnnotationWriterPod: "v1"}}}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-mover-x", UID: "job-uid",
+		Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "mover",
+			wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"},
+		Annotations: map[string]string{wsnapv1.AnnotationVolumeName: "victim-pv", workspace.AnnotationWriterPod: "v1"}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mover-pod", UID: "mp",
+		Labels:          map[string]string{wsnapv1.LabelJob: "mover"},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-mover-x", UID: "job-uid", Controller: ptr.To(true)}}}}
+	e := newEnv(t, victim, job, pod, &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "wsnap-mover-x", UID: "job-uid", Kind: "mover"}}}})
+	e.call(t, "/v1/report", "token-mover-pod", protocol.Report{Role: protocol.RoleMover, Operation: protocol.OpSnapshot, SnapshotID: "s1", Final: true})
+	var got corev1.PersistentVolume
+	_ = e.client.Get(context.Background(), types.NamespacedName{Name: "victim-pv"}, &got)
+	if got.Annotations[workspace.AnnotationFinalPod] != "" {
+		t.Fatal("a job of workspace ws1 marked another workspace's PV as saved")
+	}
+}
+
+// TestReportsOnlyFromTheWriterAndClaimant (reviewer #2 finding 5).
+func TestReportsOnlyFromTheWriterAndClaimant(t *testing.T) {
+	req := &wsnapv1.WorkspaceSnapshot{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "r1"},
+		Spec: wsnapv1.WorkspaceSnapshotSpec{WorkspaceName: "ws1"}, Status: wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotRunning, ClaimedBy: "u1"}}
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"), workloadPod("w2", "u2", "ws1"), req)
+	e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot})
+	if rec, _ := e.call(t, "/v1/report", "token-w2", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "fake"}); rec.Code != http.StatusConflict {
+		t.Errorf("a non-writer's snapshot report got %d, want 409", rec.Code)
+	}
+	var ws wsnapv1.Workspace
+	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &ws)
+	if ws.Status.LastSnapshot != nil && ws.Status.LastSnapshot.ID == "fake" {
+		t.Fatal("a non-writer rewrote the last snapshot")
+	}
+	// r2 was claimed by another pod; even the writer w1 cannot complete it.
+	r2 := &wsnapv1.WorkspaceSnapshot{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "r2"},
+		Spec: wsnapv1.WorkspaceSnapshotSpec{WorkspaceName: "ws1"}, Status: wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotRunning, ClaimedBy: "someone-else"}}
+	if err := e.client.Create(context.Background(), r2); err != nil {
+		t.Fatal(err)
+	}
+	r2.Status = wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotRunning, ClaimedBy: "someone-else"}
+	_ = e.client.Status().Update(context.Background(), r2)
+	e.call(t, "/v1/report", "token-w1", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot, SnapshotID: "s-w1", Request: "r2"})
+	var got wsnapv1.WorkspaceSnapshot
+	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "r2"}, &got)
+	if got.Status.Phase != wsnapv1.SnapshotRunning {
+		t.Fatalf("a pod that did not claim the request completed it: %+v", got.Status)
+	}
+}
+
+// TestAdmissionConsumesRestoreFrom (reviewer #2 suspicion S4): a warm Pod
+// was admitted; the unused restoreFrom must not fire at a later cold start.
+func TestAdmissionConsumesRestoreFrom(t *testing.T) {
+	ws := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1", Generation: 2},
+		Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo", RestoreFrom: &wsnapv1.RestoreSource{SnapshotID: "old"}}}
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"), ws)
+	if rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatal(rec.Code)
+	}
+	var got wsnapv1.Workspace
+	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &got)
+	if got.Status.RestoreFromGeneration != 2 {
+		t.Fatalf("restoreFromGeneration = %d; the unused restoreFrom stays armed", got.Status.RestoreFromGeneration)
 	}
 }

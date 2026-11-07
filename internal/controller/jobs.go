@@ -1,14 +1,18 @@
 package controller
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	wsnapv1 "github.com/chrisyifanjin/wsnap/api/v1alpha1"
 	"github.com/chrisyifanjin/wsnap/internal/webhook"
@@ -120,4 +124,37 @@ func rescueClaimName(pvName string) string { return "wsnap-rescue-" + shortHash(
 
 func maintenanceJobName(ws *wsnapv1.Workspace) string {
 	return fmt.Sprintf("wsnap-maint-%s", shortHash(ws.Namespace, ws.Name, ws.Status.LastSnapshot.ID))
+}
+
+// maxRecordedJobs bounds Workspace.status.jobs; the oldest entries go first.
+const maxRecordedJobs = 20
+
+// createJob creates job and records its UID in the Workspace status, which
+// is what the broker checks before it serves the Job.
+func createJob(ctx context.Context, c client.Client, r client.Reader, job *batchv1.Job, wsName string) error {
+	if err := c.Create(ctx, job); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(job), job); err != nil {
+			return err
+		}
+	}
+	ref := wsnapv1.JobRef{Name: job.Name, UID: string(job.UID), Kind: job.Labels[wsnapv1.LabelJob]}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var ws wsnapv1.Workspace
+		if err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: wsName}, &ws); err != nil {
+			return err
+		}
+		for _, j := range ws.Status.Jobs {
+			if j.UID == ref.UID {
+				return nil
+			}
+		}
+		ws.Status.Jobs = append(ws.Status.Jobs, ref)
+		if n := len(ws.Status.Jobs); n > maxRecordedJobs {
+			ws.Status.Jobs = ws.Status.Jobs[n-maxRecordedJobs:]
+		}
+		return c.Status().Update(ctx, &ws)
+	})
 }

@@ -154,6 +154,7 @@ The webhook adds the sidecar. Optional annotations:
 | `wsnap.dev/volume` | Name of the workspace volume, if not `workspace`. |
 | `wsnap.dev/quiesce-timeout` | Ask the agent to pause before each snapshot (see below). |
 | `wsnap.dev/final-timeout` | Time limit for the final snapshot. Default `50s`. |
+| `wsnap.dev/workload-grace` | Time the workload takes to exit after SIGTERM. Default `30s`. The webhook sets the grace period to this plus the final timeout plus 10 s. |
 | `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 For agent-sandbox, put the labels in `Sandbox.spec.podTemplate.metadata`
@@ -224,7 +225,7 @@ Alert on a rising `result="error"` rate, and on workspaces whose
 
 | Symptom | Cause and action |
 |---|---|
-| Pod stays in `PodInitializing` | The sidecar waits. Read `kubectl logs <pod> -c wsnap`. A `409` means another Pod still writes the workspace, a rescue runs, or a Job works on the volume; it ends by itself. |
+| Pod stays in `PodInitializing` | The sidecar waits until the broker admits the Pod as the writer. Read `kubectl logs <pod> -c wsnap`. A `409` means another Pod still writes the workspace, a rescue runs, or a Job works on the volume; it ends by itself. |
 | Pod refused at creation | The webhook explains why in the error message. |
 | `Ready=False` on a repository | Read the condition message. |
 | PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed or ran out of time (2 h). Fix the cause, then remove the annotation to retry. |

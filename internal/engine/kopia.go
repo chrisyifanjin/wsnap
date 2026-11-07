@@ -24,6 +24,11 @@ type Kopia struct {
 // the source reads wsnap@<workspace>:<path>.
 const kopiaUser = "wsnap"
 
+// kopiaMaintenanceUser owns maintenance. Kopia runs automatic maintenance
+// after a snapshot when the connected identity owns it; a sidecar with a
+// no-delete credential must never be that owner.
+const kopiaMaintenanceUser = "wsnap-maintenance"
+
 func (k *Kopia) WriterDeletePrefixes() []string {
 	// Kopia writes a session marker blob ("s" prefix) at the start of every
 	// write session and deletes it when the session commits. Verified
@@ -139,7 +144,11 @@ func (k *Kopia) Init(ctx context.Context, t Target) error {
 	// config file (it arrives in KOPIA_PASSWORD on every call). Storage
 	// credentials are still written to the config. Persisting the password
 	// would use the OS keychain on macOS.
-	common := []string{"--override-username=" + kopiaUser, "--override-hostname=" + t.Workspace, "--no-persist-credentials"}
+	user := kopiaUser
+	if t.Maintenance {
+		user = kopiaMaintenanceUser
+	}
+	common := []string{"--override-username=" + user, "--override-hostname=" + t.Workspace, "--no-persist-credentials"}
 	connect := append(append([]string{"repository", "connect"}, storage...), common...)
 	if t.ReadOnly {
 		connect = append(connect, "--readonly")
@@ -162,8 +171,10 @@ func (k *Kopia) Init(ctx context.Context, t Target) error {
 	// failing it: a partial snapshot beats none for a final snapshot or a
 	// rescue.
 	ignore := []string{"policy", "set", "--global", "--ignore-file-errors=true", "--ignore-dir-errors=true"}
+	// A leading "/" anchors a rule at the snapshot root; without it Kopia
+	// would also drop nested folders that happen to share the name.
 	for _, n := range excludedNames {
-		ignore = append(ignore, "--add-ignore="+n)
+		ignore = append(ignore, "--add-ignore=/"+n)
 	}
 	if _, err := k.kopia(ctx, t, "", ignore...); err != nil {
 		return fmt.Errorf("kopia set ignore policy: %w", err)

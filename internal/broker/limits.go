@@ -65,8 +65,13 @@ type CachingAuthenticator struct {
 
 type cachedIdentity struct {
 	id      Identity
+	err     error
 	expires time.Time
 }
+
+// failureTTL is how long a rejected token stays rejected without another
+// TokenReview.
+const failureTTL = 10 * time.Second
 
 func (c *CachingAuthenticator) Authenticate(ctx context.Context, token string) (Identity, error) {
 	key := sha256.Sum256([]byte(token))
@@ -74,11 +79,17 @@ func (c *CachingAuthenticator) Authenticate(ctx context.Context, token string) (
 	c.mu.Lock()
 	if e, ok := c.cache[key]; ok && now.Before(e.expires) {
 		c.mu.Unlock()
-		return e.id, nil
+		return e.id, e.err
 	}
 	c.mu.Unlock()
 	id, err := c.Next.Authenticate(ctx, token)
 	if err != nil {
+		c.mu.Lock()
+		if c.cache == nil {
+			c.cache = map[[32]byte]cachedIdentity{}
+		}
+		c.cache[key] = cachedIdentity{err: err, expires: now.Add(failureTTL)}
+		c.mu.Unlock()
 		return id, err
 	}
 	c.mu.Lock()

@@ -48,13 +48,28 @@ spec:
           containerPort: 8080
         - name: webhook
           containerPort: 9443
+        - name: health
+          containerPort: 8082
         volumeMounts:
         - name: webhook-certs
           mountPath: /tmp/wsnap-webhook
+        # Ready means both the broker and the webhook serve.
         readinessProbe:
           httpGet:
+            path: /readyz
+            port: health
+          periodSeconds: 2
+        livenessProbe:
+          httpGet:
             path: /healthz
-            port: broker
+            port: health
+        # Keep serving while the API server and kube-proxy drop this Pod's
+        # endpoints; otherwise webhook calls routed here time out and, with
+        # failurePolicy Fail, labeled Pods are refused during a rollout.
+        lifecycle:
+          preStop:
+            sleep:
+              seconds: 10
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true

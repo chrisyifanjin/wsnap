@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -189,7 +190,12 @@ func main() {
 	// The broker serves on every replica; it does not need the leader lock.
 	must(mgr.Add(brokerRunnable{addr: *brokerAddr, handler: srv.Handler(), tls: tlsConfig}))
 	if *manageCerts {
-		certs := webhook.CertSetup{Client: mgr.GetClient(), Namespace: *namespace, SecretName: "wsnap-webhook-cert",
+		// Uncached: the RBAC allows get/update of this one webhook
+		// configuration by name, not list/watch, so a cached read would
+		// wait forever for an informer that never syncs.
+		direct, err := client.New(mgr.GetConfig(), client.Options{Scheme: scheme})
+		must(err)
+		certs := webhook.CertSetup{Client: direct, Namespace: *namespace, SecretName: "wsnap-webhook-cert",
 			ServiceName: "wsnap-webhook", WebhookName: "wsnap", CertDir: *webhookDir}
 		// Renew while running, on every replica (see CertSetup.Ensure).
 		must(mgr.Add(allReplicas(func(ctx context.Context) error {
@@ -208,7 +214,16 @@ func main() {
 		})))
 	}
 	must(mgr.AddHealthzCheck("healthz", func(*http.Request) error { return nil }))
-	must(mgr.AddReadyzCheck("readyz", func(*http.Request) error { return nil }))
+	// Ready only when the webhook serves: with failurePolicy Fail, an
+	// endpoint whose webhook is not listening refuses labeled Pods.
+	must(mgr.AddReadyzCheck("webhook", mgr.GetWebhookServer().StartedChecker()))
+	must(mgr.AddReadyzCheck("broker", func(*http.Request) error {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1"+*brokerAddr, time.Second)
+		if err != nil {
+			return err
+		}
+		return conn.Close()
+	}))
 
 	log.Info("starting", "broker", *brokerAddr, "audience", *audience)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

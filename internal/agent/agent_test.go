@@ -22,10 +22,12 @@ import (
 // fakeBroker hands out exec-engine credentials for a filesystem repository
 // and records reports.
 type fakeBroker struct {
-	t            *testing.T
-	repo         string
-	command      []string
-	fail503      atomic.Int32 // fail this many credential requests with 503
+	t       *testing.T
+	repo    string
+	command []string
+	fail503 atomic.Int32 // fail this many credential requests with 503
+	fail409 atomic.Int32 // refuse this many credential requests with 409
+	// denySnapshot refuses writer (snapshot) credentials while set.
 	denySnapshot atomic.Bool
 	credReqs     atomic.Int32
 	mu           sync.Mutex
@@ -43,6 +45,11 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if b.fail503.Load() > 0 {
 			b.fail503.Add(-1)
 			http.Error(w, "restarting", http.StatusServiceUnavailable)
+			return
+		}
+		if b.fail409.Load() > 0 {
+			b.fail409.Add(-1)
+			http.Error(w, "workspace ws is written by pod other; waiting until it stops", http.StatusConflict)
 			return
 		}
 		var req protocol.CredentialsRequest
@@ -237,47 +244,6 @@ func TestCredentialsAreCachedAndRetried(t *testing.T) {
 	}
 }
 
-func TestWarmVolumeWaitsForWriterClaimBeforeStartup(t *testing.T) {
-	c, b := setup(t)
-	c.IntervalOverride = time.Hour
-	b.denySnapshot.Store(true)
-	write(t, MarkerPath(c.Dir), "previous Pod initialized this volume\n")
-	write(t, filepath.Join(c.Dir, "work.txt"), "keep this work")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := make(chan error, 1)
-	go func() { errCh <- c.RunSidecar(ctx) }()
-	deadline := time.Now().Add(10 * time.Second)
-	for b.credReqs.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if b.credReqs.Load() == 0 {
-		t.Fatal("sidecar did not ask the broker for writer credentials")
-	}
-	if err := StartupReady(c.StateDir); err == nil {
-		t.Fatal("startup probe passed while the broker denied writer ownership")
-	}
-	if err := Ready(c.Dir); err != nil {
-		t.Fatalf("warm volume marker disappeared: %v", err)
-	}
-
-	b.denySnapshot.Store(false)
-	for StartupReady(c.StateDir) != nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err := StartupReady(c.StateDir); err != nil {
-		t.Fatalf("startup did not become ready after the broker accepted the writer: %v", err)
-	}
-	if got, err := os.ReadFile(filepath.Join(c.Dir, "work.txt")); err != nil || string(got) != "keep this work" {
-		t.Fatalf("warm volume data changed: %q, %v", got, err)
-	}
-	cancel()
-	if err := <-errCh; err != nil {
-		t.Fatalf("RunSidecar: %v", err)
-	}
-}
-
 // TestTerminationWaitsForInflightSnapshot uses an engine whose snapshot
 // takes two seconds. SIGTERM arrives in the middle; the snapshot must
 // finish, and the final snapshot must follow.
@@ -350,7 +316,7 @@ func TestRequestTriggers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() { errc <- c.RunSidecar(ctx) }()
-	for Ready(c.Dir) != nil {
+	for StartupReady(c.StateDir) != nil {
 		time.Sleep(50 * time.Millisecond)
 	}
 	reqDir := markerPath(c.Dir, "requests")
@@ -733,7 +699,7 @@ func TestPinnedRollbackSurvivesAnIdlePod(t *testing.T) {
 // snapshot (reviewer finding R1).
 func TestMoverSavesNothingFromAnUninitializedVolume(t *testing.T) {
 	for name, prepare := range map[string]func(c *Config){
-		"never initialized": func(c *Config) {},
+		"empty volume": func(c *Config) {},
 		"restore interrupted": func(c *Config) {
 			write(t, MarkerPath(c.Dir), "x")
 			write(t, markerPath(c.Dir, "restoring"), "id")
@@ -872,5 +838,61 @@ func TestSymlinkedStagingIsNotFollowed(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "a.txt")); err == nil {
 		t.Fatal("restored files landed outside the volume")
+	}
+}
+
+// TestMoverSavesDataWhoseMarkerTheWorkloadDeleted: "git clean -fdx" in a
+// repo at the volume root removes .wsnap; the work must still be saved
+// (reviewer #2 finding 3).
+func TestMoverSavesDataWhoseMarkerTheWorkloadDeleted(t *testing.T) {
+	c, b := setup(t)
+	write(t, filepath.Join(c.Dir, "src", "main.go"), "package main")
+	if err := c.RunMover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reps := b.snapshotReports()
+	if len(reps) != 1 || reps[0].SnapshotID == "" || !reps[0].Final {
+		t.Fatalf("data without a marker was not saved: %+v", reps)
+	}
+}
+
+func TestWarmVolumeWaitsForWriterClaimBeforeStartup(t *testing.T) {
+	c, b := setup(t)
+	c.IntervalOverride = time.Hour
+	b.denySnapshot.Store(true)
+	write(t, MarkerPath(c.Dir), "previous Pod initialized this volume\n")
+	write(t, filepath.Join(c.Dir, "work.txt"), "keep this work")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.RunSidecar(ctx) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for b.credReqs.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if b.credReqs.Load() == 0 {
+		t.Fatal("sidecar did not ask the broker for writer credentials")
+	}
+	if err := StartupReady(c.StateDir); err == nil {
+		t.Fatal("startup probe passed while the broker denied writer ownership")
+	}
+	if err := Ready(c.Dir); err != nil {
+		t.Fatalf("warm volume marker disappeared: %v", err)
+	}
+
+	b.denySnapshot.Store(false)
+	for StartupReady(c.StateDir) != nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := StartupReady(c.StateDir); err != nil {
+		t.Fatalf("startup did not become ready after the broker accepted the writer: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(c.Dir, "work.txt")); err != nil || string(got) != "keep this work" {
+		t.Fatalf("warm volume data changed: %q, %v", got, err)
+	}
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("RunSidecar: %v", err)
 	}
 }

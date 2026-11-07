@@ -122,7 +122,7 @@ EOF
       restartPolicy: Always
       args: [sidecar, --dir=/workspace, --final-timeout=50s, --operation-timeout=60s${SIDECAR_TLS_ARGS:-}]
       startupProbe:
-        exec: {command: [/usr/local/bin/wsnap-agent, ready, --dir=/workspace]}
+        exec: {command: [/usr/local/bin/wsnap-agent, ready, --state-dir=/var/lib/wsnap]}
         periodSeconds: 1
         failureThreshold: 600
       volumeMounts:
@@ -574,15 +574,13 @@ broker_tls() { # on|off
 		kubectl -n wsnap-system patch deploy wsnap-controller --type strategic -p '{"spec":{"template":{"spec":{
 			"volumes":[{"name":"tls","secret":{"secretName":"wsnap-broker-tls"}}],
 			"containers":[{"name":"controller","args":'"$args"',
-				"volumeMounts":[{"name":"tls","mountPath":"/tls","readOnly":true}],
-				"readinessProbe":{"httpGet":{"path":"/healthz","port":"broker","scheme":"HTTPS"}}}]}}}}' >/dev/null
+				"volumeMounts":[{"name":"tls","mountPath":"/tls","readOnly":true}]}]}}}}' >/dev/null
 	else
 		args='["--broker-addr=:8080","--broker-url=http://wsnap-broker.wsnap-system.svc:8080","--agent-image=wsnap-agent:dev","--leader-elect"]'
 		kubectl -n wsnap-system patch deploy wsnap-controller --type strategic -p '{"spec":{"template":{"spec":{
 			"volumes":[{"name":"tls","$patch":"delete"}],
 			"containers":[{"name":"controller","args":'"$args"',
-				"volumeMounts":[{"mountPath":"/tls","$patch":"delete"}],
-				"readinessProbe":{"httpGet":{"path":"/healthz","port":"broker","scheme":"HTTP"}}}]}}}}' >/dev/null
+				"volumeMounts":[{"mountPath":"/tls","$patch":"delete"}]}]}}}}' >/dev/null
 	fi
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
 }

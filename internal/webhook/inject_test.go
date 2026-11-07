@@ -48,7 +48,8 @@ func TestInjectsSidecarIntoAnyAgentImage(t *testing.T) {
 	if !strings.Contains(args, "--quiesce-timeout=5s") || !strings.Contains(args, "--broker-url=http://b") {
 		t.Errorf("args = %s", args)
 	}
-	if *p.Spec.AutomountServiceAccountToken || *p.Spec.TerminationGracePeriodSeconds < 60 {
+	// 30s for the workload to exit + 50s final snapshot + 10s margin.
+	if *p.Spec.AutomountServiceAccountToken || *p.Spec.TerminationGracePeriodSeconds < 90 {
 		t.Errorf("automount %v grace %d", *p.Spec.AutomountServiceAccountToken, *p.Spec.TerminationGracePeriodSeconds)
 	}
 	if sc.SecurityContext == nil || !*sc.SecurityContext.ReadOnlyRootFilesystem || sc.SecurityContext.Capabilities.Drop[0] != "ALL" {

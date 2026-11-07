@@ -308,6 +308,13 @@ type VolumeRef struct {
 	Kind string `json:"kind"`
 }
 
+// JobRef identifies a Job the controller created.
+type JobRef struct {
+	Name string `json:"name"`
+	UID  string `json:"uid"`
+	Kind string `json:"kind"`
+}
+
 // PodRef identifies one Pod incarnation.
 type PodRef struct {
 	Name string `json:"name"`
@@ -365,6 +372,13 @@ type WorkspaceStatus struct {
 	// a restore already used.
 	// +optional
 	RestoreFromGeneration int64 `json:"restoreFromGeneration,omitempty"`
+	// jobs lists the Jobs the controller created for this workspace. The
+	// broker serves only Jobs listed here: status is written by wsnap, so
+	// a namespace user cannot forge an entry by copying a Job's labels.
+	// +listType=map
+	// +listMapKey=uid
+	// +optional
+	Jobs []JobRef `json:"jobs,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +optional

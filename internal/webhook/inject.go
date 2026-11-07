@@ -25,6 +25,11 @@ const (
 	AnnotationQuiesceTimeout = "wsnap.dev/quiesce-timeout"
 	// AnnotationFinalTimeout bounds the final snapshot, e.g. "50s".
 	AnnotationFinalTimeout = "wsnap.dev/final-timeout"
+	// AnnotationWorkloadGrace is how long the workload may take to exit
+	// after SIGTERM, e.g. "30s". Native sidecars stop after the workload,
+	// inside the same grace period, so the final snapshot only gets what
+	// the workload leaves.
+	AnnotationWorkloadGrace = "wsnap.dev/workload-grace"
 )
 
 // Config is what injection needs from the controller.
@@ -43,6 +48,8 @@ const (
 	dataPath    = "/workspace"
 
 	defaultFinalTimeout = 50 * time.Second
+	// defaultWorkloadGrace is the workload's own shutdown budget.
+	defaultWorkloadGrace = 30 * time.Second
 	// graceMargin is kept between the final snapshot's deadline and the
 	// kubelet's SIGKILL.
 	graceMargin = 10 * time.Second
@@ -85,7 +92,15 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		}
 		quiesce = d
 	}
-	needGrace := int64((finalTimeout + graceMargin) / time.Second)
+	workloadGrace := defaultWorkloadGrace
+	if v := pod.Annotations[AnnotationWorkloadGrace]; v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return fmt.Errorf("annotation %s=%q is not a duration", AnnotationWorkloadGrace, v)
+		}
+		workloadGrace = d
+	}
+	needGrace := int64((workloadGrace + finalTimeout + graceMargin) / time.Second)
 	if g := pod.Spec.TerminationGracePeriodSeconds; g == nil || *g < needGrace {
 		pod.Spec.TerminationGracePeriodSeconds = ptr.To(needGrace)
 	}
@@ -127,7 +142,7 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		// The workload starts only after the volume is restored. 30 minutes
 		// covers a large cold restore.
 		StartupProbe: &corev1.Probe{
-			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/usr/local/bin/wsnap-agent", "ready", "--dir=" + dataPath}}},
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/usr/local/bin/wsnap-agent", "ready", "--state-dir=/var/lib/wsnap"}}},
 			PeriodSeconds:    1,
 			FailureThreshold: 1800,
 		},

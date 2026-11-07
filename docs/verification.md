@@ -112,89 +112,44 @@ Found by the first independent review:
 - A cached credential could expire during a long snapshot.
 - restic's exit code 3 (some files unreadable) failed every snapshot.
 
-Found by the second independent review and fixed:
+Found by the second independent review, and fixed:
 
-- A warm volume's initialized marker let the workload start before the
-  broker accepted the Pod as writer. The startup probe now checks a marker
-  on the sidecar's private volume, written only after writer credentials are
-  granted. `TestWarmVolumeWaitsForWriterClaimBeforeStartup` holds the broker
-  at a conflict and checks that startup remains blocked.
+- A Pod on a volume that already had data started its workload before the
+  broker accepted it as the writer. The startup probe now checks a marker on
+  the sidecar's private volume, written only after writer credentials are
+  granted (`TestWarmVolumeWaitsForWriterClaimBeforeStartup`).
+- A late rescue could roll back a newer writer that had already stopped.
+  The controller now decides by snapshot history, not by running Pods.
+- The mover trusted a marker file the workload can delete. It now skips
+  only an empty volume or an interrupted restore.
+- A namespace user could forge a wsnap Job and get the delete credential.
+  The broker now serves only Jobs that the controller recorded in the
+  Workspace status, and marks only PVs of the caller's workspace as saved.
+- Reports from a Pod that was not the writer, or from a Pod that did not
+  claim the request, changed the status. They are now refused.
+- A request timed out while its Job was still running. Only waiting
+  requests time out now.
+- The webhook certificate renewal waited forever on a cache it could not
+  fill. It now reads from the API server.
+- During a controller rollout, the webhook could be unreachable for a few
+  seconds (found by the end-to-end TLS scenario). Readiness now includes
+  the webhook, and a terminating Pod keeps serving for 10 seconds.
+- The termination grace period did not leave the final snapshot enough
+  time when the workload exits slowly. It now adds a workload budget
+  (`wsnap.dev/workload-grace`, default 30 s).
+- An unused `restoreFrom` could apply at a much later cold restore. A Pod's
+  admission now uses it up.
+- Kopia's automatic maintenance could run under the sidecar's no-delete
+  credential. Maintenance now has its own Kopia identity.
+- Kopia excluded nested folders named `.wsnap` or `lost+found`. The rules
+  are now anchored at the snapshot root.
+- Rejected tokens caused a TokenReview each time. They are remembered for
+  10 seconds.
 
-## Open issues
+## Known limits
 
-A second independent review found these problems. They are not fixed yet.
-Each item gives the problem, the result, and the planned fix.
-
-### Data loss
-
-1. **A late rescue can replace newer work.**
-   The controller skips a rescue only while the newer writer Pod exists.
-   When that Pod has already stopped, the rescue runs.
-   Result: the old data becomes the newest snapshot.
-   Fix: compare the PV's writer with the workspace's last snapshot, not
-   with running Pods.
-
-2. **The workload can delete the marker that the mover trusts.**
-   A root workload can delete `.wsnap` (for example with `git clean -fdx`).
-   The mover then thinks the volume holds no workspace data.
-   Result: the mover saves nothing, and Kubernetes deletes the PV.
-   Fix: skip the snapshot only for an empty volume or an interrupted
-   restore, and record initialization outside the volume.
-
-3. **A namespace user can forge a wsnap Job.**
-   The broker accepts a Job by its labels.
-   A user can copy the labels into a new Job.
-   Result: that user gets the maintenance (delete) credential, and can mark
-   a PV as saved when it is not.
-   Fix: record the UIDs of wsnap Jobs where only the controller writes,
-   and check the PV's workspace before a final mark.
-
-### Wrong status
-
-4. **The broker accepts reports from a Pod that is not the writer.**
-   Result: the last snapshot and request results can show the wrong
-   snapshot.
-   Fix: accept snapshot reports only from the writer Pod, and complete a
-   request only for the Pod that claimed it.
-
-5. **A request times out while its work continues.**
-   The timeout counts from creation, also while a Job or sidecar works.
-   Result: a large first snapshot always fails, and a restore can finish
-   after its request shows "Failed".
-   Fix: time out only waiting requests; limit running work by the Job
-   deadline and a heartbeat.
-
-### Availability
-
-6. **The webhook certificate is not renewed while the controller runs.**
-   The renewal reads the webhook configuration through a cache that it
-   has no permission to fill.
-   Result: renewal waits forever. After about 335 days, all labeled Pods
-   are refused.
-   Fix: read the configuration directly from the API server.
-
-### Security and documentation
-
-7. **A user who can edit a SnapshotRepository holds the admin credential.**
-   That user can select the `static` provider, set Job images and volumes,
-   and point STS or Azure endpoints to any URL.
-   Fix: document this as an administrator right, or move these fields to a
-   cluster-scoped object.
-
-8. **Smaller items.**
-   - With the default settings, credentials are never reused (the README
-     says they are).
-   - Kopia excludes every folder named `.wsnap` or `lost+found`, not only
-     the top-level ones.
-   - Invalid tokens are not rate limited before the TokenReview.
-   - Gateway requests run as the controller, so admission policies for the
-     caller do not apply.
-
-### To check
-
-- The final snapshot can get only 2 seconds when the workload ignores
-  SIGTERM.
-- Partial snapshots (unreadable files) count as final.
-- The broker reads Jobs from a cache before it admits a writer.
-- An unused `restoreFrom` can apply at a much later cold restore.
-- A root workload can still race the staging directory.
+- A root workload can race the staging directory during an in-place
+  restore (see [security.md](security.md)).
+- Gateway requests are created by the controller's service account after a
+  SubjectAccessReview of the caller, so admission policies that target the
+  caller do not apply to them.

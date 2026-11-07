@@ -19,8 +19,11 @@ import (
 	"github.com/chrisyifanjin/wsnap/internal/workspace"
 )
 
-// RequestTimeout fails a snapshot request that no executor finished.
+// RequestTimeout fails a request that no executor took within this time.
 var RequestTimeout = 10 * time.Minute
+
+// RunningTimeout fails a request a sidecar claimed but did not finish.
+var RunningTimeout = 2 * time.Hour
 
 // RequestReconciler routes WorkspaceSnapshot requests (Restore false) or
 // WorkspaceRestore requests (Restore true) the same way. If the
@@ -59,7 +62,14 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	case wsnapv1.SnapshotSucceeded, wsnapv1.SnapshotFailed:
 		return ctrl.Result{}, nil
 	}
-	if time.Since(sr.GetCreationTimestamp().Time) > RequestTimeout {
+	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" &&
+		time.Since(sr.GetCreationTimestamp().Time) > RunningTimeout {
+		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("the sidecar did not finish within %s", RunningTimeout))
+	}
+	// Only a request that still waits for an executor times out here: a
+	// running Job is bounded by its activeDeadlineSeconds, and cutting off
+	// a running restore would leave the request Failed while it completes.
+	if sr.Status().Phase != wsnapv1.SnapshotRunning && time.Since(sr.GetCreationTimestamp().Time) > RequestTimeout {
 		// Stop a Job that is still running: a request that reads Failed
 		// must not keep changing the volume, and a retry must not run a
 		// second Job beside it.
@@ -216,7 +226,7 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 			return ctrl.Result{}, err
 		}
 	}
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
 		return ctrl.Result{}, err
 	}
 	return recheck, nil

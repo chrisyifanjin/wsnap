@@ -254,7 +254,7 @@ func TestRoundTrip(t *testing.T) {
 					return engine.Target{
 						Backend: backend, Credentials: st.issue(t, role, backend, espec),
 						Password: "test-password", Workspace: ws,
-						StateDir: t.TempDir(), ReadOnly: !role.CanWrite(),
+						StateDir: t.TempDir(), ReadOnly: !role.CanWrite(), Maintenance: role == protocol.RoleMaintenance,
 					}
 				}
 
@@ -270,6 +270,10 @@ func TestRoundTrip(t *testing.T) {
 				writeFile(t, filepath.Join(src, "dir", "b.txt"), "two")
 				writeFile(t, filepath.Join(src, engine.StateDirName, "marker"), "agent state")
 				writeFile(t, filepath.Join(src, "lost+found", "x"), "fs junk")
+				// Only the top-level entries are excluded; nested folders
+				// that share the names are workspace data.
+				writeFile(t, filepath.Join(src, "dir", "lost+found", "keep.txt"), "nested")
+				writeFile(t, filepath.Join(src, "dir", ".wsnap", "keep.txt"), "nested")
 
 				w := target(protocol.RoleSnapshot)
 				if err := eng.Init(ctx, w); err != nil {
@@ -317,6 +321,13 @@ func TestRoundTrip(t *testing.T) {
 				}
 				if got := readFile(t, filepath.Join(dst, "c.txt")); got != "three" {
 					t.Errorf("c.txt = %q", got)
+				}
+				if espec.Type != protocol.EngineExec {
+					for _, nested := range []string{"dir/lost+found/keep.txt", "dir/.wsnap/keep.txt"} {
+						if got := readFile(t, filepath.Join(dst, nested)); got != "nested" {
+							t.Errorf("%s = %q; a nested folder with an excluded name was dropped", nested, got)
+						}
+					}
 				}
 				for _, excluded := range []string{engine.StateDirName, "lost+found"} {
 					if _, err := os.Stat(filepath.Join(dst, excluded)); err == nil {

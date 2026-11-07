@@ -24,7 +24,7 @@ spec:
         restartPolicy: Always                     # native sidecar (Kubernetes 1.29+)
         args: [sidecar, --dir=/workspace, --final-timeout=50s]
         startupProbe:                             # the agent starts after the restore
-          exec: {command: [/usr/local/bin/wsnap-agent, ready, --dir=/workspace]}
+          exec: {command: [/usr/local/bin/wsnap-agent, ready, --state-dir=/var/lib/wsnap]}
           periodSeconds: 1
           failureThreshold: 1800
         volumeMounts:

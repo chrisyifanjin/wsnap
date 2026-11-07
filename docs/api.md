@@ -50,7 +50,8 @@ first Pod. You can create it first, to set `restoreFrom`.
 | `status.lastRestore` | `snapshotID`, `sourceWorkspace`, `time`, `pod`. |
 | `status.lastError` | The last failure. |
 | `status.snapshotsSinceMaintenance`, `status.lastMaintenance` | Maintenance bookkeeping. |
-| `status.restoreFromGeneration` | The generation whose `restoreFrom` was used. |
+| `status.restoreFromGeneration` | The generation whose `restoreFrom` was used (or skipped because the volume already had data). |
+| `status.jobs` | Jobs the controller created for this workspace. The broker serves only these. |
 
 ### WorkspaceSnapshot and WorkspaceRestore
 
@@ -77,7 +78,7 @@ A request fails after 10 minutes without an executor.
 | `wsnap.dev/volume` | Pod | Workspace volume name. Default `workspace`. |
 | `wsnap.dev/sidecar` | Pod | Sidecar container name. Default `wsnap`. |
 | `wsnap.dev/inject` | Pod | `"false"`: the Pod brings its own sidecar. |
-| `wsnap.dev/quiesce-timeout`, `wsnap.dev/final-timeout` | Pod | Sidecar timing. |
+| `wsnap.dev/quiesce-timeout`, `wsnap.dev/final-timeout`, `wsnap.dev/workload-grace` | Pod | Sidecar timing and the grace period. |
 | `wsnap.dev/protected`, `wsnap.dev/workspace-ref`, `wsnap.dev/original-reclaim-policy`, `wsnap.dev/writer-pod-uid`, `wsnap.dev/final-pod-uid`, `wsnap.dev/rescue` | PV | wsnap's bookkeeping. Do not edit, except to retry a failed rescue (remove `wsnap.dev/rescue`). |
 | `wsnap.dev/requested-by` | request | The user that created it through the gateway API. |
 
@@ -105,6 +106,7 @@ each call with a SubjectAccessReview.
 |---|---|---|
 | `POST /v1/namespaces/{ns}/workspaces/{ws}/snapshots` | `create workspacesnapshots` | `{"wait": true, "timeoutSeconds": 45}` |
 | `POST /v1/namespaces/{ns}/workspaces/{ws}/restores` | `create workspacerestores` | `{"snapshotID": "...", "sourceWorkspace": "...", "wait": true}` |
+| `POST /v1/namespaces/{ns}/workspaces/{ws}/forks` | `create workspacesnapshots` and `create workspaces` | `{"name": "child", "repository": "..."}`: snapshots the parent now, then creates the child pinned to that snapshot |
 | `GET /v1/namespaces/{ns}/workspacesnapshots/{name}` | `get workspacesnapshots` | — |
 | `GET /v1/namespaces/{ns}/workspacerestores/{name}` | `get workspacerestores` | — |
 

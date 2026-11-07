@@ -43,6 +43,9 @@ type Target struct {
 	// ReadOnly opens the repository without writing anything, as the
 	// restore role requires.
 	ReadOnly bool
+	// Maintenance marks the maintenance role. Engines with an owner
+	// concept use a separate identity for it.
+	Maintenance bool
 }
 
 // Snapshot identifies one snapshot.

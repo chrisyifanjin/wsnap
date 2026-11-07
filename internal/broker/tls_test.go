@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -66,5 +67,24 @@ func TestTokenReviewMustConfirmTheAudience(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("audiences %v: err = %v, want ok=%v", tc.audiences, err, tc.ok)
 		}
+	}
+}
+
+type countingAuth struct{ n int }
+
+func (c *countingAuth) Authenticate(context.Context, string) (Identity, error) {
+	c.n++
+	return Identity{}, fmt.Errorf("bad token")
+}
+
+// TestRejectedTokensAreRemembered (reviewer #2 finding 9).
+func TestRejectedTokensAreRemembered(t *testing.T) {
+	next := &countingAuth{}
+	a := &CachingAuthenticator{Next: next, TTL: time.Minute}
+	for i := 0; i < 50; i++ {
+		_, _ = a.Authenticate(context.Background(), "junk")
+	}
+	if next.n != 1 {
+		t.Fatalf("%d TokenReviews for one junk token, want 1", next.n)
 	}
 }

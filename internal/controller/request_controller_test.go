@@ -26,7 +26,7 @@ func requestEnv(t *testing.T, objs ...client.Object) (*RequestReconciler, client
 	_ = wsnapv1.AddToScheme(scheme)
 	repo := &wsnapv1.SnapshotRepository{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "repo"}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objs, repo)...).
-		WithStatusSubresource(&wsnapv1.WorkspaceSnapshot{}, &wsnapv1.WorkspaceRestore{}, &batchv1.Job{}).Build()
+		WithStatusSubresource(&wsnapv1.WorkspaceSnapshot{}, &wsnapv1.WorkspaceRestore{}, &batchv1.Job{}, &wsnapv1.Workspace{}).Build()
 	return &RequestReconciler{Client: c, Reader: c, Jobs: JobConfig{AgentImage: "agent:test", BrokerURL: "http://b", Audience: "wsnap"}}, c
 }
 
@@ -270,9 +270,10 @@ func TestOneJobPerVolume(t *testing.T) {
 	}
 }
 
-// TestTimeoutDeletesTheJob (finding R5).
+// TestTimeoutDeletesTheJob (finding R5): a request still waiting at the
+// timeout fails, and any Job created for it is removed.
 func TestTimeoutDeletesTheJob(t *testing.T) {
-	sr := snapReq(time.Now().Add(-RequestTimeout-time.Minute), wsnapv1.SnapshotRunning, "mover")
+	sr := snapReq(time.Now().Add(-RequestTimeout-time.Minute), wsnapv1.SnapshotPending, "")
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: requestJobName(request{sr})}}
 	r, c := requestEnv(t, sr, job)
 	if got := reconcileReq(t, r, c); got.Status.Phase != wsnapv1.SnapshotFailed {
@@ -280,5 +281,33 @@ func TestTimeoutDeletesTheJob(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: job.Name}, &batchv1.Job{}); err == nil {
 		t.Fatal("the job of a timed-out request still exists and may keep writing")
+	}
+}
+
+// TestRunningJobIsNotCutOffByTheWaitTimeout (reviewer #2 finding 6): a
+// large first snapshot can run longer than the 10-minute wait timeout.
+func TestRunningJobIsNotCutOffByTheWaitTimeout(t *testing.T) {
+	sr := snapReq(time.Now().Add(-RequestTimeout-time.Minute), wsnapv1.SnapshotRunning, "mover")
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: requestJobName(request{sr})}}
+	r, c := requestEnv(t, sr, job, wsWith(pvcVol, nil), boundClaim())
+	if got := reconcileReq(t, r, c); got.Status.Phase != wsnapv1.SnapshotRunning {
+		t.Fatalf("a running job was failed by the wait timeout: %+v", got.Status)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: job.Name}, &batchv1.Job{}); err != nil {
+		t.Fatal("the running job was deleted")
+	}
+}
+
+// TestJobsAreRegisteredInWorkspaceStatus (reviewer #2 finding 4).
+func TestJobsAreRegisteredInWorkspaceStatus(t *testing.T) {
+	sr := snapReq(time.Now(), "", "")
+	r, c := requestEnv(t, sr, wsWith(pvcVol, nil), boundClaim())
+	reconcileReq(t, r, c)
+	var ws wsnapv1.Workspace
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "ws1"}, &ws)
+	var job batchv1.Job
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: requestJobName(request{sr})}, &job)
+	if len(ws.Status.Jobs) != 1 || ws.Status.Jobs[0].UID != string(job.UID) || ws.Status.Jobs[0].Kind != "mover" {
+		t.Fatalf("job not registered: %+v (job uid %s)", ws.Status.Jobs, job.UID)
 	}
 }
