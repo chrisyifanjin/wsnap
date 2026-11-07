@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -115,7 +116,9 @@ func stores(t *testing.T) map[string]store {
 		const account = "devstoreaccount1"
 		p := credentials.AzureSAS{ServiceURL: "https://" + account + ".blob." + suffix}
 		secret := map[string][]byte{credentials.KeyAzureAccountKey: []byte(os.Getenv("WSNAP_TEST_AZURE_KEY"))}
-		run := strings.ToLower(time.Now().UTC().Format("20060102t150405"))
+		// stores is called once per engine, including engines skipped by -run.
+		// A seconds-only name collides when those calls happen together.
+		run := strconv.FormatInt(time.Now().UnixNano(), 36)
 		// With the static provider the admin pre-creates the container, as
 		// with an S3 bucket; nothing in wsnap creates it.
 		staticContainer := "static-" + run
