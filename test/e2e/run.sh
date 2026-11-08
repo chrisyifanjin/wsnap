@@ -869,6 +869,14 @@ EOF
 	wait_for 60 "webhook back" webhook_admits
 }
 
+# copy_broker_ca puts the broker's CA into gw-client. It passes the CA as
+# an argument, not on stdin: "kubectl exec -i" can drop stdin and leave an
+# empty file. It succeeds only when a PEM certificate landed.
+copy_broker_ca() {
+	local ca
+	ca=$(kubectl -n wsnap-system get secret wsnap-broker-cert -o jsonpath='{.data.ca\.crt}') && [[ -n $ca ]] || return 1
+	kubectl -n "$NS" exec gw-client -- sh -c "echo '$ca' | base64 -d > /tmp/broker-ca.crt && grep -q 'BEGIN CERTIFICATE' /tmp/broker-ca.crt"
+}
 gw_curl() { kubectl -n "$NS" exec gw-client -- curl -sS --cacert /tmp/broker-ca.crt "$@"; }
 gw_status() { kubectl -n "$NS" exec gw-client -- curl -s --cacert /tmp/broker-ca.crt -o /dev/null -w '%{http_code}' "$@"; }
 
@@ -906,8 +914,7 @@ EOF
 	local tok nob url resp
 	tok=$(kubectl -n "$NS" create token platform)
 	nob=$(kubectl -n "$NS" create token nobody)
-	kubectl -n wsnap-system get secret wsnap-broker-cert -o jsonpath='{.data.ca\.crt}' | base64 -d |
-		kubectl -n "$NS" exec -i gw-client -- sh -c 'cat > /tmp/broker-ca.crt'
+	wait_for 60 "broker CA in gw-client" copy_broker_ca
 	url=https://wsnap-broker.wsnap-system.svc:8443/v1/namespaces/$NS/workspaces/ws-gw
 	resp=$(gw_curl -X POST -H "Authorization: Bearer $tok" -d '{"wait":true,"timeoutSeconds":45}' "$url/snapshots")
 	[[ $resp == *'"phase":"Succeeded"'* && $resp == *'"executor":"sidecar"'* ]] || die "gateway snapshot did not succeed: $resp"
