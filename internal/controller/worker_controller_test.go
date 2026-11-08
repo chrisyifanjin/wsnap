@@ -39,8 +39,16 @@ func TestWorkerJobSharesTheWorkloadsNodeAndClaim(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: workerJobName(testNS, pod)}, &job); err != nil {
 		t.Fatal(err)
 	}
-	if job.Spec.Template.Spec.NodeName != "node-a" {
-		t.Errorf("worker not pinned to the workload's node: %q", job.Spec.Template.Spec.NodeName)
+	spec := job.Spec.Template.Spec
+	terms := spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if spec.NodeName != "" || len(terms) != 1 || terms[0].MatchFields[0].Values[0] != "node-a" {
+		t.Errorf("worker must be scheduled (not pinned) to the workload's node: nodeName %q, affinity %+v", spec.NodeName, terms)
+	}
+	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 0 {
+		t.Error("a finished worker would keep the workload's claim in use")
+	}
+	if spec.Containers[0].Resources.Requests.Memory().IsZero() {
+		t.Error("worker has no resource requests (BestEffort, evicted first)")
 	}
 	ref := workspace.JobRef(&job)
 	if ref.ClaimName != "data" || ref.ClaimUID != "uid-data" || ref.VolumeName != "pv-1" || ref.VolumeUID != "uid-pv-1" ||

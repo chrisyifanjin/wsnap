@@ -109,6 +109,14 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if alive {
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+		if st.Executor == "worker" {
+			// The worker Pod that claimed it is gone while its workload may
+			// still run; the Job's next Pod claims it again (redelivery goes
+			// only to the claimant's UID).
+			st.Phase, st.ClaimedBy, st.Executor = wsnapv1.SnapshotPending, "", ""
+			st.Message = "the worker Pod that claimed the request stopped before reporting; routing it again"
+			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, sr.obj)
+		}
 	}
 	live, err := r.liveWriter(ctx, &ws)
 	if err != nil {

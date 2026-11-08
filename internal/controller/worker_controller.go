@@ -8,6 +8,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -82,17 +83,19 @@ func (r *WorkerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			existing.Annotations[wsnapv1.AnnotationVolumeName] != vol.VolumeName {
 			return ctrl.Result{}, fmt.Errorf("worker job %s does not match pod %s and its volume", name, pod.Name)
 		}
-		if !jobFinished(&existing) {
-			return ctrl.Result{}, nil
+		if jobFinished(&existing) {
+			// The worker was evicted or failed while its workload still
+			// runs. Foreground deletion lets the old Pod release its mount
+			// before a replacement Job with the same name is created.
+			fg := metav1.DeletePropagationForeground
+			if err := r.Delete(ctx, &existing, &client.DeleteOptions{PropagationPolicy: &fg}); client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		// The worker was evicted or failed while its workload still runs.
-		// Foreground deletion lets the old Pod release its mount before a
-		// replacement Job with the same name is created.
-		fg := metav1.DeletePropagationForeground
-		if err := r.Delete(ctx, &existing, &client.DeleteOptions{PropagationPolicy: &fg}); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		// A running Job still goes through createJob: it keeps the Job only
+		// if it is registered, and replaces one that a crash left
+		// unregistered (or that a namespace user created under this name).
 	} else if !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
@@ -100,8 +103,10 @@ func (r *WorkerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: ws.Namespace, Name: ws.Spec.RepositoryName}, &repo); err != nil {
 		return ctrl.Result{}, err
 	}
+	grace := workloadGrace(&pod)
 	job := r.Jobs.newAgentJob("worker", name, &ws, &repo,
-		[]string{"worker", "--dir=" + dataMountPath, "--pod-uid=" + string(pod.UID), "--final-timeout=50s"},
+		[]string{"worker", "--dir=" + dataMountPath, "--pod-uid=" + string(pod.UID),
+			"--final-timeout=" + workerFinalTimeout.String(), "--workload-grace=" + grace.String()},
 		[]corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: vol.ClaimName}}}},
 		[]corev1.VolumeMount{{Name: "workspace", MountPath: dataMountPath}})
@@ -114,12 +119,42 @@ func (r *WorkerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		workspace.AnnotationWriterPod:   string(pod.UID),
 	}
 	job.Spec.ActiveDeadlineSeconds = nil // a live worker may outlive a two-hour one-shot Job
-	job.Spec.Template.Spec.NodeName = pod.Spec.NodeName
-	job.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To[int64](90)
+	// A finished worker Pod still counts as a user of the claim, which
+	// would keep a deleted workload's PVC (and PV) for the default TTL.
+	job.Spec.TTLSecondsAfterFinished = ptr.To[int32](0)
+	spec := &job.Spec.Template.Spec
+	// Scheduled (not pinned with nodeName) to the workload's node, so the
+	// scheduler checks capacity and taints, with the workload's
+	// tolerations and priority. A ReadWriteOnce claim allows both Pods on
+	// one node.
+	spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+			MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{pod.Spec.NodeName}}},
+		}}}}}
+	spec.Tolerations = pod.Spec.Tolerations
+	spec.PriorityClassName = pod.Spec.PriorityClassName
+	spec.Containers[0].Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{
+		corev1.ResourceCPU: resource.MustParse("50m"), corev1.ResourceMemory: resource.MustParse("64Mi")}}
+	// On SIGTERM the worker waits up to the workload's grace for it to
+	// stop, then takes the final snapshot.
+	spec.TerminationGracePeriodSeconds = ptr.To(int64((grace + workerFinalTimeout + 10*time.Second) / time.Second))
 	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// workerFinalTimeout bounds the worker's final snapshot.
+const workerFinalTimeout = 50 * time.Second
+
+// workloadGrace is how long the workload's containers may run after its
+// Pod is deleted; capped so a huge grace cannot keep a worker forever.
+func workloadGrace(pod *corev1.Pod) time.Duration {
+	g := 30 * time.Second
+	if pod.Spec.TerminationGracePeriodSeconds != nil {
+		g = time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
+	}
+	return min(g, 10*time.Minute)
 }
 
 func (r *WorkerReconciler) SetupWithManager(mgr ctrl.Manager) error {
