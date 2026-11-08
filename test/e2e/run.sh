@@ -281,8 +281,13 @@ scenario_pvc() {
 	wait_for 180 "pvc-1 ready" pod_ready pvc-1
 	write_file pvc-1 /workspace/hello.txt v1
 	local pv; pv=$(pv_of pvc-a)
+	local claim_uid pv_uid
+	claim_uid=$(kubectl -n "$NS" get pvc pvc-a -o jsonpath='{.metadata.uid}')
+	pv_uid=$(kubectl get pv "$pv" -o jsonpath='{.metadata.uid}')
+	[[ $(ws_field ws-pvc .status.volume.claimUID) == "$claim_uid" && $(ws_field ws-pvc .status.volume.volumeUID) == "$pv_uid" ]] ||
+		die "Workspace did not record the bound PVC and PV UIDs"
 	[[ $(kubectl get pv "$pv" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}') == Retain ]] || die "PV $pv not protected"
-	pass "PV $pv switched to Retain while the workspace is in use"
+	pass "PV $pv switched to Retain; Workspace recorded its PVC and PV UIDs"
 
 	kubectl -n "$NS" delete pod pvc-1 --wait=true >/dev/null
 	[[ $(ws_field ws-pvc .status.lastSnapshot.final) == true ]] || die "no final snapshot after graceful delete"

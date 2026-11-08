@@ -345,6 +345,25 @@ Found by the sixth independent review, and fixed:
   and the workload must exit on SIGTERM. The second was found by the
   end-to-end suite, whose test workload ignored SIGTERM.
 
+PVC identity and provisioning checks:
+
+- `Workspace.status.volume` records the claim and PV UIDs as well as their
+  names. A writer cannot receive credentials until both sides of the
+  binding agree. Protection refuses a PV already owned by another
+  workspace (`TestResolveVolumeRequiresClaimAndPVIdentity`).
+- An idle request Job refuses a replacement claim with the same name;
+  a registered mover or restorer checks the same identity again when its
+  Pod asks for credentials. The controller records that identity in
+  Workspace status, so editing the Job's annotations cannot change it
+  (`TestIdleRequestRejectsReplacedClaim`, `TestJobRoles`).
+- A rescue PVC is pinned to its released PV and the PV is pre-bound to
+  the new claim UID. A preexisting same-name claim cannot cause a mover
+  Job to start (`TestRescueRefusesPreexistingSameNameClaim`).
+- The sample `LimitRange`, `ResourceQuota`, and StorageClass admission
+  policy were applied to an isolated Kubernetes 1.37 namespace. A claim
+  using the reviewed class was admitted; an unreviewed class and a 20Gi
+  claim above the 10Gi limit were rejected.
+
 ## Known limits
 
 - A root workload can race the staging directory during an in-place
@@ -358,3 +377,8 @@ Found by the sixth independent review, and fixed:
 - A restore must finish within `--operation-timeout` (default 30 minutes),
   and the repository's `credentials.ttl` must be at least 5 minutes longer.
   Raise both for very large workspaces.
+- If the controller stops after creating a rescue PVC but before recording
+  its UID on the PV, it leaves the PV retained and refuses an automatic
+  retry. An operator must inspect and remove that orphaned rescue PVC
+  before retrying; it will not mount a same-name claim without proof of
+  ownership.

@@ -147,7 +147,12 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 		if err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: wsName}, &ws); err != nil {
 			return err
 		}
-		if slices.ContainsFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool { return j.UID == string(existing.UID) }) {
+		if slices.ContainsFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool {
+			return j == workspace.JobRef(&existing) && j.ClaimName == workspace.JobRef(job).ClaimName &&
+				j.ClaimUID == job.Annotations[workspace.AnnotationClaimUID] &&
+				j.VolumeName == job.Annotations[wsnapv1.AnnotationVolumeName] &&
+				j.VolumeUID == job.Annotations[workspace.AnnotationPVUID]
+		}) {
 			*job = existing
 			return nil
 		}
@@ -163,7 +168,7 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 		}
 		return fmt.Errorf("job %s/%s existed but was not registered by wsnap; deleted it, will create it again", job.Namespace, job.Name)
 	}
-	ref := wsnapv1.JobRef{Name: job.Name, UID: string(job.UID), Kind: job.Labels[wsnapv1.LabelJob]}
+	ref := workspace.JobRef(job)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var ws wsnapv1.Workspace
 		if err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: wsName}, &ws); err != nil {

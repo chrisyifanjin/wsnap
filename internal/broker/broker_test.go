@@ -78,6 +78,156 @@ type env struct {
 
 func newEnv(t *testing.T, objs ...client.Object) *env {
 	t.Helper()
+	// Fake clients do not run Kubernetes' PV binder. Give ordinary Pod
+	// fixtures a real claim/PV identity so writer checks exercise production
+	// bindings rather than an impossible running Pod with an unbound claim.
+	claims := map[string]*corev1.PersistentVolumeClaim{}
+	volumes := map[string]*corev1.PersistentVolume{}
+	for _, o := range objs {
+		switch v := o.(type) {
+		case *corev1.PersistentVolumeClaim:
+			claims[v.Name] = v
+		case *corev1.PersistentVolume:
+			volumes[v.Name] = v
+		}
+	}
+	for _, o := range objs {
+		p, ok := o.(*corev1.Pod)
+		if !ok || p.Labels[wsnapv1.LabelWorkspace] == "" {
+			continue
+		}
+		for _, v := range p.Spec.Volumes {
+			if v.PersistentVolumeClaim == nil {
+				continue
+			}
+			name := v.PersistentVolumeClaim.ClaimName
+			if claims[name] == nil {
+				claims[name] = &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: name},
+					Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-" + name}}
+				objs = append(objs, claims[name])
+			}
+		}
+	}
+	// Mover and restorer fixtures also need the PVC that a real Job Pod
+	// mounts. The Job controller does not run in the fake client.
+	for _, o := range objs {
+		j, ok := o.(*batchv1.Job)
+		if !ok || (j.Labels[wsnapv1.LabelJob] != "mover" && j.Labels[wsnapv1.LabelJob] != "restorer") {
+			continue
+		}
+		if j.Annotations == nil {
+			j.Annotations = map[string]string{}
+		}
+		pvName := j.Annotations[wsnapv1.AnnotationVolumeName]
+		if pvName == "" {
+			pvName = "pv-" + j.Name
+			j.Annotations[wsnapv1.AnnotationVolumeName] = pvName
+		}
+		claimName := ""
+		for _, v := range j.Spec.Template.Spec.Volumes {
+			if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
+				claimName = v.PersistentVolumeClaim.ClaimName
+			}
+		}
+		if claimName == "" {
+			for _, pvc := range claims {
+				if pvc.Spec.VolumeName == pvName {
+					claimName = pvc.Name
+					break
+				}
+			}
+		}
+		if claimName == "" {
+			claimName = "job-claim-" + j.Name
+		}
+		if claims[claimName] == nil {
+			claims[claimName] = &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: j.Namespace, Name: claimName},
+				Spec: corev1.PersistentVolumeClaimSpec{VolumeName: pvName}}
+			objs = append(objs, claims[claimName])
+		}
+		if volumes[pvName] == nil {
+			volumes[pvName] = &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: pvName}}
+			objs = append(objs, volumes[pvName])
+		}
+		pv := volumes[pvName]
+		if pv.Annotations == nil {
+			pv.Annotations = map[string]string{}
+		}
+		if pv.Annotations[wsnapv1.AnnotationWorkspaceRef] == "" && j.Labels[wsnapv1.LabelJobWorkspace] != "" {
+			pv.Annotations[wsnapv1.AnnotationWorkspaceRef] = j.Namespace + "/" + j.Labels[wsnapv1.LabelJobWorkspace]
+		}
+		v := corev1.Volume{Name: "workspace", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName}}}
+		found := false
+		for _, existing := range j.Spec.Template.Spec.Volumes {
+			found = found || existing.Name == "workspace"
+		}
+		if !found {
+			j.Spec.Template.Spec.Volumes = append(j.Spec.Template.Spec.Volumes, v)
+		}
+		for _, other := range objs {
+			p, ok := other.(*corev1.Pod)
+			if !ok || metav1.GetControllerOf(p) == nil || metav1.GetControllerOf(p).UID != j.UID {
+				continue
+			}
+			found := false
+			for _, existing := range p.Spec.Volumes {
+				found = found || existing.Name == "workspace"
+			}
+			if !found {
+				p.Spec.Volumes = append(p.Spec.Volumes, v)
+			}
+		}
+	}
+	for _, pvc := range claims {
+		if pvc.UID == "" {
+			pvc.UID = types.UID("uid-" + pvc.Name)
+		}
+		if pvc.Spec.VolumeName == "" {
+			continue
+		}
+		pv := volumes[pvc.Spec.VolumeName]
+		if pv == nil {
+			pv = &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: pvc.Spec.VolumeName},
+				Spec: corev1.PersistentVolumeSpec{PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete}}
+			volumes[pv.Name] = pv
+			objs = append(objs, pv)
+		}
+		if pv.UID == "" {
+			pv.UID = types.UID("uid-" + pv.Name)
+		}
+		if pv.Spec.ClaimRef == nil {
+			pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: pvc.Namespace, Name: pvc.Name, UID: pvc.UID}
+		} else if pv.Spec.ClaimRef.Namespace == pvc.Namespace && pv.Spec.ClaimRef.Name == pvc.Name && pv.Spec.ClaimRef.UID == "" {
+			pv.Spec.ClaimRef.UID = pvc.UID
+		}
+	}
+	for _, o := range objs {
+		j, ok := o.(*batchv1.Job)
+		if !ok || (j.Labels[wsnapv1.LabelJob] != "mover" && j.Labels[wsnapv1.LabelJob] != "restorer") {
+			continue
+		}
+		for _, v := range j.Spec.Template.Spec.Volumes {
+			if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
+				j.Annotations[workspace.AnnotationClaimUID] = string(claims[v.PersistentVolumeClaim.ClaimName].UID)
+				j.Annotations[workspace.AnnotationPVUID] = string(volumes[j.Annotations[wsnapv1.AnnotationVolumeName]].UID)
+			}
+		}
+	}
+	for _, o := range objs {
+		ws, ok := o.(*wsnapv1.Workspace)
+		if !ok {
+			continue
+		}
+		for i := range ws.Status.Jobs {
+			for _, other := range objs {
+				j, ok := other.(*batchv1.Job)
+				if ok && ws.Status.Jobs[i].UID == string(j.UID) {
+					ws.Status.Jobs[i] = workspace.JobRef(j)
+				}
+			}
+		}
+	}
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = wsnapv1.AddToScheme(scheme)
@@ -233,6 +383,31 @@ func TestJobRoles(t *testing.T) {
 	}
 	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMaintenance}); rec.Code != 403 {
 		t.Errorf("mover pod got maintenance: %d", rec.Code)
+	}
+	// Replacing the mounted claim under the same name invalidates the
+	// registered Job's credential, even though its template still matches.
+	claimName := job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName
+	var mounted corev1.PersistentVolumeClaim
+	if err := e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: claimName}, &mounted); err != nil {
+		t.Fatal(err)
+	}
+	mounted.UID = "replacement-claim"
+	if err := e.client.Update(context.Background(), &mounted); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != http.StatusForbidden {
+		t.Fatalf("replacement claim got a mover credential: %d %s", rec.Code, rec.Body.String())
+	}
+	var edited batchv1.Job
+	if err := e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: job.Name}, &edited); err != nil {
+		t.Fatal(err)
+	}
+	edited.Annotations[workspace.AnnotationClaimUID] = string(mounted.UID)
+	if err := e.client.Update(context.Background(), &edited); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != http.StatusForbidden {
+		t.Fatalf("edited Job annotation bypassed the status registration: %d %s", rec.Code, rec.Body.String())
 	}
 
 	// A user-made Job that copies the labels but lacks managed-by.
@@ -660,7 +835,7 @@ func TestWritersWaitForAJobOnTheirVolume(t *testing.T) {
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	_ = e.client.Status().Update(context.Background(), job)
 	if rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
-		t.Fatalf("writer got %d after the job finished", rec.Code)
+		t.Fatalf("writer got %d after the job finished: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -854,7 +1029,12 @@ func TestWriterEpochs(t *testing.T) {
 	if err := e.client.Delete(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "w1"}}); err != nil {
 		t.Fatal(err)
 	}
-	for _, o := range []client.Object{workloadPod("w2", "u2", "ws1"), claim("w2", "pv-2"), vol("pv-2")} {
+	pvc2 := claim("w2", "pv-2").(*corev1.PersistentVolumeClaim)
+	pvc2.UID = "uid-data-w2"
+	pv2 := vol("pv-2").(*corev1.PersistentVolume)
+	pv2.UID = "uid-pv-2"
+	pv2.Spec.ClaimRef = &corev1.ObjectReference{Namespace: ns, Name: pvc2.Name, UID: pvc2.UID}
+	for _, o := range []client.Object{workloadPod("w2", "u2", "ws1"), pvc2, pv2} {
 		if err := e.client.Create(context.Background(), o); err != nil {
 			t.Fatal(err)
 		}

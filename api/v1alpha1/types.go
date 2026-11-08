@@ -316,9 +316,15 @@ type VolumeRef struct {
 	// claimName is empty for emptyDir workspaces.
 	// +optional
 	ClaimName string `json:"claimName,omitempty"`
+	// claimUID prevents a deleted claim's replacement from inheriting its identity.
+	// +optional
+	ClaimUID string `json:"claimUID,omitempty"`
 	// volumeName is the bound PersistentVolume.
 	// +optional
 	VolumeName string `json:"volumeName,omitempty"`
+	// volumeUID prevents a replacement PV with the same name from being trusted.
+	// +optional
+	VolumeUID string `json:"volumeUID,omitempty"`
 	// kind is persistentVolumeClaim, ephemeral or emptyDir.
 	Kind string `json:"kind"`
 }
@@ -328,6 +334,16 @@ type JobRef struct {
 	Name string `json:"name"`
 	UID  string `json:"uid"`
 	Kind string `json:"kind"`
+	// The volume identity a mover or restorer was created to use. Empty for
+	// maintenance Jobs, which do not mount a workspace PVC.
+	// +optional
+	ClaimName string `json:"claimName,omitempty"`
+	// +optional
+	ClaimUID string `json:"claimUID,omitempty"`
+	// +optional
+	VolumeName string `json:"volumeName,omitempty"`
+	// +optional
+	VolumeUID string `json:"volumeUID,omitempty"`
 }
 
 // PodRef identifies one Pod incarnation.

@@ -1,0 +1,54 @@
+# Example for the agents namespace. Replace wsnap-safe with a StorageClass
+# whose provisioner, encryption, topology, and reclaim behavior you reviewed.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: wsnap-storage
+  namespace: agents
+spec:
+  limits:
+    - type: PersistentVolumeClaim
+      min:
+        storage: 1Gi
+      max:
+        storage: 10Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: wsnap-storage
+  namespace: agents
+spec:
+  hard:
+    persistentvolumeclaims: "20"
+    requests.storage: 100Gi
+---
+# Bind this cluster-scoped admission policy only to namespaces explicitly
+# labeled wsnap.dev/storage-policy=safe. A PVC must select the reviewed class.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: wsnap-storage-class.wsnap.dev
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["persistentvolumeclaims"]
+  validations:
+    - expression: "has(object.spec.storageClassName) && object.spec.storageClassName == 'wsnap-safe'"
+      message: "PVCs in this namespace must use the reviewed wsnap-safe StorageClass"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: wsnap-storage-class.wsnap.dev
+spec:
+  policyName: wsnap-storage-class.wsnap.dev
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        wsnap.dev/storage-policy: safe

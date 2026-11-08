@@ -37,6 +37,43 @@ to the release instead; it pins both image tags.
 The sample volume needs a StorageClass. Check yours with
 `kubectl get storageclass` before creating a Pod.
 
+### Safe PVC provisioning
+
+Pick a StorageClass whose CSI driver, encryption, topology, and reclaim
+policy meet your requirements. Use `WaitForFirstConsumer` for topology-bound
+storage; Kubernetes waits for a Pod's scheduling decision before provisioning.
+Give each workspace Pod or Sandbox an explicit class and storage request.
+wsnap does not create its primary PVC. Its temporary rescue PVC pins
+`volumeName` to the already released PV and uses that PV's class, access
+modes, volume mode, and capacity. A rescue needs room in the namespace quota
+for one extra PVC and its requested capacity until it finishes.
+
+An administrator can apply the example policy after adapting its namespace,
+class, and limits:
+
+```sh
+kubectl apply -f config/samples/storage-policy.yaml
+kubectl label namespace agents wsnap.dev/storage-policy=safe
+```
+
+The `LimitRange` caps each claim; the `ResourceQuota` caps total requested
+storage and claim count. The `ValidatingAdmissionPolicy` enforces the
+reviewed StorageClass in labeled namespaces. Install the policy before
+labeling a namespace, and make its class match the PVs wsnap may rescue.
+Only cluster administrators should edit the policy or namespace label.
+Before enabling it on an existing namespace, check all of its PVCs and
+workload templates for a class mismatch.
+
+wsnap records the PVC and PV UIDs in `Workspace.status.volume`. On an
+upgrade, an idle workspace whose status lacks these fields cannot start an
+idle request Job: start a Pod on the existing claim first so wsnap can
+verify its live binding and record the identities. A name reused for a new
+PVC or PV never inherits the old status record.
+Drain in-flight mover and restorer Jobs before this upgrade: older Job
+registrations lack the volume identity and will be refused credentials.
+Keep any affected PV retained, inspect the Job and claim, then use the
+documented rescue retry procedure after the upgrade.
+
 `wsnap-controller --version` and `wsnap-agent version` print the build.
 
 This installs the CRDs, the controller (2 replicas, leader election, PDB),
