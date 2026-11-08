@@ -90,3 +90,16 @@ func TestWorkerModeRefusesReadWriteOncePodClaims(t *testing.T) {
 		t.Errorf("a claim created after the Pod was refused: %s", r.Result.Message)
 	}
 }
+
+func TestWorkerModeReplacesABroughtGate(t *testing.T) {
+	p := pvcPod("data")
+	p.Spec.InitContainers = []corev1.Container{{Name: "wsnap-gate", Image: "busybox", Command: []string{"true"}}}
+	wcfg := cfg
+	wcfg.ExecutionMode = wsnapv1.ExecutionWorker
+	if err := Mutate(p, wcfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Spec.InitContainers) != 1 || p.Spec.InitContainers[0].Image != cfg.AgentImage || p.Spec.InitContainers[0].Command != nil {
+		t.Fatalf("a gate the Pod brought was kept: %+v", p.Spec.InitContainers)
+	}
+}

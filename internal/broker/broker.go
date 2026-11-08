@@ -126,6 +126,9 @@ type caller struct {
 	// that Pod is gone; the Job can still take and report its final snapshot.
 	workloadPod *corev1.Pod
 	workerEpoch int64
+	// workerRef is a worker Job's registration; its target fields, not the
+	// Job's editable annotations, name the workload.
+	workerRef wsnapv1.JobRef
 }
 
 func (s *Server) resolve(r *http.Request) (*caller, error) {
@@ -329,7 +332,7 @@ func (s *Server) resolveWorkerTarget(ctx context.Context, c *caller, ref wsnapv1
 		ref.VolumeName == "" || ref.VolumeUID == "" {
 		return fail(http.StatusForbidden, "worker job %s lacks a complete target and volume identity", j.Name)
 	}
-	c.workerEpoch = ref.WriterEpoch
+	c.workerEpoch, c.workerRef = ref.WriterEpoch, ref
 	var target corev1.Pod
 	err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: ref.TargetPodName}, &target)
 	if apierrors.IsNotFound(err) || (err == nil && string(target.UID) != ref.TargetPodUID) {
@@ -366,11 +369,28 @@ func (s *Server) handleWorkerState(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, fail(http.StatusForbidden, "only a worker job may read worker state"))
 		return
 	}
-	stop := c.workloadPod == nil || c.workloadPod.Status.Phase == corev1.PodSucceeded || c.workloadPod.Status.Phase == corev1.PodFailed
+	// Gone is not stopped: a force-deleted Pod's object disappears while
+	// the kubelet still runs its containers for up to their grace period.
+	// The worker waits that long before it marks a snapshot final.
+	gone := c.workloadPod == nil
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
-		Stop bool `json:"stop"`
-	}{Stop: stop})
+	_ = json.NewEncoder(w).Encode(protocol.WorkerState{Stop: gone || workloadStopped(c.workloadPod), Gone: gone})
+}
+
+// workloadStopped reports whether every workload container has exited.
+func workloadStopped(p *corev1.Pod) bool {
+	if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+		return true
+	}
+	if p.DeletionTimestamp == nil || len(p.Status.ContainerStatuses) < len(p.Spec.Containers) {
+		return false
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.State.Terminated == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // sameAgentSpec checks that a Pod runs its Job's template where it
@@ -1165,7 +1185,7 @@ func (s *Server) report(r *http.Request) error {
 	}
 	podRef := &wsnapv1.PodRef{Name: c.pod.Name, UID: string(c.pod.UID)}
 	if c.job == "worker" {
-		podRef = &wsnapv1.PodRef{Name: c.jobObj.Annotations[wsnapv1.AnnotationTargetPodName], UID: c.jobObj.Annotations[wsnapv1.AnnotationTargetPodUID]}
+		podRef = &wsnapv1.PodRef{Name: c.workerRef.TargetPodName, UID: c.workerRef.TargetPodUID}
 	}
 	now := metav1.Now()
 	switch {
@@ -1318,6 +1338,9 @@ func (s *Server) markFinal(ctx context.Context, c *caller, volumeName string) er
 		// The writer recorded when the Job was created: the Job's snapshot
 		// holds that writer's data and nothing written after.
 		uid = c.jobObj.Annotations[workspace.AnnotationWriterPod]
+		if c.job == "worker" {
+			uid = c.workerRef.TargetPodUID // the annotation is editable
+		}
 		if uid == "" {
 			uid = "mover"
 		}
