@@ -5,13 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"golang.org/x/time/rate"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
