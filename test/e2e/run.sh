@@ -1011,7 +1011,8 @@ EOF
 }
 worker_job_of() { kubectl -n "$NS" get jobs -l "wsnap.dev/job=worker,wsnap.dev/job-workspace=$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
 worker_pod_node() { kubectl -n "$NS" get pods -l "wsnap.dev/job=worker,wsnap.dev/job-workspace=$1" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null; }
-job_complete() { [[ $(kubectl -n "$NS" get job "$1" -o jsonpath='{.status.succeeded}' 2>/dev/null) == 1 ]]; }
+# A worker Job has TTL 0: once it succeeds, Kubernetes deletes it.
+job_succeeded_or_gone() { [[ $(kubectl -n "$NS" get job "$1" -o jsonpath='{.status.succeeded}' 2>/dev/null) == 1 ]] || not_found -n "$NS" job "$1"; }
 
 scenario_worker() {
 	log "worker: live snapshots from a separate Pod that shares the PVC"
@@ -1040,7 +1041,7 @@ scenario_worker() {
 	# workload and include this write.
 	write_file wk-1 /workspace/live.txt last-write
 	kubectl -n "$NS" delete pod wk-1 --wait=true >/dev/null
-	wait_for 120 "worker Job finished" job_complete "$job"
+	wait_for 120 "worker Job finished" job_succeeded_or_gone "$job"
 	[[ $(ws_field ws-wk .status.lastSnapshot.final) == true && $(ws_field ws-wk .status.lastSnapshot.executor) == worker ]] ||
 		die "no final snapshot by the worker: $(ws_field ws-wk .status.lastSnapshot)"
 	pass "the workload stopped; the worker took the final snapshot, then finished"
