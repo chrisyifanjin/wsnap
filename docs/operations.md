@@ -238,6 +238,7 @@ The webhook adds the sidecar. Optional annotations:
 | `wsnap.dev/quiesce-timeout` | Ask the agent to pause before each snapshot (see below). |
 | `wsnap.dev/final-timeout` | Time limit for the final snapshot. Default `50s`. |
 | `wsnap.dev/workload-grace` | Time the workload takes to exit after SIGTERM. Default `30s`. The webhook sets the grace period to this plus the final timeout plus 10 s. |
+| `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 **The workload must exit on SIGTERM.** Kubernetes stops the sidecar only
 after the workload containers exit. A workload that ignores SIGTERM (for
@@ -246,7 +247,6 @@ for) uses up the whole grace period, and the sidecar gets 2 seconds for its
 final snapshot. A PVC-backed workspace is then rescued later; an emptyDir
 workspace loses the changes since its last snapshot. Run the workload
 under an init that forwards signals (`tini`, `dumb-init`) or trap TERM.
-| `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 For agent-sandbox, put the labels in `Sandbox.spec.podTemplate.metadata`
 and the volume in `volumeClaimTemplates`, as in
@@ -260,6 +260,45 @@ snapshot. With `emptyDir`, wsnap can take a final
 snapshot during a normal stop, but it cannot rescue data after the Pod
 disappears. If the underlying disk is lost, any volume type can restore
 only the last completed snapshot.
+
+### Worker mode: snapshots from a separate Pod
+
+By default the agent runs as a sidecar in the workload Pod. In worker
+mode, it runs in a separate Pod instead, so the workload Pod holds no
+wsnap container and no wsnap token. Create the Workspace before the
+first workload Pod:
+
+```yaml
+apiVersion: wsnap.dev/v1alpha1
+kind: Workspace
+metadata: {name: user-42-project-x, namespace: agents}
+spec:
+  repositoryName: default
+  execution: {mode: worker}
+```
+
+Then label the workload Pod as usual. What happens:
+
+1. The webhook adds a gate init container (`wsnap-gate`) to the workload
+   Pod. It has no credentials; it waits for a marker file on the volume.
+2. When the Pod is scheduled, the controller creates a worker Job on the
+   same node that mounts the same PVC.
+3. The worker restores the workspace, writes the marker, and the gate
+   lets the workload start.
+4. The worker snapshots while the workload runs and serves requests.
+5. When the workload Pod stops, the worker takes the final snapshot and
+   finishes. If the worker gets SIGTERM first (a drain), it waits up to
+   half its final timeout for the workload to stop.
+
+Limits:
+
+- The workspace volume must be a PVC or a generic ephemeral PVC that
+  two Pods on one node can mount (`ReadWriteOnce` or `ReadWriteMany`). The
+  webhook refuses `emptyDir` and `ReadWriteOncePod`.
+- The mode cannot change after the Workspace exists. A Workspace that the
+  controller created for a Pod uses sidecar mode.
+- The workload starts only after its worker is scheduled and has
+  restored. If the controller is down, the workload waits at the gate.
 
 ### Quiesce handshake
 

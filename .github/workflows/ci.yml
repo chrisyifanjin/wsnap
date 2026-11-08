@@ -39,7 +39,7 @@ jobs:
         run: make install-manifest VERSION=v0.0.0-ci && rm install.yaml
 
   e2e:
-    # Three groups of scenarios that share no state, each on its own
+    # Groups of scenarios that share no state, each on its own
     # three-node cluster. test/e2e/run.sh defines the groups.
     name: e2e (${{ matrix.group }})
     runs-on: ubuntu-latest
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [controlplane, volumes, failures]
+        group: [controlplane, volumes, failures, worker]
     steps:
       - uses: actions/checkout@v7
       - name: Install kind and kubectl

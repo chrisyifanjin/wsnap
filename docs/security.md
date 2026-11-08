@@ -57,7 +57,7 @@ sequenceDiagram
 | Role | Granted to | Storage permission |
 |---|---|---|
 | `restore` | a workspace Pod before any workload container started; after that, only for a `WorkspaceRestore` this Pod claimed | read |
-| `snapshot` | the writer Pod of the workspace | read, write; delete only engine scratch objects |
+| `snapshot` | the writer Pod of the workspace; in worker mode, its registered worker Job | read, write; delete only engine scratch objects |
 | `mover` | Pods of wsnap mover and restorer Jobs | as `snapshot` |
 | `maintenance` | Pods of wsnap maintenance Jobs | read, write, delete |
 
@@ -73,6 +73,12 @@ serves a Job Pod only when all of these are true:
    arguments, environment, mounts, security context), and every template
    volume is unchanged. Containers that an admission webhook adds (a
    service mesh proxy) are allowed if they cannot read the token.
+
+In worker mode the workload Pod has no wsnap token at all, and the broker
+refuses it any credential. The worker Job is served only while its
+workload Pod (name and UID), node, and PVC/PV UIDs match the record in
+Workspace status. The gate container in the workload Pod has no
+credential; it only reads a marker file.
 
 Engine scratch objects:
 

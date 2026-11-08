@@ -14,12 +14,13 @@
 #   multinode  (needs 2+ workers) cross-node restore; the mover follows a node-local PV; drain takes a final snapshot
 #   webhook    sidecar injection into bare Pods and Sandboxes; unsafe Pods refused; fail closed while down
 #   gateway    REST gateway API gated by RBAC; data-plane request through the agent-sandbox router and sandboxd
+#   worker     worker mode: live snapshots from a separate Pod on the same node and PVC; RWOP claims refused
 #
 # The harness writes files through "kubectl exec" only to play the agent;
 # wsnap itself never uses exec.
 # Usage: test/e2e/run.sh [setup] [scenario|group...]
 #
-# The groups split the scenarios into three sets of about equal length that
+# The groups split the scenarios into sets of about equal length that
 # share no state, so CI runs each set on its own cluster in parallel.
 # Without arguments, every group runs in order on one cluster.
 # SKIP_IMAGE_BUILD=1 makes setup load images that are already built.
@@ -945,6 +946,7 @@ group() {
 	controlplane) echo webhook gateway tls multinode ;;
 	volumes) echo pvc ephemeral sandbox emptydir singlewriter requests ;;
 	failures) echo chaos ;;
+	worker) echo worker ;;
 	esac
 }
 
@@ -971,9 +973,83 @@ diagnose() {
 	done
 }
 
+worker_pod() { # name workspace claim
+	kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $1
+  namespace: $NS
+  labels: {wsnap.dev/workspace: $2, wsnap.dev/repository: restic-s3}
+spec:
+  containers:
+  - name: agent
+    image: alpine:3.22
+    command: [sh, -c, 'trap "exit 0" TERM; sleep infinity & wait']
+    volumeMounts: [{name: workspace, mountPath: /workspace}]
+  volumes:
+  - name: workspace
+    persistentVolumeClaim: {claimName: $3}
+EOF
+}
+worker_job_of() { kubectl -n "$NS" get jobs -l "wsnap.dev/job=worker,wsnap.dev/job-workspace=$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
+worker_pod_node() { kubectl -n "$NS" get pods -l "wsnap.dev/job=worker,wsnap.dev/job-workspace=$1" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null; }
+job_complete() { [[ $(kubectl -n "$NS" get job "$1" -o jsonpath='{.status.succeeded}' 2>/dev/null) == 1 ]]; }
+
+scenario_worker() {
+	log "worker: live snapshots from a separate Pod that shares the PVC"
+	kubectl -n "$NS" delete pod wk-1 wk-2 wk-rwop --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc wk-a wk-b wk-rwop --ignore-not-found --wait=true >/dev/null
+	fresh_workspace ws-wk
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: Workspace\nmetadata: {name: ws-wk, namespace: %s}\nspec: {repositoryName: restic-s3, execution: {mode: worker}}\n' "$NS" | kubectl apply -f - >/dev/null
+	apply_pvc wk-a >/dev/null
+	worker_pod wk-1 ws-wk wk-a >/dev/null
+	wait_for 180 "wk-1 ready" pod_ready wk-1
+	local inits; inits=$(kubectl -n "$NS" get pod wk-1 -o jsonpath='{.spec.initContainers[*].name}')
+	[[ $inits == wsnap-gate ]] || die "worker-mode Pod has init containers '$inits'; want only the gate"
+	kubectl -n "$NS" get pod wk-1 -o jsonpath='{.spec.volumes[*].projected}' | grep -q wsnap && die "worker-mode workload got a wsnap token"
+	local job; job=$(worker_job_of ws-wk)
+	[[ -n $job ]] || die "no worker Job"
+	[[ $(worker_pod_node ws-wk) == $(kubectl -n "$NS" get pod wk-1 -o jsonpath='{.spec.nodeName}') ]] || die "worker Pod not on the workload's node"
+	pass "workload Pod has only a credential-free gate; worker Job $job runs on its node"
+
+	write_file wk-1 /workspace/live.txt from-the-workload
+	apply_request wssnap wk-live ws-wk >/dev/null
+	wait_for 90 "live snapshot by the worker" req_is wssnap wk-live Succeeded
+	[[ $(req_field wssnap wk-live .status.executor) == worker ]] || die "live request not served by the worker"
+	pass "WorkspaceSnapshot on a live workload: the separate worker took $(req_field wssnap wk-live .status.snapshotID)"
+
+	# Write, then stop at once: the final snapshot must wait for the
+	# workload and include this write.
+	write_file wk-1 /workspace/live.txt last-write
+	kubectl -n "$NS" delete pod wk-1 --wait=true >/dev/null
+	wait_for 120 "worker Job finished" job_complete "$job"
+	[[ $(ws_field ws-wk .status.lastSnapshot.final) == true && $(ws_field ws-wk .status.lastSnapshot.executor) == worker ]] ||
+		die "no final snapshot by the worker: $(ws_field ws-wk .status.lastSnapshot)"
+	pass "the workload stopped; the worker took the final snapshot, then finished"
+
+	apply_pvc wk-b >/dev/null
+	worker_pod wk-2 ws-wk wk-b >/dev/null
+	wait_for 180 "wk-2 ready" pod_ready wk-2
+	[[ $(read_file wk-2 /workspace/live.txt) == last-write ]] || die "cold restore by a worker returned $(read_file wk-2 /workspace/live.txt)"
+	pass "a new workload on a new PVC got the last write: its worker restored before the gate opened"
+	kubectl -n "$NS" delete pod wk-2 --wait=true >/dev/null
+
+	kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: wk-rwop, namespace: $NS}
+spec: {accessModes: [ReadWriteOncePod], resources: {requests: {storage: 1Gi}}}
+EOF
+	local out; out=$(worker_pod wk-rwop ws-wk wk-rwop 2>&1 || true)
+	[[ $out == *ReadWriteOncePod* ]] || die "a ReadWriteOncePod claim was admitted in worker mode: $out"
+	pass "a ReadWriteOncePod claim is refused at admission: no worker could mount it"
+	kubectl -n "$NS" delete pvc wk-a wk-b wk-rwop --wait=false >/dev/null
+}
+
 main() {
 	local steps=() s g
-	(($#)) || set -- setup controlplane volumes failures
+	(($#)) || set -- setup controlplane volumes failures worker
 	for s in "$@"; do
 		if [[ -n $(group "$s") ]]; then
 			read -ra g <<<"$(group "$s")"

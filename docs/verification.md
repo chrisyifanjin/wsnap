@@ -65,16 +65,18 @@ multi-node scenario: `kind create cluster --name wsnap --config test/e2e/kind-mu
 | `chaos` | Controller stopped while a Pod dies, leader killed during a rescue, storage stopped and started, sidecar killed with SIGKILL, a crash with an immediate replacement Pod. |
 | `tls` | The broker over HTTPS: sidecars and Jobs verify its CA; an untrusted CA and plain HTTP are refused. |
 | `multinode` | Restore on another node, a mover that follows a node-local PV, a drain that takes a final snapshot. |
+| `worker` | Worker mode: the workload Pod gets only a gate; a worker on its node serves a live request, takes the final snapshot with the last write after the workload stops, and restores a new workload on a new PVC. A `ReadWriteOncePod` claim is refused. |
 
-The scenarios form three groups that share no state:
+The scenarios form four groups that share no state:
 
 | Group | Scenarios |
 |---|---|
 | `controlplane` | `webhook`, `gateway`, `tls`, `multinode` |
 | `volumes` | `pvc`, `ephemeral`, `sandbox`, `emptydir`, `singlewriter`, `requests` |
 | `failures` | `chaos` |
+| `worker` | `worker` |
 
-`test/e2e/run.sh` with no arguments runs `setup` and then all three groups
+`test/e2e/run.sh` with no arguments runs `setup` and then all four groups
 on one cluster. `test/e2e/run.sh setup volumes` runs one group. CI runs
 each group on its own cluster at the same time. When a run fails, the
 script prints the Pods, volumes, wsnap objects, events and logs, and CI
