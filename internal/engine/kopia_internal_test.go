@@ -27,7 +27,7 @@ func TestKopiaCachePerRepository(t *testing.T) {
 	if cacheOf("ns/child") == cacheOf("ns/parent") {
 		t.Error("two repositories share one cache")
 	}
-	if cacheOf("ns/child") != cacheOf("ns/child") {
+	if first, again := cacheOf("ns/child"), cacheOf("ns/child"); first != again {
 		t.Error("the cache of one repository is not stable")
 	}
 }

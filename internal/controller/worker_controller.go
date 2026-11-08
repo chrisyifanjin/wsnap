@@ -104,7 +104,7 @@ func (r *WorkerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 	grace := workloadGrace(&pod)
-	job := r.Jobs.newAgentJob("worker", name, &ws, &repo,
+	job := r.Jobs.newAgentJob(wsnapv1.JobWorker, name, &ws, &repo,
 		[]string{"worker", "--dir=" + dataMountPath, "--pod-uid=" + string(pod.UID),
 			"--final-timeout=" + workerFinalTimeout.String(), "--workload-grace=" + grace.String()},
 		[]corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
@@ -161,7 +161,7 @@ func (r *WorkerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).Named("workspace-worker").
 		For(&corev1.Pod{}, builder.WithPredicates(podRelevant)).
 		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
-			if o.GetLabels()[wsnapv1.LabelJob] != "worker" {
+			if o.GetLabels()[wsnapv1.LabelJob] != wsnapv1.JobWorker {
 				return nil
 			}
 			name := o.GetAnnotations()[wsnapv1.AnnotationTargetPodName]
