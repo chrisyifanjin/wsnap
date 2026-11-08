@@ -23,17 +23,6 @@ import (
 	"github.com/chrisyifanjin/wsnap/internal/workspace"
 )
 
-// Rescue phases stored in the wsnap.dev/rescue annotation of a PV.
-const (
-	RescueRunning = "running"
-	RescueDone    = "done"
-	RescueFailed  = "failed"
-	// RescueSkipped was set by earlier versions when a newer writer
-	// existed. Writer epochs made the skip unnecessary; such PVs are still
-	// left for an operator.
-	RescueSkipped = "skipped-newer-writer"
-)
-
 // PVReconciler handles protected PVs after their claim is deleted.
 //
 // Deleting a Sandbox, or a Pod with a generic ephemeral volume, deletes the
@@ -64,14 +53,14 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 		return ctrl.Result{}, nil
 	}
 	phase := pv.Annotations[wsnapv1.AnnotationRescue]
-	// RescueSkipped is only set by earlier versions.
-	if phase == RescueFailed || phase == RescueSkipped {
+	// wsnapv1.RescueSkippedNewerWriter is only set by earlier versions.
+	if phase == wsnapv1.RescueFailed || phase == wsnapv1.RescueSkippedNewerWriter {
 		return ctrl.Result{}, nil // kept for an operator; never retried on its own
 	}
 	// A PV bound to its rescue claim is mid-rescue whatever the annotation
 	// says, so a lost annotation update cannot strand it.
 	boundToRescue := pv.Spec.ClaimRef != nil && pv.Spec.ClaimRef.Name == rescueClaimName(pv.Name) && pv.Spec.ClaimRef.Namespace == ns
-	if phase == RescueRunning || (boundToRescue && phase != RescueDone) {
+	if phase == wsnapv1.RescueRunning || (boundToRescue && phase != wsnapv1.RescueDone) {
 		// An empty phase on a PV bound to its rescue claim: an operator
 		// removed "failed" to retry (or an annotation update was lost).
 		return r.checkRescue(ctx, &pv, ns, name, phase == "")
@@ -79,12 +68,11 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	if pv.Status.Phase != corev1.VolumeReleased {
 		return ctrl.Result{}, nil
 	}
-	if phase == RescueDone {
+	if phase == wsnapv1.RescueDone {
 		return ctrl.Result{}, r.reclaim(ctx, &pv)
 	}
 
-	writer := pv.Annotations[workspace.AnnotationWriterPod]
-	if writer != "" && writer == pv.Annotations[workspace.AnnotationFinalPod] {
+	if workspace.HasFinalSnapshot(pv.Annotations) {
 		logger.Info("released volume has a final snapshot; reclaiming", "pv", pv.Name)
 		return ctrl.Result{}, r.reclaim(ctx, &pv)
 	}
@@ -178,8 +166,8 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 			cur.Spec.ClaimRef = &corev1.ObjectReference{Kind: "PersistentVolumeClaim", APIVersion: "v1", Namespace: ws.Namespace, Name: claimName, UID: actual.UID}
 			changed = true
 		}
-		if cur.Annotations[wsnapv1.AnnotationRescue] != RescueRunning {
-			cur.Annotations[wsnapv1.AnnotationRescue] = RescueRunning
+		if cur.Annotations[wsnapv1.AnnotationRescue] != wsnapv1.RescueRunning {
+			cur.Annotations[wsnapv1.AnnotationRescue] = wsnapv1.RescueRunning
 			changed = true
 		}
 		if !changed {
@@ -251,16 +239,16 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 				return r.restartRescue(ctx, pv, &job)
 			}
 			if cur.Annotations[workspace.AnnotationFinalPod] != want {
-				r.Recorder.Eventf(pv, nil, corev1.EventTypeWarning, "RescueFailed", "Rescue",
+				r.Recorder.Eventf(pv, nil, corev1.EventTypeWarning, "wsnapv1.RescueFailed", "Rescue",
 					"mover job %s/%s completed, but the broker recorded no final snapshot of this volume; keeping it", ns, job.Name)
-				return ctrl.Result{}, r.setRescue(ctx, &cur, RescueFailed)
+				return ctrl.Result{}, r.setRescue(ctx, &cur, wsnapv1.RescueFailed)
 			}
 			log.FromContext(ctx).Info("rescue finished", "pv", pv.Name, "job", job.Name)
-			if err := r.setRescue(ctx, &cur, RescueDone); err != nil {
+			if err := r.setRescue(ctx, &cur, wsnapv1.RescueDone); err != nil {
 				return ctrl.Result{}, err
 			}
 			// Deleting the rescue claim releases the PV again; the next
-			// reconcile sees RescueDone and reclaims it.
+			// reconcile sees wsnapv1.RescueDone and reclaims it.
 			bg := metav1.DeletePropagationBackground
 			if err := r.Delete(ctx, &job, &client.DeleteOptions{PropagationPolicy: &bg}); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, err
@@ -271,8 +259,8 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 			if retry {
 				return r.restartRescue(ctx, pv, &job)
 			}
-			r.Recorder.Eventf(pv, nil, corev1.EventTypeWarning, "RescueFailed", "Rescue", "mover job %s/%s failed; keeping the volume", ns, job.Name)
-			return ctrl.Result{}, r.setRescue(ctx, pv, RescueFailed)
+			r.Recorder.Eventf(pv, nil, corev1.EventTypeWarning, "wsnapv1.RescueFailed", "Rescue", "mover job %s/%s failed; keeping the volume", ns, job.Name)
+			return ctrl.Result{}, r.setRescue(ctx, pv, wsnapv1.RescueFailed)
 		}
 	}
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -286,7 +274,7 @@ func (r *PVReconciler) restartRescue(ctx context.Context, pv *corev1.PersistentV
 	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &fg, Preconditions: &metav1.Preconditions{UID: &job.UID}}); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.setRescue(ctx, pv, RescueRunning); err != nil {
+	if err := r.setRescue(ctx, pv, wsnapv1.RescueRunning); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil

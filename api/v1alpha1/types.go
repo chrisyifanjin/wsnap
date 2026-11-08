@@ -41,7 +41,7 @@ const (
 	// to restore once the volume's data is safe.
 	AnnotationOriginalReclaimPolicy = "wsnap.dev/original-reclaim-policy"
 	// AnnotationRescue on a protected PV tracks the rescue of a released
-	// volume. See RescuePhase.
+	// volume: one of the Rescue* phases.
 	AnnotationRescue = "wsnap.dev/rescue"
 	// AnnotationVolumeName on a mover Job names the PV it snapshots. On a
 	// WorkspaceSnapshot it targets that PV instead of the writer's volume
@@ -302,6 +302,30 @@ type RestoreSource struct {
 	// +optional
 	SnapshotID string `json:"snapshotID,omitempty"`
 }
+
+// Rescue phases: the value of AnnotationRescue on a protected PV.
+//
+// A protected PV whose claim is deleted goes to Released with its data
+// intact. If its last writer took a final snapshot, the controller
+// restores the original reclaim policy and Kubernetes reclaims it; no
+// rescue phase is set. Otherwise:
+//
+//	(none) ──▶ running ──▶ done ──▶ reclaimed
+//	              │
+//	              └──▶ failed (kept for an operator; remove the annotation to retry)
+//
+// While a PV is running, or released without a final snapshot and not yet
+// running, the broker makes the workspace's next writer wait, so it cannot
+// restore older data than the rescue will save.
+const (
+	RescueRunning = "running"
+	RescueDone    = "done"
+	RescueFailed  = "failed"
+	// RescueSkippedNewerWriter was set by earlier versions when a newer
+	// writer existed. Writer epochs made the skip unnecessary; such PVs are
+	// still left for an operator.
+	RescueSkippedNewerWriter = "skipped-newer-writer"
+)
 
 // Kinds of Job the controller creates: the value of LabelJob and of
 // JobRef.Kind.

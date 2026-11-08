@@ -12,6 +12,7 @@ nav:
   - Security: security.md
   - API: api.md
   - Verification: verification.md
+  - Engineering standard: engineering.md
 theme:
   name: material
   features:

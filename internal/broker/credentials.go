@@ -44,8 +44,55 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.Role.Valid() {
 		return nil, fail(http.StatusBadRequest, "body must be {\"role\": restore|snapshot|mover|maintenance}")
 	}
-	// A claimed WorkspaceRestore authorizes the restore role in a running
-	// Pod and selects what to restore.
+	restoreReq, err := s.authorizeRole(ctx, c, req)
+	if err != nil {
+		return nil, err
+	}
+	var repo wsnapv1.SnapshotRepository
+	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: c.id.Repository}, &repo); err != nil {
+		return nil, upstream(err, "snapshot repository %s/%s", c.id.Namespace, c.id.Repository)
+	}
+	ws, err := s.admit(ctx, c, req.Role, restoreReq)
+	if err != nil {
+		return nil, err
+	}
+	src, err := s.restoreSource(ctx, c, req.Role, restoreReq, ws, &repo)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.issue(ctx, c, &repo, src.workspace, req.Role)
+	if err != nil {
+		return nil, err
+	}
+	resp.SnapshotID, resp.SourceWorkspace, resp.RestoreFromGeneration = src.snapshotID, src.source, src.generation
+	switch req.Role {
+	case protocol.RoleRestore:
+		if src.snapshotID == "" {
+			// The recorded newest snapshot, of the source for a fork. A
+			// deposed writer can still upload snapshots, but the broker never
+			// records them, so they are never restored.
+			var tws wsnapv1.Workspace
+			if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: src.workspace}, &tws); err != nil {
+				return nil, upstream(err, "workspace %s", src.workspace)
+			}
+			if last := tws.Status.LastSnapshot; last != nil {
+				resp.LatestSnapshotID = last.ID
+			}
+		}
+	case protocol.RoleMaintenance:
+		if resp.KeepIDs, err = s.pinnedSnapshots(ctx, c.id); err != nil {
+			return nil, err
+		}
+	}
+	s.Log.Info("issued credential", "namespace", c.id.Namespace, "workspace", c.id.Name, "role", req.Role,
+		"pod", c.pod.Name, "scoped", resp.Credentials.Scoped, "expires", resp.Credentials.ExpiresAt)
+	return resp, nil
+}
+
+// authorizeRole checks that the caller may have the requested role. A
+// claimed WorkspaceRestore authorizes the restore role in a running Pod
+// and selects what to restore; it is returned for the later steps.
+func (s *Server) authorizeRole(ctx context.Context, c *caller, req protocol.CredentialsRequest) (*wsnapv1.WorkspaceRestore, error) {
 	var restoreReq *wsnapv1.WorkspaceRestore
 	if req.Role == protocol.RoleRestore && req.Request != "" {
 		var err error
@@ -63,108 +110,129 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 			return nil, err
 		}
 	}
-	var repo wsnapv1.SnapshotRepository
-	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: c.id.Repository}, &repo); err != nil {
-		return nil, upstream(err, "snapshot repository %s/%s", c.id.Namespace, c.id.Repository)
-	}
-	var ws *wsnapv1.Workspace
-	if c.job == "" {
-		var err error
-		ws, err = s.ensureWorkspace(ctx, c.id)
+	return restoreReq, nil
+}
+
+// admit applies the writer rules for callers that serve a live workload:
+// a workspace Pod's own sidecar, or a worker Job on behalf of its
+// workload Pod. Other Jobs (mover, restorer, maintenance) were admitted
+// when the controller created them. It returns the Workspace, or nil.
+func (s *Server) admit(ctx context.Context, c *caller, role protocol.Role, restoreReq *wsnapv1.WorkspaceRestore) (*wsnapv1.Workspace, error) {
+	switch c.job {
+	case "":
+		ws, err := s.ensureWorkspace(ctx, c.id)
 		if err != nil {
 			return nil, err
 		}
-		if err := s.checkSingleWriter(ctx, c, ws); err != nil {
-			return nil, err
-		}
-		if req.Role == protocol.RoleRestore && restoreReq == nil {
-			if err := s.checkNoPendingRescue(ctx, c); err != nil {
-				return nil, err
-			}
-		}
-		// Protect the volume before handing out any credential, so data
-		// the Pod writes is never reclaimed without a final snapshot.
-		if err := s.trackVolume(ctx, c, req.Role == protocol.RoleSnapshot); err != nil {
-			return nil, err
-		}
-	} else if c.job == wsnapv1.JobWorker {
-		ws, err = s.ensureWorkspace(ctx, c.id)
+		return ws, s.admitWriter(ctx, c, ws, role, restoreReq)
+	case wsnapv1.JobWorker:
+		ws, err := s.ensureWorkspace(ctx, c.id)
 		if err != nil {
 			return nil, err
 		}
 		if ws.Spec.ExecutionMode() != wsnapv1.ExecutionWorker {
 			return nil, fail(http.StatusForbidden, "workspace %s is not in worker mode", c.id.Name)
 		}
-		if c.workloadPod != nil {
-			if err := workspace.CheckWorkerIsolation(c.workloadPod, s.Audience, s.AllowAutomountedTokens); err != nil {
-				return nil, fail(http.StatusForbidden, "workload Pod %s: %v", c.workloadPod.Name, err)
+		if c.workloadPod == nil {
+			if c.workerEpoch == 0 {
+				return nil, fail(http.StatusConflict, "worker's workload Pod is gone before initialization")
 			}
-			if err := s.checkNoAPIToken(ctx, c.workloadPod); err != nil {
-				return nil, err
-			}
-			workload := *c
-			workload.pod = c.workloadPod
-			if err := s.checkSingleWriter(ctx, &workload, ws); err != nil {
-				return nil, err
-			}
-			if req.Role == protocol.RoleRestore && restoreReq == nil {
-				if err := s.checkNoPendingRescue(ctx, &workload); err != nil {
-					return nil, err
-				}
-			}
-			if err := s.trackVolume(ctx, &workload, req.Role == protocol.RoleSnapshot); err != nil {
-				return nil, err
-			}
-			if err := s.bindWorkerEpoch(ctx, c); err != nil {
-				return nil, err
-			}
-		} else if c.workerEpoch == 0 {
-			return nil, fail(http.StatusConflict, "worker's workload Pod is gone before initialization")
+			return ws, nil // the workload stopped; the worker finishes its final snapshot
+		}
+		if err := workspace.CheckWorkerIsolation(c.workloadPod, s.Audience, s.AllowAutomountedTokens); err != nil {
+			return nil, fail(http.StatusForbidden, "workload Pod %s: %v", c.workloadPod.Name, err)
+		}
+		if err := s.checkNoAPIToken(ctx, c.workloadPod); err != nil {
+			return nil, err
+		}
+		// The writer is the workload Pod, not the worker.
+		workload := *c
+		workload.pod = c.workloadPod
+		if err := s.admitWriter(ctx, &workload, ws, role, restoreReq); err != nil {
+			return nil, err
+		}
+		return ws, s.bindWorkerEpoch(ctx, c)
+	}
+	return nil, nil
+}
+
+// admitWriter is the one place where sidecar and worker modes admit a
+// writer: at most one live writer per workspace; no restore while an
+// older volume of the workspace waits for its rescue; and the volume is
+// protected before any credential is handed out, so data the Pod writes
+// is never reclaimed without a final snapshot.
+func (s *Server) admitWriter(ctx context.Context, writer *caller, ws *wsnapv1.Workspace, role protocol.Role, restoreReq *wsnapv1.WorkspaceRestore) error {
+	if err := s.checkSingleWriter(ctx, writer, ws); err != nil {
+		return err
+	}
+	if role == protocol.RoleRestore && restoreReq == nil {
+		if err := s.checkNoPendingRescue(ctx, writer); err != nil {
+			return err
 		}
 	}
-	// A restore may read another workspace (fork) or a pinned snapshot,
-	// chosen by a WorkspaceRestore or by Workspace.spec.restoreFrom.
-	target := c.id.Name
-	var snapshotID, source string
-	var restoreGen int64
+	return s.trackVolume(ctx, writer, role == protocol.RoleSnapshot)
+}
+
+// restoreTarget is what a credential opens: normally the caller's own
+// workspace, or another workspace's repository for a fork.
+type restoreTarget struct {
+	workspace  string
+	snapshotID string // pinned snapshot; empty means the recorded newest
+	source     string // set for a fork
+	generation int64  // the restoreFrom generation consumed, or 0
+}
+
+// restoreSource picks what a restore reads: a WorkspaceRestore, or
+// Workspace.spec.restoreFrom once per generation. For a fork it replaces
+// repo with the source workspace's repository.
+func (s *Server) restoreSource(ctx context.Context, c *caller, role protocol.Role, restoreReq *wsnapv1.WorkspaceRestore,
+	ws *wsnapv1.Workspace, repo *wsnapv1.SnapshotRepository) (restoreTarget, error) {
+	t := restoreTarget{workspace: c.id.Name}
 	var rf *wsnapv1.RestoreSource
 	switch {
 	case restoreReq != nil:
 		rf = &wsnapv1.RestoreSource{WorkspaceName: restoreReq.Spec.SourceWorkspace, SnapshotID: restoreReq.Spec.SnapshotID}
-	case req.Role == protocol.RoleRestore && ws != nil && ws.Spec.RestoreFrom != nil && ws.Status.RestoreFromGeneration != ws.Generation:
-		rf, restoreGen = ws.Spec.RestoreFrom, ws.Generation
+	case role == protocol.RoleRestore && ws != nil && ws.Spec.RestoreFrom != nil && ws.Status.RestoreFromGeneration != ws.Generation:
+		rf, t.generation = ws.Spec.RestoreFrom, ws.Generation
 	}
-	if rf != nil {
-		snapshotID = rf.SnapshotID
-		if rf.WorkspaceName != "" && rf.WorkspaceName != c.id.Name {
-			var src wsnapv1.Workspace
-			if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: rf.WorkspaceName}, &src); err != nil {
-				return nil, upstream(err, "restoreFrom workspace %s", rf.WorkspaceName)
-			}
-			if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: src.Spec.RepositoryName}, &repo); err != nil {
-				return nil, upstream(err, "repository of workspace %s", rf.WorkspaceName)
-			}
-			target, source = rf.WorkspaceName, rf.WorkspaceName
+	if rf == nil {
+		return t, nil
+	}
+	t.snapshotID = rf.SnapshotID
+	if rf.WorkspaceName != "" && rf.WorkspaceName != c.id.Name {
+		var src wsnapv1.Workspace
+		if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: rf.WorkspaceName}, &src); err != nil {
+			return t, upstream(err, "restoreFrom workspace %s", rf.WorkspaceName)
 		}
+		if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: src.Spec.RepositoryName}, repo); err != nil {
+			return t, upstream(err, "repository of workspace %s", rf.WorkspaceName)
+		}
+		t.workspace, t.source = rf.WorkspaceName, rf.WorkspaceName
 	}
+	return t, nil
+}
+
+// issue asks the repository's provider for a credential scoped to one
+// workspace's repository (target) and one role.
+func (s *Server) issue(ctx context.Context, c *caller, repo *wsnapv1.SnapshotRepository, target string, role protocol.Role) (*protocol.CredentialsResponse, error) {
 	var secret corev1.Secret
 	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: repo.Namespace, Name: repo.Spec.Credentials.SecretName}, &secret); err != nil {
 		return nil, upstream(err, "credentials secret")
 	}
-	backend, err := workspace.Backend(&repo, c.id.Namespace, target)
+	backend, err := workspace.Backend(repo, c.id.Namespace, target)
 	if err != nil {
 		return nil, fail(http.StatusFailedDependency, "%v", err)
 	}
-	provider, err := workspace.Provider(&repo)
+	provider, err := workspace.Provider(repo)
 	if err != nil {
 		return nil, fail(http.StatusFailedDependency, "%v", err)
 	}
-	eng := workspace.Engine(&repo)
+	eng := workspace.Engine(repo)
 	creds, err := provider.Issue(ctx, credentials.Request{
-		Role: req.Role, Namespace: c.id.Namespace, Workspace: target,
+		Role: role, Namespace: c.id.Namespace, Workspace: target,
 		Backend: backend, Secret: secret.Data,
 		WriterDeletePrefixes: engine.WriterDeletePrefixes(eng),
-		TTL:                  workspace.TTL(&repo),
+		TTL:                  workspace.TTL(repo),
 	})
 	if err != nil {
 		// STS, IAM or Azure may be briefly down; agents retry 5xx.
@@ -174,40 +242,15 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 	if err != nil {
 		return nil, fail(http.StatusFailedDependency, "%v", err)
 	}
-	var latestID string
-	var keep []string
-	switch req.Role {
-	case protocol.RoleRestore:
-		if snapshotID == "" {
-			// The recorded newest snapshot, of the source for a fork. A
-			// deposed writer can still upload snapshots, but the broker never
-			// records them, so they are never restored.
-			var tws wsnapv1.Workspace
-			if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: c.id.Namespace, Name: target}, &tws); err != nil {
-				return nil, upstream(err, "workspace %s", target)
-			}
-			if last := tws.Status.LastSnapshot; last != nil {
-				latestID = last.ID
-			}
-		}
-	case protocol.RoleMaintenance:
-		if keep, err = s.pinnedSnapshots(ctx, c.id); err != nil {
-			return nil, err
-		}
-	}
-	s.Log.Info("issued credential", "namespace", c.id.Namespace, "workspace", c.id.Name, "role", req.Role,
-		"pod", c.pod.Name, "scoped", creds.Scoped, "expires", creds.ExpiresAt)
 	return &protocol.CredentialsResponse{
-		Namespace: c.id.Namespace, Workspace: c.id.Name, Role: req.Role,
+		Namespace: c.id.Namespace, Workspace: c.id.Name, Role: role,
 		Engine: eng, Backend: backend, Credentials: creds, RepositoryPassword: password,
-		Interval:  protocol.Duration{Duration: workspace.Interval(&repo)},
-		KeepLast:  workspace.KeepLast(&repo),
-		KeepDaily: workspace.KeepDaily(&repo),
+		Interval:  protocol.Duration{Duration: workspace.Interval(repo)},
+		KeepLast:  workspace.KeepLast(repo),
+		KeepDaily: workspace.KeepDaily(repo),
 		// Only an explicit setting: an unset field must not override the
 		// agent's own --operation-timeout with the default.
 		OperationTimeout: protocol.Duration{Duration: repo.Spec.OperationTimeout.Duration},
-		SnapshotID:       snapshotID, SourceWorkspace: source, RestoreFromGeneration: restoreGen,
-		LatestSnapshotID: latestID, KeepIDs: keep,
 	}, nil
 }
 

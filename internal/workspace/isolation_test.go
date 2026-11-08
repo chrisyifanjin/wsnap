@@ -44,3 +44,20 @@ func TestCheckWorkerIsolation(t *testing.T) {
 		})
 	}
 }
+
+func TestHasFinalSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		writer, final string
+		want          bool
+	}{
+		{"pod-a", "pod-a", true},
+		{"pod-b", "pod-a", false}, // a newer writer after the final snapshot
+		{"", "", false},           // never written by a workspace Pod
+		{"pod-a", "", false},
+	} {
+		a := map[string]string{AnnotationWriterPod: tc.writer, AnnotationFinalPod: tc.final}
+		if got := HasFinalSnapshot(a); got != tc.want {
+			t.Errorf("HasFinalSnapshot(writer %q, final %q) = %v, want %v", tc.writer, tc.final, got, tc.want)
+		}
+	}
+}

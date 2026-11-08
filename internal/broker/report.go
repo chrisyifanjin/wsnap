@@ -100,87 +100,9 @@ func (s *Server) report(r *http.Request) error {
 	}
 	switch rep.Operation {
 	case protocol.OpSnapshot:
-		rec := wsnapv1.SnapshotRecord{ID: rep.SnapshotID, Time: metav1.NewTime(rep.EndTime), Pod: podRef, Final: rep.Final, Executor: wsnapv1.ExecutorSidecar}
-		if c.job == wsnapv1.JobWorker {
-			if c.workerEpoch == 0 {
-				return fail(http.StatusConflict, "worker epoch has not been recorded")
-			}
-			rec.Executor = wsnapv1.ExecutorWorker
-			rec.VolumeName = c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
-			rec.Epoch = c.workerEpoch
-		}
-		if c.job == wsnapv1.JobMover || c.job == wsnapv1.JobRestorer {
-			rec.Executor = wsnapv1.ExecutorMover
-			rec.VolumeName = c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
-			// The Job snapshots the volume's data, whose epoch the
-			// controller recorded from the PV when it created the Job.
-			rec.Epoch = workspace.Epoch(c.jobObj.Annotations)
-		}
-		if c.job == "" {
-			// The reporting Pod's own volume, not status.volume, which may
-			// already describe another Pod.
-			ref, err := workspace.ResolveVolume(ctx, s.Reader, c.pod)
-			if err != nil {
-				return volumeError(err)
-			}
-			rec.VolumeName = ref.VolumeName
-		}
-		superseded := false
-		if err := s.updateStatusChecked(ctx, c.id, func(st *wsnapv1.WorkspaceStatus) error {
-			if c.job == "" {
-				// Checked in the same read as the write: a writer change in
-				// between would otherwise let a deposed writer's snapshot
-				// become the newest.
-				if st.WriterPod == nil || st.WriterPod.UID != string(c.pod.UID) {
-					return fail(http.StatusConflict, "pod %s is not the writer of workspace %s; report refused", c.pod.Name, c.id.Name)
-				}
-				rec.Epoch = st.WriterEpoch
-			}
-			// Restores use lastSnapshot, so it must only move forward: a
-			// rescue of an older writer's volume is kept in the repository
-			// but does not replace a newer writer's snapshot.
-			superseded = st.LastSnapshot != nil && rec.Epoch < st.LastSnapshot.Epoch
-			if !superseded {
-				st.LastSnapshot = &rec
-			} else if !rep.Reused {
-				st.SupersededSnapshots = append(st.SupersededSnapshots, rec)
-				if n := len(st.SupersededSnapshots); n > maxSuperseded {
-					st.SupersededSnapshots = st.SupersededSnapshots[n-maxSuperseded:]
-				}
-			}
-			if !rep.Reused {
-				st.SnapshotsSinceMaintenance++
-			}
-			st.LastError = ""
-			return nil
-		}); err != nil {
-			return err
-		}
-		if superseded {
-			s.Log.Info("snapshot of an older writer epoch kept in status.supersededSnapshots, not as the newest", "workspace", c.id.Name,
-				"snapshot", rep.SnapshotID, "epoch", rec.Epoch)
-		}
-		if rep.Final {
-			if err := s.markFinal(ctx, c, rec.VolumeName); err != nil {
-				return err
-			}
-		}
-		return s.completeRequest(ctx, c, rep.Request, false, rec.Executor, rep.SnapshotID, "")
+		return s.recordSnapshot(ctx, c, rep, podRef)
 	case protocol.OpRestore:
-		executor := wsnapv1.ExecutorSidecar
-		if c.job != "" {
-			executor = c.job
-		}
-		if err := s.completeRequest(ctx, c, rep.Request, true, executor, rep.SnapshotID, ""); err != nil {
-			return err
-		}
-		return s.updateStatus(ctx, c.id, func(st *wsnapv1.WorkspaceStatus) {
-			st.LastRestore = &wsnapv1.RestoreRecord{SnapshotID: rep.SnapshotID, SourceWorkspace: rep.SourceWorkspace, Time: now, Pod: *podRef}
-			if rep.RestoreFromGeneration > st.RestoreFromGeneration {
-				st.RestoreFromGeneration = rep.RestoreFromGeneration
-			}
-			st.LastError = ""
-		})
+		return s.recordRestore(ctx, c, rep, podRef, now)
 	case protocol.OpMaintenance:
 		return s.updateStatus(ctx, c.id, func(st *wsnapv1.WorkspaceStatus) {
 			st.LastMaintenance = &now
@@ -189,6 +111,110 @@ func (s *Server) report(r *http.Request) error {
 		})
 	}
 	return fail(http.StatusBadRequest, "unknown operation %q", rep.Operation)
+}
+
+// snapshotRecord describes a reported snapshot: who took it, of which
+// volume, and in which writer epoch (a sidecar's epoch is filled in from
+// Workspace status, in the same read as the write).
+func (s *Server) snapshotRecord(ctx context.Context, c *caller, rep protocol.Report, podRef *wsnapv1.PodRef) (wsnapv1.SnapshotRecord, error) {
+	rec := wsnapv1.SnapshotRecord{ID: rep.SnapshotID, Time: metav1.NewTime(rep.EndTime), Pod: podRef, Final: rep.Final, Executor: wsnapv1.ExecutorSidecar}
+	switch c.job {
+	case wsnapv1.JobWorker:
+		if c.workerEpoch == 0 {
+			return rec, fail(http.StatusConflict, "worker epoch has not been recorded")
+		}
+		rec.Executor = wsnapv1.ExecutorWorker
+		rec.VolumeName = c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
+		rec.Epoch = c.workerEpoch
+	case wsnapv1.JobMover, wsnapv1.JobRestorer:
+		rec.Executor = wsnapv1.ExecutorMover
+		rec.VolumeName = c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
+		// The Job snapshots the volume's data, whose epoch the controller
+		// recorded from the PV when it created the Job.
+		rec.Epoch = workspace.Epoch(c.jobObj.Annotations)
+	case "":
+		// The reporting Pod's own volume, not status.volume, which may
+		// already describe another Pod.
+		ref, err := workspace.ResolveVolume(ctx, s.Reader, c.pod)
+		if err != nil {
+			return rec, volumeError(err)
+		}
+		rec.VolumeName = ref.VolumeName
+	}
+	return rec, nil
+}
+
+func (s *Server) recordSnapshot(ctx context.Context, c *caller, rep protocol.Report, podRef *wsnapv1.PodRef) error {
+	rec, err := s.snapshotRecord(ctx, c, rep, podRef)
+	if err != nil {
+		return err
+	}
+	superseded := false
+	if err := s.updateStatusChecked(ctx, c.id, func(st *wsnapv1.WorkspaceStatus) error {
+		if c.job == "" {
+			// Checked in the same read as the write: a writer change in
+			// between would otherwise let a deposed writer's snapshot
+			// become the newest.
+			if st.WriterPod == nil || st.WriterPod.UID != string(c.pod.UID) {
+				return fail(http.StatusConflict, "pod %s is not the writer of workspace %s; report refused", c.pod.Name, c.id.Name)
+			}
+			rec.Epoch = st.WriterEpoch
+		}
+		superseded = recordInEpochOrder(st, rec, rep.Reused)
+		if !rep.Reused {
+			st.SnapshotsSinceMaintenance++
+		}
+		st.LastError = ""
+		return nil
+	}); err != nil {
+		return err
+	}
+	if superseded {
+		s.Log.Info("snapshot of an older writer epoch kept in status.supersededSnapshots, not as the newest", "workspace", c.id.Name,
+			"snapshot", rep.SnapshotID, "epoch", rec.Epoch)
+	}
+	if rep.Final {
+		if err := s.markFinal(ctx, c, rec.VolumeName); err != nil {
+			return err
+		}
+	}
+	return s.completeRequest(ctx, c, rep.Request, false, rec.Executor, rep.SnapshotID, "")
+}
+
+// recordInEpochOrder makes rec the newest snapshot unless it belongs to an
+// older writer epoch. Restores use lastSnapshot, so it must only move
+// forward: a rescue of an older writer's volume is kept (pinned, in
+// supersededSnapshots) but does not replace a newer writer's snapshot.
+// It reports whether rec was superseded.
+func recordInEpochOrder(st *wsnapv1.WorkspaceStatus, rec wsnapv1.SnapshotRecord, reused bool) bool {
+	if st.LastSnapshot == nil || rec.Epoch >= st.LastSnapshot.Epoch {
+		st.LastSnapshot = &rec
+		return false
+	}
+	if !reused {
+		st.SupersededSnapshots = append(st.SupersededSnapshots, rec)
+		if n := len(st.SupersededSnapshots); n > maxSuperseded {
+			st.SupersededSnapshots = st.SupersededSnapshots[n-maxSuperseded:]
+		}
+	}
+	return true
+}
+
+func (s *Server) recordRestore(ctx context.Context, c *caller, rep protocol.Report, podRef *wsnapv1.PodRef, now metav1.Time) error {
+	executor := wsnapv1.ExecutorSidecar
+	if c.job != "" {
+		executor = c.job
+	}
+	if err := s.completeRequest(ctx, c, rep.Request, true, executor, rep.SnapshotID, ""); err != nil {
+		return err
+	}
+	return s.updateStatus(ctx, c.id, func(st *wsnapv1.WorkspaceStatus) {
+		st.LastRestore = &wsnapv1.RestoreRecord{SnapshotID: rep.SnapshotID, SourceWorkspace: rep.SourceWorkspace, Time: now, Pod: *podRef}
+		if rep.RestoreFromGeneration > st.RestoreFromGeneration {
+			st.RestoreFromGeneration = rep.RestoreFromGeneration
+		}
+		st.LastError = ""
+	})
 }
 
 func operationMatchesRole(op protocol.Operation, role protocol.Role) bool {
