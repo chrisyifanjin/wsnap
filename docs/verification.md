@@ -88,6 +88,7 @@ multi-node scenario: `kind create cluster --name wsnap --config test/e2e/kind-mu
 | `multinode` | Restore on another node, a mover that follows a node-local PV, a drain that takes a final snapshot. |
 | `worker` | Worker mode: the workload Pod gets only a gate; a worker on its node serves a live request, takes the final snapshot with the last write after the workload stops, and restores a new workload on a new PVC. A `ReadWriteOncePod` claim is refused. |
 | `runtimes` | Installs a pinned, checksum-verified gVisor release on every node and a `gvisor` RuntimeClass. Sidecar mode with the workload and the sidecar inside one gVisor sandbox: request snapshot, final snapshot, cold restore. Worker mode with a gVisor workload and a default-runtime worker sharing the PVC: live snapshot, final snapshot with the last write, restore. Each Pod's kernel is checked to be gVisor. |
+| `kata` (opt-in, not in CI) | Installs Kata Containers 4.2.0 on one node and runs the same checks as `runtimes`. Status on GitHub runners in kind: the install works, the microVM starts, but the guest agent never answers over vsock (60 s), so Pods do not start. Kata is therefore **not verified**. It needs a host with KVM and `vhost_vsock` loaded before the cluster starts: `test/e2e/run.sh setup kata`. |
 
 The scenarios form five groups that share no state:
 

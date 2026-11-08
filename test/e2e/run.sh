@@ -17,7 +17,7 @@
 #   gateway    REST gateway API gated by RBAC; data-plane request through the agent-sandbox router and sandboxd
 #   worker     worker mode: live snapshots from a separate Pod on the same node and PVC; RWOP claims refused
 #   runtimes   gVisor (runsc) workload Pods: sidecar mode inside the sandbox, worker mode beside it
-#   kata       Kata Containers workload Pods (needs /dev/kvm): the same checks as runtimes
+#   kata       opt-in: Kata Containers workload Pods (needs /dev/kvm); see docs/verification.md for its status
 #
 # The harness writes files through "kubectl exec" only to play the agent;
 # wsnap itself never uses exec.
@@ -111,15 +111,18 @@ crash_sidecar() {
 	node=$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.nodeName}')
 	docker exec "$node" crictl stop --timeout 0 "${id#containerd://}" >/dev/null
 }
-# crash_pod kills a Pod without a graceful stop. It deletes the Pod first,
-# so the kubelet does not recreate the sandbox (it did once, and the
-# restarted sidecar then took a normal final snapshot), and stops the
-# sandbox right after, before a final snapshot can finish.
+# crash_pod kills a Pod the way a node failure would: no graceful stop,
+# no final snapshot. The kubelet is stopped meanwhile, so it can neither
+# recreate the sandbox (it once did, and the restarted sidecar took a
+# normal final snapshot) nor start a graceful stop that races the kill.
 crash_pod() {
-	local node
+	local node sandbox
 	node=$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.nodeName}')
-	kubectl -n "$NS" delete pod "$1" --wait=false >/dev/null
-	docker exec "$node" sh -c "crictl stopp \$(crictl pods --name '^$1\$' --namespace $NS -q)" >/dev/null
+	sandbox=$(docker exec "$node" crictl pods --name "^$1\$" --namespace "$NS" -q)
+	docker exec "$node" systemctl stop kubelet
+	docker exec "$node" crictl stopp "$sandbox" >/dev/null
+	kubectl -n "$NS" delete pod "$1" --grace-period=0 --force >/dev/null 2>&1
+	docker exec "$node" systemctl start kubelet
 	wait_for 120 "$1 gone after the crash" pod_gone "$1"
 }
 pod_gone() { not_found -n "$NS" pod "$1"; }
@@ -1295,7 +1298,7 @@ scenario_kata() {
 
 main() {
 	local steps=() s g
-	(($#)) || set -- setup controlplane volumes failures worker runtimes kata
+	(($#)) || set -- setup controlplane volumes failures worker runtimes
 	for s in "$@"; do
 		if [[ -n $(group "$s") ]]; then
 			read -ra g <<<"$(group "$s")"
