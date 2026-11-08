@@ -64,7 +64,7 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	case wsnapv1.SnapshotSucceeded, wsnapv1.SnapshotFailed:
 		return r.cleanupFinishedJob(ctx, sr)
 	}
-	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && (st.Executor == "sidecar" || st.Executor == "worker") &&
+	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && (st.Executor == wsnapv1.ExecutorSidecar || st.Executor == wsnapv1.ExecutorWorker) &&
 		time.Since(sr.GetCreationTimestamp().Time) > RunningTimeout {
 		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("the live executor did not finish within %s", RunningTimeout))
 	}
@@ -100,7 +100,7 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// A specific volume (a stopped writer's): only a Job can reach it.
 		return r.startJob(ctx, sr, &ws, recheck)
 	}
-	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && (st.Executor == "sidecar" || st.Executor == "worker") {
+	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && (st.Executor == wsnapv1.ExecutorSidecar || st.Executor == wsnapv1.ExecutorWorker) {
 		// A terminating live executor still finishes what it claimed.
 		alive, err := r.claimantAlive(ctx, sr.GetNamespace(), ws.Name, st.ClaimedBy)
 		if err != nil {
@@ -109,7 +109,7 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if alive {
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		if st.Executor == "worker" {
+		if st.Executor == wsnapv1.ExecutorWorker {
 			// The worker Pod that claimed it is gone while its workload may
 			// still run; the Job's next Pod claims it again (redelivery goes
 			// only to the claimant's UID).
@@ -150,7 +150,7 @@ func (r *RequestReconciler) claimantAlive(ctx context.Context, namespace, wsName
 		return false, nil
 	}
 	// The claimant is a workspace Pod (sidecar) or a worker Job's Pod.
-	for _, sel := range []client.MatchingLabels{{wsnapv1.LabelWorkspace: wsName}, {wsnapv1.LabelJob: "worker", wsnapv1.LabelJobWorkspace: wsName}} {
+	for _, sel := range []client.MatchingLabels{{wsnapv1.LabelWorkspace: wsName}, {wsnapv1.LabelJob: wsnapv1.JobWorker, wsnapv1.LabelJobWorkspace: wsName}} {
 		var pods corev1.PodList
 		if err := r.Reader.List(ctx, &pods, client.InNamespace(namespace), sel); err != nil {
 			return false, err
@@ -205,9 +205,9 @@ func (q request) GetCreationTimestamp() metav1.Time        { return q.obj.GetCre
 
 func (r *RequestReconciler) jobKind() string {
 	if r.Restore {
-		return "restorer"
+		return wsnapv1.JobRestorer
 	}
-	return "mover"
+	return wsnapv1.JobMover
 }
 
 func (r *RequestReconciler) liveWriter(ctx context.Context, ws *wsnapv1.Workspace) (bool, error) {

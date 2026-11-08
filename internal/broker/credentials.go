@@ -55,10 +55,10 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 	} else if err := c.allowed(req.Role); err != nil {
 		return nil, err
 	}
-	if restoreReq == nil && c.job == "restorer" && req.Role == protocol.RoleRestore {
+	if restoreReq == nil && c.job == wsnapv1.JobRestorer && req.Role == protocol.RoleRestore {
 		return nil, fail(http.StatusForbidden, "a restorer job must name its WorkspaceRestore")
 	}
-	if c.job == "mover" || c.job == "restorer" {
+	if c.job == wsnapv1.JobMover || c.job == wsnapv1.JobRestorer {
 		if err := s.checkNoWorkloadOnVolume(ctx, c); err != nil {
 			return nil, err
 		}
@@ -87,7 +87,7 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 		if err := s.trackVolume(ctx, c, req.Role == protocol.RoleSnapshot); err != nil {
 			return nil, err
 		}
-	} else if c.job == "worker" {
+	} else if c.job == wsnapv1.JobWorker {
 		ws, err = s.ensureWorkspace(ctx, c.id)
 		if err != nil {
 			return nil, err

@@ -63,12 +63,12 @@ func (s *Server) report(r *http.Request) error {
 	if !operationMatchesRole(rep.Operation, rep.Role) {
 		return fail(http.StatusBadRequest, "operation %q cannot be reported with role %q", rep.Operation, rep.Role)
 	}
-	if err := c.allowed(rep.Role); err != nil && rep.Role != protocol.RoleRestore && !(c.job == "restorer" && rep.Role == protocol.RoleMover) {
+	if err := c.allowed(rep.Role); err != nil && rep.Role != protocol.RoleRestore && !(c.job == wsnapv1.JobRestorer && rep.Role == protocol.RoleMover) {
 		// A restore report arrives after the workload may have started.
 		return err
 	}
 	podRef := &wsnapv1.PodRef{Name: c.pod.Name, UID: string(c.pod.UID)}
-	if c.job == "worker" {
+	if c.job == wsnapv1.JobWorker {
 		podRef = &wsnapv1.PodRef{Name: c.workerRef.TargetPodName, UID: c.workerRef.TargetPodUID}
 	}
 	now := metav1.Now()
@@ -81,7 +81,7 @@ func (s *Server) report(r *http.Request) error {
 		reports.WithLabelValues(string(rep.Operation), "ok").Inc()
 	}
 	if rep.NoData {
-		if c.job != "mover" || rep.Operation != protocol.OpSnapshot {
+		if c.job != wsnapv1.JobMover || rep.Operation != protocol.OpSnapshot {
 			return fail(http.StatusBadRequest, "only a mover reports a volume without data")
 		}
 		if err := s.markFinal(ctx, c, c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]); err != nil {
@@ -100,17 +100,17 @@ func (s *Server) report(r *http.Request) error {
 	}
 	switch rep.Operation {
 	case protocol.OpSnapshot:
-		rec := wsnapv1.SnapshotRecord{ID: rep.SnapshotID, Time: metav1.NewTime(rep.EndTime), Pod: podRef, Final: rep.Final, Executor: "sidecar"}
-		if c.job == "worker" {
+		rec := wsnapv1.SnapshotRecord{ID: rep.SnapshotID, Time: metav1.NewTime(rep.EndTime), Pod: podRef, Final: rep.Final, Executor: wsnapv1.ExecutorSidecar}
+		if c.job == wsnapv1.JobWorker {
 			if c.workerEpoch == 0 {
 				return fail(http.StatusConflict, "worker epoch has not been recorded")
 			}
-			rec.Executor = "worker"
+			rec.Executor = wsnapv1.ExecutorWorker
 			rec.VolumeName = c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
 			rec.Epoch = c.workerEpoch
 		}
-		if c.job == "mover" || c.job == "restorer" {
-			rec.Executor = "mover"
+		if c.job == wsnapv1.JobMover || c.job == wsnapv1.JobRestorer {
+			rec.Executor = wsnapv1.ExecutorMover
 			rec.VolumeName = c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
 			// The Job snapshots the volume's data, whose epoch the
 			// controller recorded from the PV when it created the Job.
@@ -167,7 +167,7 @@ func (s *Server) report(r *http.Request) error {
 		}
 		return s.completeRequest(ctx, c, rep.Request, false, rec.Executor, rep.SnapshotID, "")
 	case protocol.OpRestore:
-		executor := "sidecar"
+		executor := wsnapv1.ExecutorSidecar
 		if c.job != "" {
 			executor = c.job
 		}
@@ -222,11 +222,11 @@ func (s *Server) markFinal(ctx context.Context, c *caller, volumeName string) er
 		// The writer recorded when the Job was created: the Job's snapshot
 		// holds that writer's data and nothing written after.
 		uid = c.jobObj.Annotations[workspace.AnnotationWriterPod]
-		if c.job == "worker" {
+		if c.job == wsnapv1.JobWorker {
 			uid = c.workerRef.TargetPodUID // the annotation is editable
 		}
 		if uid == "" {
-			uid = "mover"
+			uid = workspace.FinalByMover
 		}
 	}
 	return workspace.MarkPV(ctx, s.Client, s.Reader, volumeName, workspace.AnnotationFinalPod, uid)

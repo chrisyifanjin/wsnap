@@ -174,7 +174,7 @@ func (s *Server) trackVolume(ctx context.Context, c *caller, consumeRestoreFrom 
 		return fail(http.StatusConflict, "workspace claim %s is not bound to a volume yet", ref.ClaimName)
 	}
 	selfJob := ""
-	if c.job == "worker" && c.jobObj != nil {
+	if c.job == wsnapv1.JobWorker && c.jobObj != nil {
 		selfJob = string(c.jobObj.UID)
 	}
 	if err := s.checkNoActiveJob(ctx, c.id.Namespace, ref.VolumeName, selfJob); err != nil {

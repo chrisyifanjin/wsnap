@@ -53,7 +53,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// One maintenance Job at a time per workspace.
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, client.InNamespace(ws.Namespace), client.MatchingLabels{
-		wsnapv1.LabelJob: "maintenance", wsnapv1.LabelJobWorkspace: ws.Name,
+		wsnapv1.LabelJob: wsnapv1.JobMaintenance, wsnapv1.LabelJobWorkspace: ws.Name,
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -62,7 +62,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, nil
 		}
 	}
-	job := r.Jobs.newAgentJob("maintenance", maintenanceJobName(&ws), &ws, &repo, []string{"maintain"}, nil, nil)
+	job := r.Jobs.newAgentJob(wsnapv1.JobMaintenance, maintenanceJobName(&ws), &ws, &repo, []string{"maintain"}, nil, nil)
 	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -89,7 +89,7 @@ func jobFinished(j *batchv1.Job) bool {
 // jobToPV maps a mover Job to the PV it rescues.
 func jobToPV() handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
-		if o.GetLabels()[wsnapv1.LabelJob] != "mover" {
+		if o.GetLabels()[wsnapv1.LabelJob] != wsnapv1.JobMover {
 			return nil
 		}
 		pv := o.GetAnnotations()[wsnapv1.AnnotationVolumeName]

@@ -34,11 +34,11 @@ func (s *Server) claimedRestore(ctx context.Context, c *caller, name string) (*w
 		if r.Status.ClaimedBy != string(c.pod.UID) {
 			return nil, fail(http.StatusForbidden, "restore request %s is claimed by another pod", name)
 		}
-	case "restorer":
+	case wsnapv1.JobRestorer:
 		if c.jobObj.Annotations[wsnapv1.AnnotationRequest] != name {
 			return nil, fail(http.StatusForbidden, "job %s does not serve restore request %s", c.jobObj.Name, name)
 		}
-	case "worker":
+	case wsnapv1.JobWorker:
 		if r.Status.ClaimedBy != string(c.pod.UID) {
 			return nil, fail(http.StatusForbidden, "restore request %s is claimed by another worker", name)
 		}
@@ -78,9 +78,9 @@ func (s *Server) completeRequest(ctx context.Context, c *caller, name string, re
 		switch {
 		case c.job == "" && st.ClaimedBy != string(c.pod.UID):
 			return fail(http.StatusForbidden, "request %s was not claimed by pod %s", name, c.pod.Name)
-		case c.job == "worker" && st.ClaimedBy != string(c.pod.UID):
+		case c.job == wsnapv1.JobWorker && st.ClaimedBy != string(c.pod.UID):
 			return fail(http.StatusForbidden, "request %s was not claimed by worker %s", name, c.pod.Name)
-		case c.job != "" && c.job != "worker" && c.jobObj.Annotations[wsnapv1.AnnotationRequest] != name:
+		case c.job != "" && c.job != wsnapv1.JobWorker && c.jobObj.Annotations[wsnapv1.AnnotationRequest] != name:
 			return fail(http.StatusForbidden, "job %s does not serve request %s", c.jobObj.Name, name)
 		}
 		if st.Phase == wsnapv1.SnapshotSucceeded || st.Phase == wsnapv1.SnapshotFailed {
@@ -112,7 +112,7 @@ var (
 func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	c, err := s.resolve(r)
-	if err == nil && c.job != "" && c.job != "worker" {
+	if err == nil && c.job != "" && c.job != wsnapv1.JobWorker {
 		err = fail(http.StatusForbidden, "jobs do not wait for requests")
 	}
 	if err != nil {
@@ -162,7 +162,7 @@ func (s *Server) claimRequests(ctx context.Context, c *caller) (protocol.WaitRes
 	}
 	writerUID := string(c.pod.UID)
 	livePod := c.pod
-	if c.job == "worker" {
+	if c.job == wsnapv1.JobWorker {
 		writerUID = c.jobObj.Annotations[wsnapv1.AnnotationTargetPodUID]
 		livePod = c.workloadPod
 	}
@@ -184,9 +184,9 @@ func (s *Server) claimRequests(ctx context.Context, c *caller) (protocol.WaitRes
 			// reach it; a sidecar would snapshot its own volume instead.
 			return false, nil
 		}
-		executor := "sidecar"
-		if c.job == "worker" {
-			executor = "worker"
+		executor := wsnapv1.ExecutorSidecar
+		if c.job == wsnapv1.JobWorker {
+			executor = wsnapv1.ExecutorWorker
 		}
 		if st.Phase == wsnapv1.SnapshotRunning && st.Executor == executor && st.ClaimedBy == string(c.pod.UID) {
 			// Claimed by this Pod but maybe never delivered: the answer to

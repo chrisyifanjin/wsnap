@@ -23,7 +23,7 @@ const (
 	AnnotationSidecar = "wsnap.dev/sidecar"
 
 	// LabelJob marks Jobs the controller creates, and their Pods. The value
-	// is mover or maintenance.
+	// is the Job's kind: JobMover, JobRestorer, JobMaintenance or JobWorker.
 	LabelJob = "wsnap.dev/job"
 	// LabelJobWorkspace names the workspace of a controller-created Job.
 	// Jobs do not carry LabelWorkspace, which marks workload Pods.
@@ -302,6 +302,28 @@ type RestoreSource struct {
 	// +optional
 	SnapshotID string `json:"snapshotID,omitempty"`
 }
+
+// Kinds of Job the controller creates: the value of LabelJob and of
+// JobRef.Kind.
+const (
+	// JobMover snapshots a volume no Pod is using (a rescue or a request).
+	JobMover = "mover"
+	// JobRestorer restores a snapshot into a volume no Pod is using.
+	JobRestorer = "restorer"
+	// JobMaintenance applies retention to a workspace repository.
+	JobMaintenance = "maintenance"
+	// JobWorker takes live snapshots beside a workload in worker mode.
+	JobWorker = "worker"
+)
+
+// Executors: what took a snapshot or served a request (status.executor
+// of SnapshotRecord, WorkspaceSnapshot and WorkspaceRestore).
+const (
+	ExecutorSidecar  = "sidecar"
+	ExecutorWorker   = "worker"
+	ExecutorMover    = "mover"
+	ExecutorRestorer = "restorer"
+)
 
 // WorkspaceSpec is the durable identity of a workspace.
 // A running Pod cannot change its executor placement, so mode is immutable.

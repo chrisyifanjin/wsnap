@@ -232,6 +232,9 @@ const (
 	// AnnotationWriterEpoch is the Workspace writerEpoch of the last Pod
 	// that the broker admitted as writer on this volume.
 	AnnotationWriterEpoch = "wsnap.dev/writer-epoch"
+	// FinalByMover is AnnotationWriterPod and AnnotationFinalPod's value
+	// when no workspace Pod wrote the volume before a mover Job saved it.
+	FinalByMover = "mover"
 )
 
 // ErrBadVolume marks a Pod whose workspace volume wsnap cannot use, as

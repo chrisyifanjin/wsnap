@@ -189,7 +189,7 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 	}); err != nil {
 		return fmt.Errorf("pre-bind volume: %w", err)
 	}
-	job := r.Jobs.newAgentJob("mover", moverJobName(pv.Name), ws, &repo,
+	job := r.Jobs.newAgentJob(wsnapv1.JobMover, moverJobName(pv.Name), ws, &repo,
 		[]string{"mover", "--dir=" + dataMountPath},
 		[]corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName}}}},
@@ -246,7 +246,7 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 			if err := r.Reader.Get(ctx, types.NamespacedName{Name: pv.Name}, &cur); err != nil {
 				return ctrl.Result{}, err
 			}
-			want := cmp.Or(job.Annotations[workspace.AnnotationWriterPod], "mover")
+			want := cmp.Or(job.Annotations[workspace.AnnotationWriterPod], workspace.FinalByMover)
 			if cur.Annotations[workspace.AnnotationFinalPod] != want && retry {
 				return r.restartRescue(ctx, pv, &job)
 			}

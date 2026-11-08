@@ -21,7 +21,7 @@ func (s *Server) handleWorkerState(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	if c.job != "worker" {
+	if c.job != wsnapv1.JobWorker {
 		s.writeError(w, fail(http.StatusForbidden, "only a worker job may read worker state"))
 		return
 	}
