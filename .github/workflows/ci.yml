@@ -43,25 +43,40 @@ jobs:
   e2e:
     # Groups of scenarios that share no state, each on its own
     # three-node cluster. test/e2e/run.sh defines the groups.
-    name: e2e (${{ matrix.group }})
+    name: e2e (${{ matrix.group }}, Kubernetes ${{ matrix.k8s }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         group: [controlplane, volumes, failures, worker, runtimes]
+        # An explicit value, so the entries below become new jobs instead of
+        # being merged into the 1.37 jobs of the same group.
+        k8s: ["1.37"]
+        # The oldest supported Kubernetes (README: 1.30 or later) runs the
+        # groups that cover every volume kind and both execution modes. kind
+        # v0.29.0 is the newest release with a 1.30 node image.
+        include:
+          - {group: volumes, k8s: "1.30", kind: v0.29.0, kubectl: v1.30.13,
+             node: "kindest/node:v1.30.13@sha256:397209b3d947d154f6641f2d0ce8d473732bd91c87d9575ade99049aa33cd648"}
+          - {group: worker, k8s: "1.30", kind: v0.29.0, kubectl: v1.30.13,
+             node: "kindest/node:v1.30.13@sha256:397209b3d947d154f6641f2d0ce8d473732bd91c87d9575ade99049aa33cd648"}
+    env:
+      KIND_VERSION: ${{ matrix.kind || 'v0.33.0' }}
+      KUBECTL_VERSION: ${{ matrix.kubectl || 'v1.37.0' }}
+      KIND_NODE_IMAGE: ${{ matrix.node || '' }}
     steps:
       - uses: actions/checkout@v7
       - name: Install kind and kubectl
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
-          curl -fsSLo "$RUNNER_TEMP/bin/kind" https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
-          curl -fsSLo "$RUNNER_TEMP/bin/kubectl" https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl
+          curl -fsSLo "$RUNNER_TEMP/bin/kind" "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-amd64"
+          curl -fsSLo "$RUNNER_TEMP/bin/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
           chmod +x "$RUNNER_TEMP/bin/kind" "$RUNNER_TEMP/bin/kubectl"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Create three-node cluster (in the background, while images build)
         run: |
-          (kind create cluster --name wsnap --config test/e2e/kind-multinode.yaml > "$RUNNER_TEMP/kind.log" 2>&1
+          (kind create cluster --name wsnap --config test/e2e/kind-multinode.yaml ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} > "$RUNNER_TEMP/kind.log" 2>&1
            echo $? > "$RUNNER_TEMP/kind.rc") &
       - uses: docker/setup-buildx-action@v4
       - name: Build the controller image
@@ -100,6 +115,6 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
-          name: kind-logs-${{ matrix.group }}
+          name: kind-logs-${{ matrix.group }}-k8s-${{ matrix.k8s }}
           path: ${{ runner.temp }}/kind-logs
           retention-days: 7
