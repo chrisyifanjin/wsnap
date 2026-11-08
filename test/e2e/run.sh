@@ -1126,6 +1126,10 @@ EOF
 # in_gvisor checks, from inside a Pod's container, that its kernel is the
 # gVisor Sentry, so a test cannot pass on runc by accident.
 in_gvisor() { kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>/dev/null | grep -q gVisor; }
+gvisor_evidence() {
+	printf 'runtimeClassName=%q; dmesg: %s' "$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.runtimeClassName}')" \
+		"$(kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>&1 | head -3 | tr '\n' '|')"
+}
 
 scenario_runtimes() {
 	log "runtimes: gVisor workload Pods"
@@ -1140,7 +1144,8 @@ scenario_runtimes() {
 	apply_pvc gv-a >/dev/null
 	RUNTIME_CLASS=gvisor apply_pod gv-1 ws-gv kopia-s3 pvc:gv-a yes >/dev/null
 	wait_for 240 "gv-1 ready" pod_ready gv-1
-	in_gvisor gv-1 || die "gv-1 does not run in gVisor"
+	for _ in 1 2 3 4 5; do in_gvisor gv-1 && break; sleep 2; done
+	in_gvisor gv-1 || die "gv-1 does not run in gVisor: $(gvisor_evidence gv-1)"
 	write_file gv-1 /workspace/kernel.txt written-in-gvisor
 	kubectl -n "$NS" exec gv-1 -c agent -- touch /workspace/.wsnap/requests/in-gvisor
 	wait_for 60 "snapshot inside gVisor" result_has gv-1 in-gvisor snapshotID
@@ -1162,7 +1167,8 @@ scenario_runtimes() {
 	apply_pvc gvw-a >/dev/null
 	RUNTIME_CLASS=gvisor worker_pod gvw-1 ws-gvw gvw-a >/dev/null
 	wait_for 240 "gvw-1 ready" pod_ready gvw-1
-	in_gvisor gvw-1 || die "gvw-1 does not run in gVisor"
+	for _ in 1 2 3 4 5; do in_gvisor gvw-1 && break; sleep 2; done
+	in_gvisor gvw-1 || die "gvw-1 does not run in gVisor: $(gvisor_evidence gvw-1)"
 	write_file gvw-1 /workspace/kernel.txt written-in-gvisor-worker-mode
 	apply_request wssnap gvw-live ws-gvw >/dev/null
 	wait_for 90 "worker snapshot of a gVisor workload" req_is wssnap gvw-live Succeeded
