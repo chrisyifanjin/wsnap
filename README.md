@@ -128,6 +128,9 @@ For other backends, TLS, monitoring and uninstall, see
 ¹ restic cannot create a repository with a container SAS; the validator
 refuses that combination.
 
+Container runtimes: runc (containerd) and gVisor (runsc), in both sidecar
+and worker mode. Kata Containers is not tested yet.
+
 The end-to-end suite runs on a three-node kind cluster with agent-sandbox.
 It injects failures: the controller stopped, the leader killed during a
 rescue, storage stopped, the sidecar killed, a crash with an immediate

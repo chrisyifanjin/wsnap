@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [controlplane, volumes, failures, worker]
+        group: [controlplane, volumes, failures, worker, runtimes]
     steps:
       - uses: actions/checkout@v7
       - name: Install kind and kubectl

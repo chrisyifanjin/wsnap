@@ -16,6 +16,7 @@
 #   webhook    sidecar injection into bare Pods and Sandboxes; unsafe Pods refused; fail closed while down
 #   gateway    REST gateway API gated by RBAC; data-plane request through the agent-sandbox router and sandboxd
 #   worker     worker mode: live snapshots from a separate Pod on the same node and PVC; RWOP claims refused
+#   runtimes   gVisor (runsc) workload Pods: sidecar mode inside the sandbox, worker mode beside it
 #
 # The harness writes files through "kubectl exec" only to play the agent;
 # wsnap itself never uses exec.
@@ -213,6 +214,9 @@ EOF
 		pod_spec "$3" "$4" "$5" | sed 's/^  //'
 		if [[ -n ${NODE_SELECTOR:-} ]]; then
 			printf '  nodeSelector: {kubernetes.io/hostname: %s}\n' "$NODE_SELECTOR"
+		fi
+		if [[ -n ${RUNTIME_CLASS:-} ]]; then
+			printf '  runtimeClassName: %s\n' "$RUNTIME_CLASS"
 		fi
 	} | kubectl apply -f -
 }
@@ -971,6 +975,7 @@ group() {
 	volumes) echo pvc ephemeral sandbox emptydir singlewriter requests ;;
 	failures) echo chaos ;;
 	worker) echo worker ;;
+	runtimes) echo runtimes ;;
 	esac
 }
 
@@ -1006,6 +1011,7 @@ metadata:
   namespace: $NS
   labels: {wsnap.dev/workspace: $2, wsnap.dev/repository: restic-s3}
 spec:
+  ${RUNTIME_CLASS:+runtimeClassName: $RUNTIME_CLASS}
   containers:
   - name: agent
     image: alpine:3.22
@@ -1072,9 +1078,112 @@ EOF
 	kubectl -n "$NS" delete pvc wk-a wk-b wk-rwop --wait=false >/dev/null
 }
 
+# gVisor: a pinned release, checked against its published SHA-512.
+GVISOR_RELEASE=${GVISOR_RELEASE:-20261019}
+GVISOR_SHA512_x86_64=7cbc2aeeee809dcccfb40e612504a1b76f2c119790cee59e482f7b35428cccc4f71705e7e322442d07d1f7d29b5d9e72e31319fc3088d6dcbec9fc7c1f0d8881
+
+# install_gvisor adds the runsc runtime to every kind node and registers
+# the RuntimeClass "gvisor". Idempotent.
+install_gvisor() {
+	if kubectl get runtimeclass gvisor >/dev/null 2>&1; then
+		return
+	fi
+	local nodes arch dir want sum
+	nodes=$(kind get nodes --name "$CLUSTER")
+	arch=$(docker exec "$(echo "$nodes" | head -1)" uname -m)
+	[[ $arch == x86_64 ]] || die "the gVisor checksum is pinned for x86_64 only, not $arch"
+	dir=$(mktemp -d)
+	curl -fsSLo "$dir/gvisor.tar.bz2" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_RELEASE/$arch/gvisor.tar.bz2"
+	want=$GVISOR_SHA512_x86_64
+	sum=$( (sha512sum "$dir/gvisor.tar.bz2" 2>/dev/null || shasum -a 512 "$dir/gvisor.tar.bz2") | cut -d' ' -f1)
+	[[ $sum == "$want" ]] || die "gVisor $GVISOR_RELEASE checksum mismatch"
+	tar -xjf "$dir/gvisor.tar.bz2" -C "$dir"
+	for node in $nodes; do
+		docker cp "$dir/runsc" "$node:/usr/local/bin/runsc"
+		docker cp "$dir/containerd-shim-runsc-v1" "$node:/usr/local/bin/containerd-shim-runsc-v1"
+		docker cp "$dir/gvisor-bin" "$node:/usr/local/bin/"
+		# containerd 2 (config version 3) and 1.x name the CRI plugin differently.
+		docker exec "$node" sh -c '
+			set -e
+			if grep -q "^version = 3" /etc/containerd/config.toml; then
+				plugin="plugins.\"io.containerd.cri.v1.runtime\""
+			else
+				plugin="plugins.\"io.containerd.grpc.v1.cri\""
+			fi
+			printf "\n[%s.containerd.runtimes.runsc]\n  runtime_type = \"io.containerd.runsc.v1\"\n" "$plugin" >> /etc/containerd/config.toml
+			systemctl restart containerd'
+	done
+	rm -rf "$dir"
+	kubectl apply -f - >/dev/null <<EOF
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: gvisor}
+handler: runsc
+EOF
+	kubectl wait --for=condition=Ready nodes --all --timeout=180s >/dev/null
+}
+
+# in_gvisor checks, from inside a Pod's container, that its kernel is the
+# gVisor Sentry, so a test cannot pass on runc by accident.
+in_gvisor() { kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>/dev/null | grep -q gVisor; }
+
+scenario_runtimes() {
+	log "runtimes: gVisor workload Pods"
+	install_gvisor
+	pass "gVisor $GVISOR_RELEASE installed on every node (RuntimeClass gvisor, handler runsc)"
+
+	# Sidecar mode: the wsnap sidecar runs inside the same gVisor sandbox
+	# as the workload, so every file operation goes through gVisor.
+	kubectl -n "$NS" delete pod gv-1 gv-2 --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc gv-a gv-b --ignore-not-found --wait=true >/dev/null
+	fresh_workspace ws-gv
+	apply_pvc gv-a >/dev/null
+	RUNTIME_CLASS=gvisor apply_pod gv-1 ws-gv kopia-s3 pvc:gv-a yes >/dev/null
+	wait_for 240 "gv-1 ready" pod_ready gv-1
+	in_gvisor gv-1 || die "gv-1 does not run in gVisor"
+	write_file gv-1 /workspace/kernel.txt written-in-gvisor
+	kubectl -n "$NS" exec gv-1 -c agent -- touch /workspace/.wsnap/requests/in-gvisor
+	wait_for 60 "snapshot inside gVisor" result_has gv-1 in-gvisor snapshotID
+	kubectl -n "$NS" delete pod gv-1 --wait=true >/dev/null
+	[[ $(ws_field ws-gv .status.lastSnapshot.final) == true ]] || die "no final snapshot from the sidecar in gVisor"
+	apply_pvc gv-b >/dev/null
+	RUNTIME_CLASS=gvisor apply_pod gv-2 ws-gv kopia-s3 pvc:gv-b yes >/dev/null
+	wait_for 240 "gv-2 ready" pod_ready gv-2
+	[[ $(read_file gv-2 /workspace/kernel.txt) == written-in-gvisor ]] || die "restore into a gVisor Pod lost data"
+	pass "sidecar mode in gVisor: snapshot on request, final snapshot, cold restore into a new gVisor Pod"
+	kubectl -n "$NS" delete pod gv-2 --wait=true >/dev/null
+
+	# Worker mode: the workload runs in gVisor; the worker uses the node's
+	# default runtime and shares the PVC through the host mount.
+	kubectl -n "$NS" delete pod gvw-1 gvw-2 --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc gvw-a gvw-b --ignore-not-found --wait=true >/dev/null
+	fresh_workspace ws-gvw
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: Workspace\nmetadata: {name: ws-gvw, namespace: %s}\nspec: {repositoryName: restic-s3, execution: {mode: worker}}\n' "$NS" | kubectl apply -f - >/dev/null
+	apply_pvc gvw-a >/dev/null
+	RUNTIME_CLASS=gvisor worker_pod gvw-1 ws-gvw gvw-a >/dev/null
+	wait_for 240 "gvw-1 ready" pod_ready gvw-1
+	in_gvisor gvw-1 || die "gvw-1 does not run in gVisor"
+	write_file gvw-1 /workspace/kernel.txt written-in-gvisor-worker-mode
+	apply_request wssnap gvw-live ws-gvw >/dev/null
+	wait_for 90 "worker snapshot of a gVisor workload" req_is wssnap gvw-live Succeeded
+	[[ $(req_field wssnap gvw-live .status.executor) == worker ]] || die "live request not served by the worker"
+	write_file gvw-1 /workspace/kernel.txt last-write-in-gvisor
+	local job; job=$(worker_job_of ws-gvw)
+	kubectl -n "$NS" delete pod gvw-1 --wait=true >/dev/null
+	wait_for 120 "worker Job finished" job_succeeded_or_gone "$job"
+	[[ $(ws_field ws-gvw .status.lastSnapshot.final) == true ]] || die "no final snapshot by the worker"
+	apply_pvc gvw-b >/dev/null
+	RUNTIME_CLASS=gvisor worker_pod gvw-2 ws-gvw gvw-b >/dev/null
+	wait_for 240 "gvw-2 ready" pod_ready gvw-2
+	[[ $(read_file gvw-2 /workspace/kernel.txt) == last-write-in-gvisor ]] || die "worker restore into a gVisor Pod returned $(read_file gvw-2 /workspace/kernel.txt)"
+	pass "worker mode beside gVisor: live snapshot, final snapshot with the last write, restore into a new gVisor Pod"
+	kubectl -n "$NS" delete pod gvw-2 --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc gv-a gv-b gvw-a gvw-b --wait=false >/dev/null
+}
+
 main() {
 	local steps=() s g
-	(($#)) || set -- setup controlplane volumes failures worker
+	(($#)) || set -- setup controlplane volumes failures worker runtimes
 	for s in "$@"; do
 		if [[ -n $(group "$s") ]]; then
 			read -ra g <<<"$(group "$s")"
