@@ -23,7 +23,7 @@ import (
 //     service account token for the API server (no audience), as a copied
 //     "kube-api-access" volume would.
 func CheckIsolation(pod *corev1.Pod, audience string, allowAPIToken bool) error {
-	if ptr.Deref(pod.Spec.ShareProcessNamespace, false) || pod.Spec.HostPID {
+	if sharesProcesses(pod) {
 		return fmt.Errorf("shareProcessNamespace and hostPID let the workload read the sidecar's environment and files through /proc; turn them off")
 	}
 	sidecar := SidecarName(pod)
@@ -31,22 +31,10 @@ func CheckIsolation(pod *corev1.Pod, audience string, allowAPIToken bool) error 
 	if workspaceVolume == "" {
 		workspaceVolume = wsnapv1.DefaultVolumeName
 	}
+	wsnapTokens, apiTokens := tokenVolumes(pod, audience)
 	private := map[string]string{} // volume name -> why it is private
-	apiToken := map[string]bool{}
-	for _, v := range pod.Spec.Volumes {
-		if v.Projected == nil {
-			continue
-		}
-		for _, src := range v.Projected.Sources {
-			if t := src.ServiceAccountToken; t != nil {
-				switch t.Audience {
-				case audience:
-					private[v.Name] = "the wsnap token"
-				case "":
-					apiToken[v.Name] = true
-				}
-			}
-		}
+	for name := range wsnapTokens {
+		private[name] = "the wsnap token"
 	}
 	configMaps := map[string]bool{}
 	for _, v := range pod.Spec.Volumes {
@@ -64,75 +52,88 @@ func CheckIsolation(pod *corev1.Pod, audience string, allowAPIToken bool) error 
 			}
 		}
 	}
-	check := func(kind, name string, mounts []corev1.VolumeMount) error {
-		for _, m := range mounts {
-			if why := private[m.Name]; why != "" {
-				return fmt.Errorf("%s %q mounts volume %q (%s); only the %q container may", kind, name, m.Name, why, sidecar)
-			}
-			if apiToken[m.Name] && !allowAPIToken {
-				return fmt.Errorf("%s %q mounts volume %q, an API server token; untrusted containers must not hold one", kind, name, m.Name)
-			}
-		}
-		return nil
-	}
-	for _, list := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
-		for _, c := range list {
-			if c.Name == sidecar {
-				continue
-			}
-			if err := check("container", c.Name, c.VolumeMounts); err != nil {
-				return err
-			}
-		}
-	}
 	for _, ec := range pod.Spec.EphemeralContainers {
 		if ec.TargetContainerName == sidecar {
 			return fmt.Errorf("ephemeral container %q targets %q and would share its process namespace", ec.Name, sidecar)
 		}
-		if err := check("ephemeral container", ec.Name, ec.VolumeMounts); err != nil {
-			return err
-		}
 	}
-	return nil
+	return eachWorkloadMount(pod, sidecar, func(kind, name string, m corev1.VolumeMount) error {
+		if why := private[m.Name]; why != "" {
+			return fmt.Errorf("%s %q mounts volume %q (%s); only the %q container may", kind, name, m.Name, why, sidecar)
+		}
+		return apiTokenError(kind, name, m, apiTokens, allowAPIToken)
+	})
 }
 
 // CheckWorkerIsolation applies to a workload Pod whose snapshot agent runs
 // in a separate Job. No container in this Pod may receive a wsnap token:
 // only the controller-created worker Job may authenticate as an agent.
 func CheckWorkerIsolation(pod *corev1.Pod, audience string, allowAPIToken bool) error {
-	if ptr.Deref(pod.Spec.ShareProcessNamespace, false) || pod.Spec.HostPID {
+	if sharesProcesses(pod) {
 		return fmt.Errorf("shareProcessNamespace and hostPID are not allowed in worker mode")
 	}
+	wsnapTokens, apiTokens := tokenVolumes(pod, audience)
+	if len(wsnapTokens) > 0 {
+		return fmt.Errorf("workload Pod may not project a wsnap token in worker mode")
+	}
+	return eachWorkloadMount(pod, "", func(kind, name string, m corev1.VolumeMount) error {
+		return apiTokenError(kind, name, m, apiTokens, allowAPIToken)
+	})
+}
+
+func sharesProcesses(pod *corev1.Pod) bool {
+	return ptr.Deref(pod.Spec.ShareProcessNamespace, false) || pod.Spec.HostPID
+}
+
+// tokenVolumes finds the Pod's projected service account tokens: those
+// for the broker's audience, and those for the API server (no audience),
+// as a copied "kube-api-access" volume would be.
+func tokenVolumes(pod *corev1.Pod, audience string) (wsnapTokens, apiTokens map[string]bool) {
+	wsnapTokens, apiTokens = map[string]bool{}, map[string]bool{}
 	for _, v := range pod.Spec.Volumes {
 		if v.Projected == nil {
 			continue
 		}
 		for _, src := range v.Projected.Sources {
-			if token := src.ServiceAccountToken; token != nil && token.Audience == audience {
-				return fmt.Errorf("workload Pod may not project a wsnap token in worker mode")
+			if t := src.ServiceAccountToken; t != nil {
+				switch t.Audience {
+				case audience:
+					wsnapTokens[v.Name] = true
+				case "":
+					apiTokens[v.Name] = true
+				}
 			}
-			if token := src.ServiceAccountToken; token != nil && token.Audience == "" && !allowAPIToken {
-				for _, c := range pod.Spec.InitContainers {
-					for _, m := range c.VolumeMounts {
-						if m.Name == v.Name {
-							return fmt.Errorf("init container %q mounts an API server token", c.Name)
-						}
-					}
+		}
+	}
+	return wsnapTokens, apiTokens
+}
+
+func apiTokenError(kind, name string, m corev1.VolumeMount, apiTokens map[string]bool, allowAPIToken bool) error {
+	if apiTokens[m.Name] && !allowAPIToken {
+		return fmt.Errorf("%s %q mounts volume %q, an API server token; untrusted containers must not hold one", kind, name, m.Name)
+	}
+	return nil
+}
+
+// eachWorkloadMount calls fn for every volume mount of every container
+// (init, regular and ephemeral) except the agent container named skip.
+func eachWorkloadMount(pod *corev1.Pod, skip string, fn func(kind, name string, m corev1.VolumeMount) error) error {
+	for _, list := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for _, c := range list {
+			if c.Name == skip {
+				continue
+			}
+			for _, m := range c.VolumeMounts {
+				if err := fn("container", c.Name, m); err != nil {
+					return err
 				}
-				for _, c := range pod.Spec.Containers {
-					for _, m := range c.VolumeMounts {
-						if m.Name == v.Name {
-							return fmt.Errorf("container %q mounts an API server token", c.Name)
-						}
-					}
-				}
-				for _, c := range pod.Spec.EphemeralContainers {
-					for _, m := range c.VolumeMounts {
-						if m.Name == v.Name {
-							return fmt.Errorf("ephemeral container %q mounts an API server token", c.Name)
-						}
-					}
-				}
+			}
+		}
+	}
+	for _, ec := range pod.Spec.EphemeralContainers {
+		for _, m := range ec.VolumeMounts {
+			if err := fn("ephemeral container", ec.Name, m); err != nil {
+				return err
 			}
 		}
 	}

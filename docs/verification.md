@@ -46,6 +46,27 @@ docker run --rm --network container:<azurite> -v $PWD:/t --entrypoint /t/engine.
   -e WSNAP_TEST_AZURE_KEY=<azurite key> wsnap-agent:dev -test.run 'TestRoundTrip/.*/azure'
 ```
 
+## Real clouds
+
+`.github/workflows/cloud-conformance.yml` runs the engine round trip
+(snapshot, restore, maintenance) and `TestScopedIsolation` (workspace b's
+credential cannot open workspace a's repository) against real AWS S3,
+Google Cloud Storage and Azure Blob, each with its scoped provider. It
+runs weekly and on demand. A cloud runs only when its repository
+variables are set. The login uses GitHub OIDC, so GitHub stores no cloud
+key. Use a dedicated bucket or account, with a lifecycle rule that deletes
+`conformance/` objects after one day.
+
+**Status:** the workflow has not run against a real cloud yet. Until it
+does, the tables above are the evidence: S3 with STS against MinIO, GCS
+against an emulator, and Azure against Azurite.
+
+| Cloud | Repository variables | Cloud-side setup |
+|---|---|---|
+| AWS (`s3-sts`) | `WSNAP_AWS_CI_ROLE_ARN`, `WSNAP_AWS_REGION`, `WSNAP_AWS_BUCKET`, `WSNAP_AWS_WORKSPACE_ROLE_ARN` | The CI role trusts the GitHub OIDC provider (`token.actions.githubusercontent.com`, subject `repo:<owner>/wsnap:*`) and may `sts:AssumeRole` the workspace role. It plays the broker. The workspace role trusts the CI role and allows `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket` on the bucket. wsnap's session policy narrows that to one workspace and role. |
+| GCP (`gcs-downscoped`) | `WSNAP_GCP_WORKLOAD_IDENTITY_PROVIDER`, `WSNAP_GCP_SERVICE_ACCOUNT`, `WSNAP_GCP_BUCKET` | A workload identity pool with a GitHub provider. The service account has `roles/storage.objectAdmin` on the bucket and grants `roles/iam.workloadIdentityUser` to the repository's principal set. The tests use the external-account credential file as the broker's `GOOGLE_CREDENTIALS_JSON`. |
+| Azure (`azure-sas`) | `WSNAP_AZURE_CLIENT_ID`, `WSNAP_AZURE_TENANT_ID`, `WSNAP_AZURE_SUBSCRIPTION_ID`, `WSNAP_AZURE_ACCOUNT` | An app registration with a federated credential for the repository, and the role `Storage Account Key Operator Service Role` on the storage account. The workflow reads the account key, as the broker's `AZURE_ACCOUNT_KEY`. Each run creates per-workspace containers; delete old ones from time to time. |
+
 ## End-to-end scenarios
 
 `test/e2e/run.sh` runs on a kind cluster. Use three nodes for the

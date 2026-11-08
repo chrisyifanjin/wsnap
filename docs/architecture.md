@@ -36,7 +36,7 @@ can delay a snapshot. Monitor `status.lastError` and failed rescues.
 flowchart LR
   subgraph cluster[Kubernetes cluster]
     subgraph ctrl[wsnap-controller Deployment, 2 replicas]
-      B[Broker<br/>HTTP :8080]
+      B[Broker<br/>HTTPS :8443]
       W[Admission webhook<br/>:9443]
       R[Reconcilers<br/>leader only]
     end

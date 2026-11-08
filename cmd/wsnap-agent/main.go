@@ -33,7 +33,7 @@ func main() {
 	}
 	fs := flag.NewFlagSet(mode, flag.ExitOnError)
 	cfg := agent.Config{}
-	fs.StringVar(&cfg.BrokerURL, "broker-url", envOr("WSNAP_BROKER_URL", "http://wsnap-broker.wsnap-system.svc:8080"), "broker URL")
+	fs.StringVar(&cfg.BrokerURL, "broker-url", envOr("WSNAP_BROKER_URL", "https://wsnap-broker.wsnap-system.svc:8443"), "broker URL")
 	fs.StringVar(&cfg.TokenFile, "token-file", envOr("WSNAP_TOKEN_FILE", "/var/run/secrets/wsnap/token"), "projected service account token")
 	fs.StringVar(&cfg.Dir, "dir", envOr("WSNAP_DIR", "/workspace"), "workspace directory")
 	fs.StringVar(&cfg.StateDir, "state-dir", envOr("WSNAP_STATE_DIR", "/var/lib/wsnap"), "private state directory")
@@ -57,15 +57,22 @@ func main() {
 			_ = os.Setenv("TMPDIR", tmp)
 		}
 	}
+	// The broker's CA comes from a file (a mounted ConfigMap) or inline
+	// from WSNAP_CA_PEM, which the webhook and the controller set when the
+	// broker manages its own certificate.
+	caPEM, caSource := []byte(os.Getenv("WSNAP_CA_PEM")), "WSNAP_CA_PEM"
 	if *caFile != "" {
-		pem, err := os.ReadFile(*caFile)
-		if err != nil {
+		var err error
+		if caPEM, err = os.ReadFile(*caFile); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		caSource = *caFile
+	}
+	if len(caPEM) > 0 {
 		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			fmt.Fprintln(os.Stderr, "no certificates in", *caFile)
+		if !pool.AppendCertsFromPEM(caPEM) {
+			fmt.Fprintln(os.Stderr, "no certificates in", caSource)
 			os.Exit(1)
 		}
 		cfg.HTTP.Transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}

@@ -10,7 +10,8 @@
 #   singlewriter two Pods, one workspace       kopia  + S3 (STS)   second Pod waits, then restores the first's final
 #   requests   control-plane CRs and data-plane files: capture/restore in the Pod or by a Job, fork
 #   chaos      broker down, leader killed mid-rescue, storage outage, sidecar SIGKILL, crash + replacement race
-#   tls        broker over HTTPS: sidecars and Jobs verify its CA; plain HTTP and an untrusted CA are refused
+#   tls        broker with an operator's certificate: sidecars and Jobs verify its CA; plain HTTP and an untrusted CA are refused
+#              (every other scenario runs over the TLS certificate that the broker manages itself)
 #   multinode  (needs 2+ workers) cross-node restore; the mover follows a node-local PV; drain takes a final snapshot
 #   webhook    sidecar injection into bare Pods and Sandboxes; unsafe Pods refused; fail closed while down
 #   gateway    REST gateway API gated by RBAC; data-plane request through the agent-sandbox router and sandboxd
@@ -57,6 +58,7 @@ pv_policy_is() { [[ $(kubectl get pv "$1" -o jsonpath='{.spec.persistentVolumeRe
 
 # fresh_workspace drops the Workspace record so earlier runs cannot satisfy
 # a check. The repository data in the backend stays.
+repo_reason_is() { [[ $(kubectl -n "$1" get snaprepo "$2" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}') == "$3" ]]; }
 repo_condition() { [[ $(kubectl -n "$NS" get snaprepo "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].status}") == "$3" ]]; }
 
 # tick writes a file so the sidecar sees a change, then checks for a
@@ -268,9 +270,14 @@ setup() {
 	kubectl -n storage delete job minio-setup --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	kubectl apply -f "$M/minio.yaml" >/dev/null
 	# The TLS scenario patches the Deployment outside kubectl apply's field
-	# ownership. Recreate it so a later setup really returns to plain HTTP.
+	# ownership. Recreate it so a later setup really returns to the defaults.
 	kubectl -n wsnap-system delete deploy wsnap-controller --ignore-not-found --wait=true >/dev/null
-	kubectl apply -k "$ROOT/config/default" >/dev/null
+	# Least privilege: the controller reads Secrets only where a namespace
+	# binds wsnap-secret-reader.
+	kubectl apply -k "$ROOT/config/namespaced-secrets" >/dev/null
+	kubectl delete clusterrolebinding wsnap-secret-reader --ignore-not-found >/dev/null
+	kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl -n "$NS" apply -f "$ROOT/config/samples/secret-access.yaml" >/dev/null
 	kubectl -n wsnap-system rollout restart deploy/wsnap-controller >/dev/null
 	kubectl -n storage wait --for=condition=complete job/minio-setup --timeout=180s >/dev/null
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
@@ -281,7 +288,14 @@ setup() {
 	done
 	repo_condition tar-fs CredentialsScoped False || die "static provider not flagged as unscoped"
 	repo_condition kopia-s3 CredentialsScoped True || die "s3-sts provider not flagged as scoped"
-	pass "setup (repositories validated: Ready, CredentialsScoped reported)"
+	kubectl -n wsnap-system get secret wsnap-broker-cert >/dev/null || die "the broker did not create its TLS certificate"
+	# A namespace without the RoleBinding: wsnap may not read its Secret.
+	kubectl create namespace e2e-nobind --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl -n e2e-nobind create secret generic creds --from-literal=WSNAP_MASTER_KEY=0123456789abcdef --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: SnapshotRepository\nmetadata: {name: r, namespace: e2e-nobind}\nspec: {engine: {type: restic}, backend: {filesystem: {path: /x}}, credentials: {secretName: creds}}\n' | kubectl apply -f - >/dev/null
+	wait_for 60 "SecretForbidden without a RoleBinding" repo_reason_is e2e-nobind r SecretForbidden
+	kubectl delete namespace e2e-nobind --wait=false >/dev/null
+	pass "setup (repositories Ready, CredentialsScoped reported; broker on TLS; Secrets readable only where bound)"
 }
 
 scenario_pvc() {
@@ -413,7 +427,7 @@ scenario_emptydir() {
 	log "isolation: the workload container cannot get credentials"
 	local code
 	code=$(kubectl -n "$NS" exec tmp-2 -c agent -- sh -c \
-		'wget -q -S -O- --post-data={\"role\":\"snapshot\"} http://wsnap-broker.wsnap-system.svc:8080/v1/credentials 2>&1 | grep -o "HTTP/1.1 [0-9]*" | head -1' || true)
+		'wget -q -S -O- --no-check-certificate --post-data={\"role\":\"snapshot\"} https://wsnap-broker.wsnap-system.svc:8443/v1/credentials 2>&1 | grep -o "HTTP/1.1 [0-9]*" | head -1' || true)
 	[[ $code == "HTTP/1.1 401" ]] || die "broker answered the workload container with: $code"
 	kubectl -n "$NS" exec tmp-2 -c agent -- test ! -e /var/run/secrets/wsnap/token || die "workload container sees the token"
 	pass "workload container: no token mounted, broker returns 401"
@@ -616,13 +630,13 @@ scenario_chaos() {
 broker_tls() { # on|off
 	local args
 	if [[ $1 == on ]]; then
-		args='["--broker-addr=:8080","--broker-url=https://wsnap-broker.wsnap-system.svc:8080","--agent-image=wsnap-agent:dev","--leader-elect","--tls-cert-file=/tls/tls.crt","--tls-key-file=/tls/tls.key","--agent-ca-configmap=wsnap-ca"]'
+		args='["--broker-addr=:8443","--broker-url=https://wsnap-broker.wsnap-system.svc:8443","--agent-image=wsnap-agent:dev","--leader-elect","--tls-cert-file=/tls/tls.crt","--tls-key-file=/tls/tls.key","--agent-ca-configmap=wsnap-ca"]'
 		kubectl -n wsnap-system patch deploy wsnap-controller --type strategic -p '{"spec":{"template":{"spec":{
 			"volumes":[{"name":"tls","secret":{"secretName":"wsnap-broker-tls"}}],
 			"containers":[{"name":"controller","args":'"$args"',
 				"volumeMounts":[{"name":"tls","mountPath":"/tls","readOnly":true}]}]}}}}' >/dev/null
 	else
-		args='["--broker-addr=:8080","--broker-url=http://wsnap-broker.wsnap-system.svc:8080","--agent-image=wsnap-agent:dev","--leader-elect"]'
+		args='["--broker-addr=:8443","--broker-url=https://wsnap-broker.wsnap-system.svc:8443","--agent-image=wsnap-agent:dev","--leader-elect"]'
 		kubectl -n wsnap-system patch deploy wsnap-controller --type strategic -p '{"spec":{"template":{"spec":{
 			"volumes":[{"name":"tls","$patch":"delete"}],
 			"containers":[{"name":"controller","args":'"$args"',
@@ -630,15 +644,16 @@ broker_tls() { # on|off
 	fi
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
 	# An old leader can still hold the lease after the rollout and create
-	# Jobs with the old broker URL. Wait for a leader with the new flags.
-	local url=http://; [[ $1 == on ]] && url=https://
-	wait_for 120 "leader with broker URL $url" leader_uses "--broker-url=$url"
+	# Jobs with the old broker settings. Wait for a leader with the new flags.
+	wait_for 120 "leader with operator certificate $1" leader_operator_cert "$1"
 }
 
-leader_uses() {
-	local leader; leader=$(leader_pod)
-	[[ -n $leader ]] && kubectl -n wsnap-system get pod "$leader" -o jsonpath='{.metadata.deletionTimestamp} {.spec.containers[0].args}' |
-		grep -q "^ .*$1"
+leader_operator_cert() { # on|off
+	local leader args; leader=$(leader_pod)
+	[[ -n $leader ]] || return 1
+	args=$(kubectl -n wsnap-system get pod "$leader" -o jsonpath='{.metadata.deletionTimestamp} {.spec.containers[0].args}') || return 1
+	[[ $args == " "* ]] || return 1 # terminating
+	if [[ $1 == on ]]; then [[ $args == *--tls-cert-file* ]]; else [[ $args != *--tls-cert-file* ]]; fi
 }
 
 scenario_tls() {
@@ -657,8 +672,8 @@ scenario_tls() {
 	kubectl -n "$NS" delete pvc tls-a --ignore-not-found --wait=true >/dev/null
 	fresh_workspace ws-tls
 	apply_pvc tls-a >/dev/null
-	WSNAP_TLS=trusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8080, --ca-file=/var/run/wsnap-ca/ca.crt" \
-		wait_for 60 "webhook admission after TLS rollout" apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes
+	WSNAP_TLS=trusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8443, --ca-file=/var/run/wsnap-ca/ca.crt" \
+		wait_for 60 "webhook admission after the TLS rollout" apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes
 	wait_for 180 "tls-1 ready" pod_ready tls-1
 	write_file tls-1 /workspace/secret.txt over-tls
 	kubectl -n "$NS" delete pod tls-1 --wait=true >/dev/null
@@ -670,14 +685,14 @@ scenario_tls() {
 	pass "controller-created mover Job trusted the CA through --agent-ca-configmap"
 
 	fresh_workspace ws-tls-bad
-	WSNAP_TLS=untrusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8080" \
+	WSNAP_TLS=untrusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8443" \
 		apply_pod tls-bad ws-tls-bad kopia-keep emptydir yes >/dev/null
 	wait_for 60 "untrusted refusal" logs_contain tls-bad "certificate signed by unknown authority"
 	pod_ready tls-bad && die "a sidecar that does not trust the CA became ready"
 	pass "a sidecar without the CA refuses the broker (x509: unknown authority)"
 	kubectl -n "$NS" delete pod tls-bad --wait=true >/dev/null
 
-	apply_pod tls-plain ws-tls-bad kopia-keep emptydir yes >/dev/null
+	SIDECAR_TLS_ARGS=", --broker-url=http://wsnap-broker.wsnap-system.svc:8443" apply_pod tls-plain ws-tls-bad kopia-keep emptydir yes >/dev/null
 	wait_for 60 "plain HTTP refusal" logs_contain tls-plain "initialization failed"
 	pod_ready tls-plain && die "a plain-HTTP sidecar became ready against a TLS broker"
 	pass "plain HTTP to the TLS broker is refused"
@@ -685,7 +700,7 @@ scenario_tls() {
 	kubectl -n "$NS" delete pvc tls-a >/dev/null
 
 	broker_tls off
-	pass "broker back on plain HTTP for the other scenarios"
+	pass "broker back on its own certificate for the other scenarios"
 	rm -rf "$dir"
 }
 
@@ -854,8 +869,16 @@ EOF
 	wait_for 60 "webhook back" webhook_admits
 }
 
-gw_curl() { kubectl -n "$NS" exec gw-client -- curl -sS "$@"; }
-gw_status() { kubectl -n "$NS" exec gw-client -- curl -s -o /dev/null -w '%{http_code}' "$@"; }
+# copy_broker_ca puts the broker's CA into gw-client. It passes the CA as
+# an argument, not on stdin: "kubectl exec -i" can drop stdin and leave an
+# empty file. It succeeds only when a PEM certificate landed.
+copy_broker_ca() {
+	local ca
+	ca=$(kubectl -n wsnap-system get secret wsnap-broker-cert -o jsonpath='{.data.ca\.crt}') && [[ -n $ca ]] || return 1
+	kubectl -n "$NS" exec gw-client -- sh -c "echo '$ca' | base64 -d > /tmp/broker-ca.crt && grep -q 'BEGIN CERTIFICATE' /tmp/broker-ca.crt"
+}
+gw_curl() { kubectl -n "$NS" exec gw-client -- curl -sS --cacert /tmp/broker-ca.crt "$@"; }
+gw_status() { kubectl -n "$NS" exec gw-client -- curl -s --cacert /tmp/broker-ca.crt -o /dev/null -w '%{http_code}' "$@"; }
 
 scenario_gateway() {
 	log "gateway: REST API for platforms and gateways, authorized by Kubernetes RBAC"
@@ -891,7 +914,8 @@ EOF
 	local tok nob url resp
 	tok=$(kubectl -n "$NS" create token platform)
 	nob=$(kubectl -n "$NS" create token nobody)
-	url=http://wsnap-broker.wsnap-system.svc:8080/v1/namespaces/$NS/workspaces/ws-gw
+	wait_for 60 "broker CA in gw-client" copy_broker_ca
+	url=https://wsnap-broker.wsnap-system.svc:8443/v1/namespaces/$NS/workspaces/ws-gw
 	resp=$(gw_curl -X POST -H "Authorization: Bearer $tok" -d '{"wait":true,"timeoutSeconds":45}' "$url/snapshots")
 	[[ $resp == *'"phase":"Succeeded"'* && $resp == *'"executor":"sidecar"'* ]] || die "gateway snapshot did not succeed: $resp"
 	pass "POST .../snapshots with wait=true: $resp"

@@ -32,9 +32,9 @@ func ReleaseProtectedVolumes(ctx context.Context, c client.Client, force bool) (
 	for i := range pvs.Items {
 		pv := &pvs.Items[i]
 		a := pv.Annotations
-		hasFinal := a[workspace.AnnotationWriterPod] != "" && a[workspace.AnnotationWriterPod] == a[workspace.AnnotationFinalPod]
+		hasFinal := workspace.HasFinalSnapshot(a)
 		rescue := a[wsnapv1.AnnotationRescue]
-		if !hasFinal && rescue != RescueDone && !force {
+		if !hasFinal && rescue != wsnapv1.RescueDone && !force {
 			if pv.Status.Phase == corev1.VolumeReleased {
 				res.Skipped[pv.Name] = fmt.Sprintf("released without a final snapshot (rescue %q); its data is in no snapshot", rescue)
 			} else {

@@ -37,6 +37,23 @@ to the release instead; it pins both image tags.
 The sample volume needs a StorageClass. Check yours with
 `kubectl get storageclass` before creating a Pod.
 
+### Limit which Secrets wsnap can read
+
+By default the controller may `get` Secrets in every namespace, because
+each SnapshotRepository's Secret lives in its own namespace. To allow only
+the namespaces you choose, install `config/namespaced-secrets` instead of
+`config/default`, and bind the reader role in each namespace that has
+repositories:
+
+```sh
+kubectl apply -k config/namespaced-secrets
+kubectl -n agents apply -f config/samples/secret-access.yaml
+```
+
+A repository in a namespace without the binding reports `Ready=False` with
+reason `SecretForbidden`, and wsnap checks again every minute. wsnap never
+lists or watches Secrets.
+
 ### Safe PVC provisioning
 
 Pick a StorageClass whose CSI driver, encryption, topology, and reclaim
@@ -85,9 +102,12 @@ The controller flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--agent-image` | `ghcr.io/chrisyifanjin/wsnap-agent:dev` | Image of the sidecar and the Jobs. |
-| `--broker-url` | `http://wsnap-broker.wsnap-system.svc:8080` | URL that agents use. Use `https://` with TLS. |
-| `--tls-cert-file`, `--tls-key-file` | empty | Serve the broker over TLS. Reloaded when the files change. |
-| `--agent-ca-configmap` | empty | ConfigMap (key `ca.crt`) that Jobs mount to trust the broker. |
+| `--broker-addr` | `:8443` | Broker listen address. |
+| `--broker-url` | `https://wsnap-broker.wsnap-system.svc:8443` | URL that agents use. |
+| `--broker-manage-certs` | `true` | Without `--tls-cert-file`, generate the broker's certificate into the Secret `wsnap-broker-cert` and give agents its CA in `WSNAP_CA_PEM`. Set `false` (and an `http://` URL) only to serve plain HTTP. |
+| `--broker-plain-addr` | empty | Also serve plain HTTP here (`:8080`) for agents started before an upgrade to TLS. |
+| `--tls-cert-file`, `--tls-key-file` | empty | Serve the broker with your own certificate (cert-manager). Reloaded when the files change. |
+| `--agent-ca-configmap` | empty | With your own certificate: ConfigMap (key `ca.crt`) in workload namespaces that sidecars and Jobs mount to trust the broker. |
 | `--allow-automounted-tokens` | `false` | Accept Pods that mount the default API token. Do not use this with untrusted code. |
 | `--pod-rate`, `--pod-burst` | `1`, `20` | Broker requests per second per Pod. |
 | `--webhook-manage-certs` | `true` | Generate the webhook certificate. Set `false` to use cert-manager. |
@@ -399,6 +419,12 @@ snapshot records count as epoch 0. PVs that an earlier version marked
 `wsnap.dev/rescue=skipped-newer-writer` stay as they are; remove the
 annotation to rescue them (their data is kept without replacing newer
 history).
+
+Upgrading from a plain-HTTP broker (`http://...:8080`) to the TLS default:
+running sidecars keep the old URL until their Pods restart. Add
+`--broker-plain-addr=:8080` to the controller for the upgrade, so they can
+still take their final snapshots. Remove it when every Pod started before
+the upgrade is gone.
 
 ## Troubleshoot
 

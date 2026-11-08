@@ -19,9 +19,16 @@ import (
 // Only restic accepts a raw access token (GOOGLE_ACCESS_TOKEN). Kopia's GCS
 // backend needs a credentials file, so pair Kopia with the static provider
 // or reach GCS through its S3-compatible XML API.
-type GCSDownscoped struct{}
+type GCSDownscoped struct {
+	// AllowExternalAccount also accepts an external_account (workload
+	// identity federation) configuration. Such a file names a token source
+	// (a local file, a URL or a command) that the caller of Issue would
+	// read or run. The broker reads the Secret from a tenant namespace, so
+	// it never sets this; tests that log in with OIDC do.
+	AllowExternalAccount bool
+}
 
-func (GCSDownscoped) Issue(ctx context.Context, req Request) (protocol.Credentials, error) {
+func (g GCSDownscoped) Issue(ctx context.Context, req Request) (protocol.Credentials, error) {
 	var out protocol.Credentials
 	if req.Backend.GCS == nil {
 		return out, fmt.Errorf("provider gcs-downscoped needs a gcs backend")
@@ -30,7 +37,11 @@ func (GCSDownscoped) Issue(ctx context.Context, req Request) (protocol.Credentia
 	if err != nil {
 		return out, err
 	}
-	root, err := google.CredentialsFromJSON(ctx, []byte(keyJSON), "https://www.googleapis.com/auth/cloud-platform")
+	credType := google.ServiceAccount
+	if g.AllowExternalAccount && strings.Contains(keyJSON, `"external_account"`) {
+		credType = google.ExternalAccount
+	}
+	root, err := google.CredentialsFromJSONWithType(ctx, []byte(keyJSON), credType, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {
 		return out, fmt.Errorf("parse %s: %w", KeyGoogleCredentials, err)
 	}
