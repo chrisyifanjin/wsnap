@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/time/rate"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"net/http"
 	"net/http/httptest"
@@ -937,11 +938,16 @@ func TestJobPodMustRunTheJobTemplate(t *testing.T) {
 		VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-token", MountPath: "/t"}}}
 	tokenVol := corev1.Volume{Name: "wsnap-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "wsnap", Path: "token"}}}}}}
-	tmpl := corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol}}
+	stateVol := corev1.Volume{Name: "wsnap-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}
+	agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{Name: "wsnap-state", MountPath: "/var/lib/wsnap"})
+	tmpl := corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol, stateVol}}
+	vols := tmpl.Volumes
 	evil := agent
 	evil.Image = "attacker/image"
 	sidecarMesh := corev1.Container{Name: "mesh-proxy", Image: "mesh:1"}
 	stealer := corev1.Container{Name: "stealer", Image: "x", VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-token", MountPath: "/t"}}}
+	// Kopia keeps the storage credential in the state volume (reviewer #5).
+	stateThief := corev1.Container{Name: "thief", Image: "x", VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-state", MountPath: "/s"}}}
 	for _, tc := range []struct {
 		name string
 		spec corev1.PodSpec
@@ -949,10 +955,11 @@ func TestJobPodMustRunTheJobTemplate(t *testing.T) {
 		want int
 	}{
 		{"the job's own pod", tmpl, false, 200},
-		{"an admission webhook added a container", corev1.PodSpec{Containers: []corev1.Container{agent, sidecarMesh}, Volumes: []corev1.Volume{tokenVol}}, false, 200},
-		{"another image", corev1.PodSpec{Containers: []corev1.Container{evil}, Volumes: []corev1.Volume{tokenVol}}, false, 403},
-		{"an extra container reads the token", corev1.PodSpec{Containers: []corev1.Container{agent, stealer}, Volumes: []corev1.Volume{tokenVol}}, false, 403},
-		{"shared process namespace", corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol}, ShareProcessNamespace: ptr.To(true)}, false, 403},
+		{"an admission webhook added a container", corev1.PodSpec{Containers: []corev1.Container{agent, sidecarMesh}, Volumes: vols}, false, 200},
+		{"another image", corev1.PodSpec{Containers: []corev1.Container{evil}, Volumes: vols}, false, 403},
+		{"an extra container reads the token", corev1.PodSpec{Containers: []corev1.Container{agent, stealer}, Volumes: vols}, false, 403},
+		{"an extra container reads the state volume", corev1.PodSpec{Containers: []corev1.Container{agent, stateThief}, Volumes: vols}, false, 403},
+		{"shared process namespace", corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: vols, ShareProcessNamespace: ptr.To(true)}, false, 403},
 		{"the job finished", tmpl, true, 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1132,5 +1139,56 @@ func TestRestoreWaitsForAStoppedWritersBoundVolume(t *testing.T) {
 	_ = e.client.Update(context.Background(), pvA)
 	if rec, _ := e.call(t, "/v1/credentials", "token-b", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
 		t.Fatalf("restore got %d after the volume was saved: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGarbageTokensDoNotFloodTheAPIServer (reviewer #5 finding 2): random
+// bearer tokens from one client stop reaching TokenReview after a burst,
+// and the global cap bounds TokenReviews from many clients.
+func TestGarbageTokensDoNotFloodTheAPIServer(t *testing.T) {
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
+	reviews := 0
+	e.srv.Auth = &CachingAuthenticator{Next: rejectAll{&reviews}, TTL: time.Minute}
+	for i := range 500 {
+		e.call(t, "/v1/credentials", fmt.Sprintf("garbage-%d", i), protocol.CredentialsRequest{Role: protocol.RoleSnapshot})
+	}
+	if reviews > 20 {
+		t.Fatalf("500 garbage tokens from one client caused %d TokenReviews", reviews)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "garbage-x", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("a client with many failed logins got %d, want 429", rec.Code)
+	}
+	reviews = 0
+	capped := &CachingAuthenticator{Next: rejectAll{&reviews}, TTL: time.Minute, Reviews: rate.NewLimiter(0, 5)}
+	for i := range 100 {
+		_, _ = capped.Authenticate(context.Background(), fmt.Sprintf("t-%d", i))
+	}
+	if reviews != 5 {
+		t.Fatalf("the global cap let %d TokenReviews through, want 5", reviews)
+	}
+}
+
+type rejectAll struct{ n *int }
+
+func (a rejectAll) Authenticate(context.Context, string) (Identity, error) {
+	*a.n++
+	return Identity{}, fmt.Errorf("token rejected")
+}
+
+// TestTargetedRequestIsNotClaimedBySidecar (reviewer #5 suspicion): a
+// rescue request for a stopped writer's volume must go to a Job.
+func TestTargetedRequestIsNotClaimedBySidecar(t *testing.T) {
+	targeted := &wsnapv1.WorkspaceSnapshot{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-unsaved-x",
+		Annotations: map[string]string{wsnapv1.AnnotationVolumeName: "pv-old"}},
+		Spec: wsnapv1.WorkspaceSnapshotSpec{WorkspaceName: "ws1"}, Status: wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotPending}}
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"), targeted)
+	e.srv.Client = &statusCompat{e.client}
+	e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot})
+	resp, err := e.srv.claimRequests(context.Background(), &caller{pod: workloadPod("w1", "u1", "ws1"), id: workspace.Identity{Namespace: ns, Name: "ws1", Repository: "repo"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Requests) != 0 {
+		t.Fatalf("the sidecar claimed a request for another volume: %v", resp.Requests)
 	}
 }

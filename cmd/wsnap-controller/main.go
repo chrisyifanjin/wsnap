@@ -148,6 +148,8 @@ func main() {
 		Auth: &broker.CachingAuthenticator{
 			Next: broker.TokenReviewAuthenticator{Client: clientset, Audience: *audience},
 			TTL:  time.Minute,
+			// A flood of new tokens must not overload the API server.
+			Reviews: rate.NewLimiter(50, 100),
 		},
 		Log:                    ctrl.Log.WithName("broker"),
 		AllowAutomountedTokens: *allowAPITok,

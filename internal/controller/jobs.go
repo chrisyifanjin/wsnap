@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/chrisyifanjin/wsnap/internal/workspace"
 	"slices"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -93,7 +95,7 @@ func (c JobConfig) newAgentJob(kind string, name string, ws *wsnapv1.Workspace, 
 		ObjectMeta: metav1.ObjectMeta{Namespace: ws.Namespace, Name: name, Labels: labels},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To[int32](3),
-			ActiveDeadlineSeconds:   ptr.To[int64](jobDeadline),
+			ActiveDeadlineSeconds:   ptr.To(max(int64(jobDeadline), int64(3*workspace.OperationTimeout(repo)/time.Second))),
 			TTLSecondsAfterFinished: ptr.To[int32](3600),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},

@@ -4,6 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -24,6 +27,14 @@ type PodLimiter struct {
 type bucket struct {
 	l    *rate.Limiter
 	seen time.Time
+}
+
+// Blocked reports whether key has no tokens left, without spending one.
+func (p *PodLimiter) Blocked(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b, ok := p.buckets[key]
+	return ok && b.l.Tokens() < 1
 }
 
 // Allow reports whether the Pod may make another request now.
@@ -52,6 +63,21 @@ func (p *PodLimiter) Allow(podUID string) bool {
 	return b.l.Allow()
 }
 
+// newFailedLoginLimiter bounds failed logins per client IP: after a burst
+// of rejected tokens, a client waits before the broker sends its tokens to
+// the API server again. A real agent's token almost never fails.
+func newFailedLoginLimiter() *PodLimiter {
+	return &PodLimiter{Rate: rate.Every(10 * time.Second), Burst: 10}
+}
+
+// clientIP is the remote address without its port.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 // CachingAuthenticator remembers successful token reviews for a short
 // time. Each sidecar request would otherwise cost one TokenReview call to
 // the API server. The broker still reads the Pod live and checks its UID,
@@ -59,6 +85,9 @@ func (p *PodLimiter) Allow(podUID string) bool {
 type CachingAuthenticator struct {
 	Next Authenticator
 	TTL  time.Duration
+	// Reviews bounds TokenReview calls (cache misses) for all callers, so
+	// no flood of new tokens can overload the API server. Nil: no bound.
+	Reviews *rate.Limiter
 
 	mu    sync.Mutex
 	cache map[[32]byte]cachedIdentity
@@ -83,6 +112,9 @@ func (c *CachingAuthenticator) Authenticate(ctx context.Context, token string) (
 		return e.id, e.err
 	}
 	c.mu.Unlock()
+	if c.Reviews != nil && !c.Reviews.Allow() {
+		return Identity{}, fmt.Errorf("%w: too many token reviews; try again", ErrAuthUnavailable)
+	}
 	id, err := c.Next.Authenticate(ctx, token)
 	if errors.Is(err, ErrAuthUnavailable) {
 		return id, err // an outage, not a verdict on the token

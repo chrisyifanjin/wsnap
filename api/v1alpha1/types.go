@@ -245,6 +245,11 @@ type SnapshotRepositorySpec struct {
 	Retention RetentionSpec `json:"retention,omitempty"`
 	// +optional
 	Jobs JobsSpec `json:"jobs,omitempty"`
+	// operationTimeout bounds one snapshot or restore operation, in the
+	// sidecar and in Jobs. Default 30m. Raise it for very large
+	// workspaces, and keep credentials.ttl at least 5m longer.
+	// +optional
+	OperationTimeout metav1.Duration `json:"operationTimeout,omitempty"`
 }
 
 // SnapshotRepositoryStatus is the observed state of a SnapshotRepository.

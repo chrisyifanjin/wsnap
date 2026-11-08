@@ -58,8 +58,9 @@ type Config struct {
 	HTTP             *http.Client
 	Log              *slog.Logger
 
-	mu    sync.Mutex
-	cache map[protocol.Role]cachedCredentials
+	mu            sync.Mutex
+	cache         map[protocol.Role]cachedCredentials
+	repoOpTimeout time.Duration
 }
 
 type cachedCredentials struct {
@@ -189,6 +190,7 @@ func (c *Config) credentials(ctx context.Context, role protocol.Role) (*protocol
 	if err := c.post(ctx, "/v1/credentials", protocol.CredentialsRequest{Role: role}, &resp); err != nil {
 		return nil, err
 	}
+	c.adopt(&resp)
 	if cacheable {
 		until := time.Now().Add(unexpiringReuse)
 		if exp := resp.Credentials.ExpiresAt; !exp.IsZero() {
@@ -196,10 +198,10 @@ func (c *Config) credentials(ctx context.Context, role protocol.Role) (*protocol
 			// OperationTimeout; it must not expire halfway. With the
 			// defaults (1h credential, 30m operations) one credential
 			// serves 25 minutes of snapshots.
-			until = exp.Add(-max(credentialMargin, c.OperationTimeout+credentialMargin))
-			if time.Until(exp) < c.OperationTimeout {
+			until = exp.Add(-max(credentialMargin, c.operationTimeout()+credentialMargin))
+			if time.Until(exp) < c.operationTimeout() {
 				c.Log.Warn("credentials expire before an operation's time limit; raise credentials.ttl or lower --operation-timeout",
-					"expiresIn", time.Until(exp).Round(time.Second), "operationTimeout", c.OperationTimeout)
+					"expiresIn", time.Until(exp).Round(time.Second), "operationTimeout", c.operationTimeout())
 			}
 		}
 		c.mu.Lock()
@@ -218,6 +220,7 @@ func (c *Config) credentialsFor(ctx context.Context, req protocol.CredentialsReq
 	if err := c.post(ctx, "/v1/credentials", req, &resp); err != nil {
 		return nil, err
 	}
+	c.adopt(&resp)
 	return &resp, nil
 }
 
@@ -282,10 +285,30 @@ func (c *Config) open(ctx context.Context, role protocol.Role) (*protocol.Creden
 }
 
 func (c *Config) withOperationTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.OperationTimeout <= 0 {
+	d := c.operationTimeout()
+	if d <= 0 {
 		return context.WithCancel(ctx)
 	}
-	return context.WithTimeout(ctx, c.OperationTimeout)
+	return context.WithTimeout(ctx, d)
+}
+
+// operationTimeout is the repository's spec.operationTimeout once the
+// broker has sent it, else the --operation-timeout flag.
+func (c *Config) operationTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.repoOpTimeout > 0 {
+		return c.repoOpTimeout
+	}
+	return c.OperationTimeout
+}
+
+func (c *Config) adopt(resp *protocol.CredentialsResponse) {
+	if d := resp.OperationTimeout.Duration; d > 0 {
+		c.mu.Lock()
+		c.repoOpTimeout = d
+		c.mu.Unlock()
+	}
 }
 
 // state is what the sidecar knows about the newest snapshot of the volume.
@@ -352,8 +375,17 @@ func (c *Config) takeSnapshot(ctx context.Context, role protocol.Role, o snapOpt
 		return st, "", err
 	}
 	rep.SnapshotID = snap.ID
+	if snap.Partial && rep.Final {
+		// Some files are in no snapshot: record what was saved, but do not
+		// mark the volume final, so wsnap never deletes it.
+		c.Log.Warn("snapshot is partial: some files could not be read; not marking it final", "id", snap.ID)
+		rep.Final = false
+	}
 	if err := c.report(context.WithoutCancel(ctx), rep); err != nil {
 		return st, "", err
+	}
+	if snap.Partial && o.final && role == protocol.RoleMover {
+		return st, snap.ID, fmt.Errorf("snapshot %s is partial: some files could not be read; keeping the volume", snap.ID)
 	}
 	c.Log.Info("snapshot taken", "id", snap.ID, "final", o.final, "request", o.request, "seconds", rep.EndTime.Sub(start).Seconds())
 	return state{id: snap.ID, fp: fp, valid: fpErr == nil}, snap.ID, nil

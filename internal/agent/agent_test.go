@@ -36,6 +36,7 @@ type fakeBroker struct {
 	// restore overrides for pinned and fork restores
 	restoreID, restoreSource string
 	latestID                 string // LatestSnapshotID for restores
+	opTimeout                time.Duration
 	restoreRepo              string
 	waitQueue                chan string
 	failReports              atomic.Bool // answer reports with 503
@@ -68,6 +69,7 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			RepositoryPassword: "pw",
 			Credentials:        protocol.Credentials{Scoped: true, ExpiresAt: time.Now().Add(time.Hour)},
 			Interval:           protocol.Duration{Duration: time.Hour},
+			OperationTimeout:   protocol.Duration{Duration: b.opTimeout},
 		}
 		if req.Role == protocol.RoleRestore {
 			resp.SnapshotID, resp.SourceWorkspace, resp.LatestSnapshotID = b.restoreID, b.restoreSource, b.latestID
@@ -1166,4 +1168,39 @@ func TestRequestFilesAreSpaced(t *testing.T) {
 	}
 	cancel()
 	<-errc
+}
+
+// TestRepositoryOperationTimeoutIsUsed (reviewer #5 finding 4): the
+// repository's operationTimeout, sent by the broker, bounds operations;
+// before, only a flag that nothing set could change it.
+func TestRepositoryOperationTimeoutIsUsed(t *testing.T) {
+	c, b := setup(t)
+	c.OperationTimeout = 30 * time.Minute
+	b.opTimeout = 3 * time.Hour
+	if _, err := c.credentials(context.Background(), protocol.RoleSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.operationTimeout(); got != 3*time.Hour {
+		t.Fatalf("operation timeout %s, want the repository's 3h", got)
+	}
+}
+
+// TestPartialMoverSnapshotKeepsTheVolume (reviewer #5 finding 5): files
+// the mover could not read are in no snapshot, so the snapshot is recorded
+// but not final, and the Job fails: the PV is kept.
+func TestPartialMoverSnapshotKeepsTheVolume(t *testing.T) {
+	wrapper := filepath.Join(t.TempDir(), "engine.sh")
+	script := "#!/bin/sh\nif [ \"$1\" = snapshot ]; then " + tarEngine(t) + " snapshot | sed 's/}$/,\"partial\":true}/'; exit; fi\nexec " + tarEngine(t) + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, b := setup(t, wrapper)
+	write(t, filepath.Join(c.Dir, "work.txt"), "data")
+	if err := c.RunMover(context.Background()); err == nil {
+		t.Fatal("a partial mover snapshot succeeded; the PV would be deleted with the unread files")
+	}
+	reps := b.snapshotReports()
+	if len(reps) != 1 || reps[0].SnapshotID == "" || reps[0].Final {
+		t.Fatalf("want the partial snapshot recorded, not final; got %+v", reps)
+	}
 }

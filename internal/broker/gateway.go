@@ -116,11 +116,16 @@ func (s *Server) gatewayCaller(r *http.Request, verb, ns, resource string) (auth
 	if !ok || token == "" {
 		return authnv1.UserInfo{}, fail(http.StatusUnauthorized, "missing bearer token")
 	}
+	ip := clientIP(r)
+	if s.failedLogins().Blocked(ip) {
+		return authnv1.UserInfo{}, fail(http.StatusTooManyRequests, "too many failed logins from %s", ip)
+	}
 	user, err := s.Gateway.AuthenticateUser(r.Context(), token)
 	if errors.Is(err, ErrAuthUnavailable) {
 		return user, fail(http.StatusServiceUnavailable, "%v", err)
 	}
 	if err != nil {
+		s.failedLogins().Allow(ip)
 		return user, fail(http.StatusUnauthorized, "%v", err)
 	}
 	if s.Limiter != nil && !s.Limiter.Allow("user/"+user.Username) {

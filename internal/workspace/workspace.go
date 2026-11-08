@@ -282,6 +282,14 @@ func KeepDaily(repo *wsnapv1.SnapshotRepository) int {
 	return 7
 }
 
+// OperationTimeout returns spec.operationTimeout with its default (30m).
+func OperationTimeout(repo *wsnapv1.SnapshotRepository) time.Duration {
+	if d := repo.Spec.OperationTimeout.Duration; d > 0 {
+		return d
+	}
+	return 30 * time.Minute
+}
+
 // TTL returns the credential lifetime with its default.
 func TTL(repo *wsnapv1.SnapshotRepository) time.Duration {
 	if d := repo.Spec.Credentials.TTL.Duration; d > 0 {

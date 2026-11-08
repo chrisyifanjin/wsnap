@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -52,6 +53,9 @@ type Server struct {
 	AllowAutomountedTokens bool
 	// Limiter bounds requests per Pod. Nil disables limiting.
 	Limiter *PodLimiter
+	// FailedLogins bounds failed logins per client IP. Nil: the default.
+	FailedLogins *PodLimiter
+	failedOnce   sync.Once
 	// Hub wakes long polls when requests appear. Nil falls back to
 	// periodic checks only.
 	Hub *Hub
@@ -124,12 +128,9 @@ func (s *Server) resolve(r *http.Request) (*caller, error) {
 	if !ok || token == "" {
 		return nil, fail(http.StatusUnauthorized, "missing bearer token")
 	}
-	ident, err := s.Auth.Authenticate(ctx, token)
-	if errors.Is(err, ErrAuthUnavailable) {
-		return nil, fail(http.StatusServiceUnavailable, "%v", err)
-	}
+	ident, err := s.authenticate(r, token)
 	if err != nil {
-		return nil, fail(http.StatusUnauthorized, "%v", err)
+		return nil, err
 	}
 	var pod corev1.Pod
 	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: ident.Namespace, Name: ident.PodName}, &pod); apierrors.IsNotFound(err) {
@@ -157,6 +158,33 @@ func (s *Server) resolve(r *http.Request) (*caller, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// authenticate validates an agent token. A client whose tokens keep
+// failing is refused (429) before its next token reaches the API server.
+func (s *Server) authenticate(r *http.Request, token string) (Identity, error) {
+	ip := clientIP(r)
+	if s.failedLogins().Blocked(ip) {
+		return Identity{}, fail(http.StatusTooManyRequests, "too many failed logins from %s", ip)
+	}
+	ident, err := s.Auth.Authenticate(r.Context(), token)
+	if errors.Is(err, ErrAuthUnavailable) {
+		return ident, fail(http.StatusServiceUnavailable, "%v", err)
+	}
+	if err != nil {
+		s.failedLogins().Allow(ip) // spend one failure
+		return ident, fail(http.StatusUnauthorized, "%v", err)
+	}
+	return ident, nil
+}
+
+func (s *Server) failedLogins() *PodLimiter {
+	s.failedOnce.Do(func() {
+		if s.FailedLogins == nil {
+			s.FailedLogins = newFailedLoginLimiter()
+		}
+	})
+	return s.FailedLogins
 }
 
 // checkNoAPIToken refuses workload Pods that mount the default API token.
@@ -237,8 +265,9 @@ func (s *Server) resolveJob(ctx context.Context, c *caller, job string) (*caller
 // security context), and every volume the template defines is unchanged.
 // The API server defaults a Job template and its Pods the same way, so
 // these fields match exactly for a Pod the Job controller created. Other
-// containers and volumes are allowed: admission webhooks (a service mesh,
-// for example) add them to real Job Pods.
+// containers and volumes are allowed, as long as the added containers
+// mount no template volume but ConfigMaps: admission webhooks (a service
+// mesh, for example) add them to real Job Pods.
 func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 	if ptr.Deref(pod.ShareProcessNamespace, false) || pod.HostPID {
 		return fmt.Errorf("shares a process namespace")
@@ -274,12 +303,25 @@ func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 			equality.Semantic.DeepEqual(p.EnvFrom, t.EnvFrom) && equality.Semantic.DeepEqual(p.VolumeMounts, t.VolumeMounts) &&
 			equality.Semantic.DeepEqual(p.SecurityContext, t.SecurityContext)
 	}
+	// Every template volume is private to the template's containers except
+	// ConfigMaps: besides the token, the state volume holds the engine's
+	// storage credentials (Kopia's repository.config), and the workspace
+	// and backend volumes hold data.
+	private := map[string]bool{}
+	for _, v := range tmpl.Volumes {
+		if v.ConfigMap == nil {
+			private[v.Name] = true
+		}
+	}
+	for name := range tokenVolumes {
+		private[name] = true
+	}
 	readsToken := func(mounts []corev1.VolumeMount) bool {
-		return slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return tokenVolumes[m.Name] })
+		return slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return private[m.Name] })
 	}
 	for _, c := range pod.InitContainers {
 		if readsToken(c.VolumeMounts) {
-			return fmt.Errorf("init container %q mounts the wsnap token", c.Name)
+			return fmt.Errorf("init container %q mounts a volume of the agent", c.Name)
 		}
 	}
 	for _, c := range pod.EphemeralContainers {
@@ -295,7 +337,7 @@ func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 			}
 			found++
 		} else if readsToken(c.VolumeMounts) {
-			return fmt.Errorf("container %q mounts the wsnap token", c.Name)
+			return fmt.Errorf("container %q mounts a volume of the agent", c.Name)
 		}
 	}
 	if found != len(tmpl.Containers) {
@@ -509,10 +551,11 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 	return &protocol.CredentialsResponse{
 		Namespace: c.id.Namespace, Workspace: c.id.Name, Role: req.Role,
 		Engine: eng, Backend: backend, Credentials: creds, RepositoryPassword: password,
-		Interval:   protocol.Duration{Duration: workspace.Interval(&repo)},
-		KeepLast:   workspace.KeepLast(&repo),
-		KeepDaily:  workspace.KeepDaily(&repo),
-		SnapshotID: snapshotID, SourceWorkspace: source, RestoreFromGeneration: restoreGen,
+		Interval:         protocol.Duration{Duration: workspace.Interval(&repo)},
+		KeepLast:         workspace.KeepLast(&repo),
+		KeepDaily:        workspace.KeepDaily(&repo),
+		OperationTimeout: protocol.Duration{Duration: workspace.OperationTimeout(&repo)},
+		SnapshotID:       snapshotID, SourceWorkspace: source, RestoreFromGeneration: restoreGen,
 		LatestSnapshotID: latestID, KeepIDs: keep,
 	}, nil
 }
@@ -1205,6 +1248,11 @@ func (s *Server) claimRequests(ctx context.Context, c *caller) (protocol.WaitRes
 	}
 	byWorkspace := []client.ListOption{client.InNamespace(c.id.Namespace), client.MatchingFields{workspace.IndexWorkspaceName: c.id.Name}}
 	claim := func(obj client.Object, st *wsnapv1.WorkspaceSnapshotStatus) (bool, error) {
+		if obj.GetAnnotations()[wsnapv1.AnnotationVolumeName] != "" {
+			// Targets a specific (stopped writer's) volume: only a Job can
+			// reach it; a sidecar would snapshot its own volume instead.
+			return false, nil
+		}
 		if st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" && st.ClaimedBy == string(c.pod.UID) {
 			// Claimed by this Pod but maybe never delivered: the answer to
 			// an earlier poll can be lost, or the sidecar restarted. Deliver

@@ -53,6 +53,11 @@ type Target struct {
 type Snapshot struct {
 	ID   string
 	Time time.Time
+	// Partial means some files could not be read and are missing from the
+	// snapshot (Kopia's ignored errors, restic's exit code 3). Such a
+	// snapshot is kept, but never counts as final: the volume still holds
+	// data that is in no snapshot.
+	Partial bool
 }
 
 // Engine is a snapshot technology.

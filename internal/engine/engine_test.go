@@ -443,6 +443,10 @@ func TestUnreadableFileDoesNotFailTheSnapshot(t *testing.T) {
 			if err != nil {
 				t.Fatalf("one unreadable file failed the snapshot: %v", err)
 			}
+			// It must say so, or a mover would mark it final (reviewer #5).
+			if !snap.Partial {
+				t.Error("a snapshot that skipped an unreadable file is not marked partial")
+			}
 			dst := t.TempDir()
 			if err := eng.Restore(ctx, tg, snap.ID, dst); err != nil {
 				t.Fatal(err)
