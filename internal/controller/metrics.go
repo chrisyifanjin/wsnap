@@ -70,9 +70,9 @@ func (c StateCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	var pvs corev1.PersistentVolumeList
 	if err := c.Reader.List(ctx, &pvs, client.MatchingLabels{wsnapv1.LabelProtected: "true"}); err == nil {
-		n := map[string]int{RescueRunning: 0, RescueFailed: 0}
+		n := map[string]int{wsnapv1.RescueRunning: 0, wsnapv1.RescueFailed: 0}
 		for _, pv := range pvs.Items {
-			if p := pv.Annotations[wsnapv1.AnnotationRescue]; p == RescueRunning || p == RescueFailed {
+			if p := pv.Annotations[wsnapv1.AnnotationRescue]; p == wsnapv1.RescueRunning || p == wsnapv1.RescueFailed {
 				n[p]++
 			}
 		}
