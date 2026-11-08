@@ -57,6 +57,14 @@ func rescueClaimFixture(pv *corev1.PersistentVolume, uid types.UID) *corev1.Pers
 	}
 }
 
+func TestRescueVolumeModeUsesKubernetesDefault(t *testing.T) {
+	filesystem := corev1.PersistentVolumeFilesystem
+	block := corev1.PersistentVolumeBlock
+	if !sameVolumeMode(nil, &filesystem) || sameVolumeMode(nil, &block) {
+		t.Fatal("nil volume mode must mean Filesystem, not Block")
+	}
+}
+
 func testWorkspace(mutate ...func(*wsnapv1.Workspace)) *wsnapv1.Workspace {
 	ws := &wsnapv1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "ws1"},

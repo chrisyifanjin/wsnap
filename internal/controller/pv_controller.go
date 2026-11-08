@@ -206,10 +206,13 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 }
 
 func sameVolumeMode(a, b *corev1.PersistentVolumeMode) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
+	mode := func(p *corev1.PersistentVolumeMode) corev1.PersistentVolumeMode {
+		if p == nil {
+			return corev1.PersistentVolumeFilesystem // Kubernetes' default
+		}
+		return *p
 	}
-	return *a == *b
+	return mode(a) == mode(b)
 }
 
 func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVolume, ns, name string, retry bool) (ctrl.Result, error) {
