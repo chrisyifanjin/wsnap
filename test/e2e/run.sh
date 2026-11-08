@@ -1010,6 +1010,12 @@ diagnose() {
 		echo "--- $p (wsnap)"
 		kubectl -n "$NS" logs "$p" -c wsnap --tail=30 2>/dev/null
 	done
+	local kn
+	for kn in $(kubectl get nodes -l wsnap-e2e/kata=true -o name 2>/dev/null); do
+		echo "--- Kata journal on ${kn#node/}"
+		docker exec "${kn#node/}" journalctl -u containerd --no-pager 2>/dev/null |
+			grep -iE 'kata|qemu|vsock|virtiofs|guest|vmm|panic|error' | tail -150
+	done
 }
 
 worker_pod() { # name workspace claim
@@ -1254,6 +1260,12 @@ install_kata() {
 	# the 3 s the shim waits for the guest agent by default.
 	docker exec "$node" sed -i 's/^reconnect_timeout_ms = .*/reconnect_timeout_ms = 60000/' "$cfg"
 	docker exec "$node" grep -q '^reconnect_timeout_ms = 60000' "$cfg" || die "could not raise the Kata agent timeout in $cfg"
+	if [[ -n ${KATA_DEBUG:-} ]]; then
+		# Hypervisor, agent and runtime debug logs, the guest agent at debug
+		# level; the logs go to the containerd journal of the node.
+		docker exec "$node" sed -i -e 's/^enable_debug = false/enable_debug = true/' \
+			-e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.log=debug"/' "$cfg"
+	fi
 	# With the systemd cgroup driver (kind's default), Kata's Rust runtime
 	# creates the sandbox's cgroup through systemd over D-Bus, which a
 	# kind node does not run.

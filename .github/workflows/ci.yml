@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [controlplane, volumes, failures, worker, runtimes]
+        group: [controlplane, volumes, failures, worker, runtimes, kata]
         # An explicit value, so the entries below become new jobs instead of
         # being merged into the 1.37 jobs of the same group.
         k8s: ["1.37"]
@@ -74,6 +74,11 @@ jobs:
           curl -fsSLo "$RUNNER_TEMP/bin/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
           chmod +x "$RUNNER_TEMP/bin/kind" "$RUNNER_TEMP/bin/kubectl"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # Kata starts a microVM per Pod. kind nodes are privileged containers
+      # and see host devices that exist when they start, so load the vsock
+      # and vhost modules first. Harmless for the other groups.
+      - name: Load the KVM helper modules
+        run: sudo modprobe vhost_vsock vhost_net && sudo chmod 666 /dev/kvm /dev/vhost-vsock /dev/vhost-net
       - name: Create three-node cluster (in the background, while images build)
         run: |
           (kind create cluster --name wsnap --config test/e2e/kind-multinode.yaml ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} > "$RUNNER_TEMP/kind.log" 2>&1
@@ -105,6 +110,8 @@ jobs:
       - name: Run the ${{ matrix.group }} scenarios
         env:
           SKIP_IMAGE_BUILD: "1"
+          E2E_REQUIRE_KATA: "1"
+          KATA_DEBUG: "1"
         run: |
           git clone --branch v1.0.10 --depth 1 -c advice.detachedHead=false \
             https://github.com/kubernetes-sigs/agent-sandbox.git "$RUNNER_TEMP/agent-sandbox"
