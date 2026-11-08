@@ -66,6 +66,20 @@ multi-node scenario: `kind create cluster --name wsnap --config test/e2e/kind-mu
 | `tls` | The broker over HTTPS: sidecars and Jobs verify its CA; an untrusted CA and plain HTTP are refused. |
 | `multinode` | Restore on another node, a mover that follows a node-local PV, a drain that takes a final snapshot. |
 
+The scenarios form three groups that share no state:
+
+| Group | Scenarios |
+|---|---|
+| `controlplane` | `webhook`, `gateway`, `tls`, `multinode` |
+| `volumes` | `pvc`, `ephemeral`, `sandbox`, `emptydir`, `singlewriter`, `requests` |
+| `failures` | `chaos` |
+
+`test/e2e/run.sh` with no arguments runs `setup` and then all three groups
+on one cluster. `test/e2e/run.sh setup volumes` runs one group. CI runs
+each group on its own cluster at the same time. When a run fails, the
+script prints the Pods, volumes, wsnap objects, events and logs, and CI
+uploads the kind node logs.
+
 The harness uses `kubectl exec` only to act as the agent (to write files).
 wsnap itself never uses exec.
 

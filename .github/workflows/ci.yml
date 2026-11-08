@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its older runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   go:
     runs-on: ubuntu-latest
@@ -34,25 +39,65 @@ jobs:
         run: make install-manifest VERSION=v0.0.0-ci && rm install.yaml
 
   e2e:
+    # Three groups of scenarios that share no state, each on its own
+    # three-node cluster. test/e2e/run.sh defines the groups.
+    name: e2e (${{ matrix.group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [controlplane, volumes, failures]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
       - name: Install kind and kubectl
         run: |
-          go install sigs.k8s.io/kind@v0.33.0
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSLo "$RUNNER_TEMP/bin/kind" https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
           curl -fsSLo "$RUNNER_TEMP/bin/kubectl" https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl
-          chmod +x "$RUNNER_TEMP/bin/kubectl"
+          chmod +x "$RUNNER_TEMP/bin/kind" "$RUNNER_TEMP/bin/kubectl"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: Create three-node cluster
-        run: kind create cluster --name wsnap --config test/e2e/kind-multinode.yaml
-      - name: Check every end-to-end scenario
+      - name: Create three-node cluster (in the background, while images build)
         run: |
-          git clone --branch v1.0.10 --depth 1 https://github.com/kubernetes-sigs/agent-sandbox.git "$RUNNER_TEMP/agent-sandbox"
-          AGENT_SANDBOX_DIR="$RUNNER_TEMP/agent-sandbox" test/e2e/run.sh
+          (kind create cluster --name wsnap --config test/e2e/kind-multinode.yaml > "$RUNNER_TEMP/kind.log" 2>&1
+           echo $? > "$RUNNER_TEMP/kind.rc") &
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the controller image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: controller
+          tags: wsnap-controller:dev
+          load: true
+          cache-from: type=gha,scope=e2e-controller
+          cache-to: type=gha,scope=e2e-controller,mode=max,ignore-error=true
+      - name: Build the agent image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: agent
+          tags: wsnap-agent:dev
+          load: true
+          cache-from: type=gha,scope=e2e-agent
+          cache-to: type=gha,scope=e2e-agent,mode=max,ignore-error=true
+      - name: Wait for the cluster
+        run: |
+          for _ in $(seq 300); do [[ -f $RUNNER_TEMP/kind.rc ]] && break; sleep 1; done
+          cat "$RUNNER_TEMP/kind.log"
+          [[ $(cat "$RUNNER_TEMP/kind.rc" 2>/dev/null) == 0 ]]
+      - name: Run the ${{ matrix.group }} scenarios
+        env:
+          SKIP_IMAGE_BUILD: "1"
+        run: |
+          git clone --branch v1.0.10 --depth 1 -c advice.detachedHead=false \
+            https://github.com/kubernetes-sigs/agent-sandbox.git "$RUNNER_TEMP/agent-sandbox"
+          AGENT_SANDBOX_DIR="$RUNNER_TEMP/agent-sandbox" test/e2e/run.sh setup ${{ matrix.group }}
+      - name: Export cluster logs
+        if: failure()
+        run: kind export logs --name wsnap "$RUNNER_TEMP/kind-logs"
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: kind-logs-${{ matrix.group }}
+          path: ${{ runner.temp }}/kind-logs
+          retention-days: 7

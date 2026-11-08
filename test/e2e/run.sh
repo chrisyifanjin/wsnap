@@ -17,7 +17,12 @@
 #
 # The harness writes files through "kubectl exec" only to play the agent;
 # wsnap itself never uses exec.
-# Usage: test/e2e/run.sh [setup] [scenario...]
+# Usage: test/e2e/run.sh [setup] [scenario|group...]
+#
+# The groups split the scenarios into three sets of about equal length that
+# share no state, so CI runs each set on its own cluster in parallel.
+# Without arguments, every group runs in order on one cluster.
+# SKIP_IMAGE_BUILD=1 makes setup load images that are already built.
 set -euo pipefail
 
 ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
@@ -83,7 +88,10 @@ pv_phase_is() { [[ $(kubectl get pv "$1" -o jsonpath='{.status.phase}' 2>/dev/nu
 logs_contain() { kubectl -n "$NS" logs "$1" -c wsnap 2>/dev/null | grep -q "$2"; }
 sidecar_restarts() { kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.initContainerStatuses[?(@.name=="wsnap")].restartCount}'; }
 sidecar_restarted() { (( $(sidecar_restarts "$1") > $2 )); }
-no_pods() { ! kubectl -n "$1" get pods -l "$2" -o name 2>/dev/null | grep -q .; }
+# An API error must not count as "nothing there": these predicates answer
+# true only when the API server confirmed the absence.
+no_pods() { local out; out=$(kubectl -n "$1" get pods -l "$2" -o name 2>/dev/null) && [[ -z $out ]]; }
+not_found() { local out; out=$(kubectl get "$@" 2>&1) && return 1; [[ $out == *NotFound* || $out == *"not found"* ]]; }
 pv_rescue_started() { local r; r=$(pv_annotation "$1" rescue); [[ $r == running || $r == done ]] || pv_gone "$1"; }
 # retry_request asks for a snapshot again until one succeeds.
 retry_request() {
@@ -104,7 +112,7 @@ crash_pod() {
 	docker exec "$node" sh -c "crictl stopp \$(crictl pods --name '^$1\$' --namespace $NS -q)" >/dev/null
 	kubectl -n "$NS" delete pod "$1" --wait=true >/dev/null
 }
-pod_gone() { ! kubectl -n "$NS" get pod "$1" >/dev/null 2>&1; }
+pod_gone() { not_found -n "$NS" pod "$1"; }
 result_has() { kubectl -n "$NS" exec "$1" -c agent -- grep -q "$3" "/workspace/.wsnap/results/$2.json" 2>/dev/null; }
 result_id() { kubectl -n "$NS" exec "$1" -c agent -- cat "/workspace/.wsnap/results/$2.json" | sed -n 's/.*"snapshotID":"\([^"]*\)".*/\1/p'; }
 
@@ -124,7 +132,7 @@ EOF
       image: wsnap-agent:dev
       imagePullPolicy: IfNotPresent
       restartPolicy: Always
-      args: [sidecar, --dir=/workspace, --final-timeout=50s, --operation-timeout=60s${SIDECAR_TLS_ARGS:-}]
+      args: [sidecar, --dir=/workspace, --final-timeout=50s, --operation-timeout=${SIDECAR_OP_TIMEOUT:-60s}${SIDECAR_TLS_ARGS:-}]
       startupProbe:
         exec: {command: [/usr/local/bin/wsnap-agent, ready, --state-dir=/var/lib/wsnap]}
         periodSeconds: 1
@@ -236,16 +244,18 @@ EOF
 }
 
 pv_of() { kubectl -n "$NS" get pvc "$1" -o jsonpath='{.spec.volumeName}'; }
-pv_gone() { ! kubectl get pv "$1" >/dev/null 2>&1; }
-pvc_gone() { ! kubectl -n "$NS" get pvc "$1" >/dev/null 2>&1; }
+pv_gone() { not_found pv "$1"; }
+pvc_gone() { not_found -n "$NS" pvc "$1"; }
 pod_ready() { [[ $(kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]; }
 read_file() { kubectl -n "$NS" exec "$1" -c agent -- cat "$2"; }
 write_file() { kubectl -n "$NS" exec "$1" -c agent -- sh -c "echo '$3' > $2"; }
 
 setup() {
 	log "build and load images"
-	docker build -q --target controller -t wsnap-controller:dev "$ROOT" >/dev/null
-	docker build -q --target agent -t wsnap-agent:dev "$ROOT" >/dev/null
+	if [[ -z ${SKIP_IMAGE_BUILD:-} ]]; then
+		docker build -q --target controller -t wsnap-controller:dev "$ROOT" >/dev/null
+		docker build -q --target agent -t wsnap-agent:dev "$ROOT" >/dev/null
+	fi
 	# Only locally built images need loading; the node pulls public ones.
 	# (kind cannot import multi-arch images that are only partly present.)
 	for img in wsnap-controller:dev wsnap-agent:dev; do
@@ -355,7 +365,7 @@ scenario_sandbox() {
 	local pv; pv=$(pv_of workspace-sb-1)
 
 	kubectl -n "$NS" patch sandbox sb-1 --type merge -p '{"spec":{"operatingMode":"Suspended"}}' >/dev/null
-	wait_for 120 "sandbox pod deleted" bash -c "! kubectl -n $NS get pod sb-1"
+	wait_for 120 "sandbox pod deleted" pod_gone sb-1
 	[[ $(ws_field ws-sb .status.lastSnapshot.final) == true ]] || die "suspend did not take a final snapshot"
 	kubectl -n "$NS" get pvc workspace-sb-1 >/dev/null || die "suspend deleted the PVC"
 	pass "Suspended: pod gone, final snapshot taken, PVC kept"
@@ -421,9 +431,8 @@ scenario_singlewriter() {
 	wait_for 180 "one-1 ready" pod_ready one-1
 	write_file one-1 /workspace/owner.txt first-writer
 	apply_pod one-2 ws-one kopia-s3 pvc:one-b yes >/dev/null
-	sleep 30
+	wait_for 120 "second Pod refused as writer" logs_contain one-2 "is written by pod one-1"
 	pod_ready one-2 && die "a second writer became ready while the first still runs"
-	kubectl -n "$NS" logs one-2 -c wsnap | grep -q "is written by pod one-1" || die "second Pod not waiting for the first"
 	local stopped
 	pass "second Pod waits: the broker allows one live writer per workspace"
 	kubectl -n "$NS" delete pod one-1 --wait=true >/dev/null
@@ -550,7 +559,7 @@ scenario_chaos() {
 	fi
 	wait_for 240 "rescue finished by the new leader" ws_is ws-chaos .status.lastSnapshot.executor mover
 	wait_for 120 "PV reclaimed" pv_gone "$pv"
-	apply_pod chaos-2 ws-chaos restic-s3 ephemeral yes >/dev/null
+	SIDECAR_OP_TIMEOUT=20s apply_pod chaos-2 ws-chaos restic-s3 ephemeral yes >/dev/null
 	wait_for 180 "chaos-2 ready" pod_ready chaos-2
 	[[ $(read_file chaos-2 /workspace/precious.txt) == survived-outage ]] || die "data lost across the outage"
 	pass "after the outage and a leader failover, the rescued data was restored"
@@ -743,12 +752,28 @@ ${3:-}
   containers:
   - name: agent
     image: alpine:3.22
-    command: [sleep, infinity]
+    command: [sh, -c, 'trap "exit 0" TERM; sleep infinity & wait']
     volumeMounts: [{name: workspace, mountPath: /workspace}]
   volumes:
   - name: workspace
     ephemeral: {volumeClaimTemplate: {spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}}}
 EOF
+}
+
+# probe_pod asks the API server to admit a labeled Pod without creating it.
+probe_pod() {
+	kubectl -n "$NS" apply --dry-run=server -f - 2>&1 <<EOF
+{"apiVersion": "v1", "kind": "Pod",
+ "metadata": {"name": "probe", "namespace": "$NS",
+  "labels": {"wsnap.dev/workspace": "ws-probe", "wsnap.dev/repository": "restic-s3"}},
+ "spec": {"containers": [{"name": "a", "image": "alpine:3.22", "volumeMounts": [{"name": "workspace", "mountPath": "/w"}]}],
+  "volumes": [{"name": "workspace", "emptyDir": {}}]}}
+EOF
+}
+webhook_admits() { probe_pod >/dev/null; }
+webhook_refuses() {
+	local out; out=$(probe_pod) && return 1
+	[[ $out == *"failed calling webhook"* || $out == *"no endpoints"* || $out == *"connection refused"* ]]
 }
 
 scenario_webhook() {
@@ -779,7 +804,7 @@ spec:
       containers:
       - name: agent
         image: alpine:3.22
-        command: [sleep, infinity]
+        command: [sh, -c, 'trap "exit 0" TERM; sleep infinity & wait']
         volumeMounts: [{name: workspace, mountPath: /workspace}]
 EOF
 	wait_for 180 "sandbox pod" kubectl -n "$NS" get pod sb-inj
@@ -804,6 +829,10 @@ EOF
 
 	kubectl -n wsnap-system scale deploy/wsnap-controller --replicas=0 >/dev/null
 	wait_for 90 "controller down" no_pods wsnap-system app.kubernetes.io/name=wsnap-controller
+	# Endpoint removal reaches the API server's webhook client a moment
+	# after the Pods are gone. A webhook that fails open never refuses, so
+	# this wait still fails then.
+	wait_for 60 "admission refuses labeled Pods" webhook_refuses
 	out=$(labels_only_pod down-1 ws-down 2>&1 || true)
 	[[ $out == *"failed calling webhook"* || $out == *"no endpoints"* || $out == *"connection refused"* ]] || die "a labeled Pod was admitted while the webhook was down: $out"
 	kubectl -n "$NS" run plain-pod --image=alpine:3.22 --restart=Never -- sleep 5 >/dev/null || die "an unlabeled Pod was blocked"
@@ -811,7 +840,7 @@ EOF
 	pass "webhook down: labeled Pods are refused (fail closed); unlabeled Pods are unaffected"
 	kubectl -n wsnap-system scale deploy/wsnap-controller --replicas=2 >/dev/null
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
-	wait_for 60 "webhook back" bash -c "kubectl -n $NS apply --dry-run=server -f - <<<'{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"probe\",\"namespace\":\"$NS\",\"labels\":{\"wsnap.dev/workspace\":\"ws-probe\",\"wsnap.dev/repository\":\"restic-s3\"}},\"spec\":{\"containers\":[{\"name\":\"a\",\"image\":\"alpine:3.22\",\"volumeMounts\":[{\"name\":\"workspace\",\"mountPath\":\"/w\"}]}],\"volumes\":[{\"name\":\"workspace\",\"emptyDir\":{}}]}}'"
+	wait_for 60 "webhook back" webhook_admits
 }
 
 gw_curl() { kubectl -n "$NS" exec gw-client -- curl -sS "$@"; }
@@ -899,9 +928,51 @@ EOF
 	kubectl -n "$NS" delete pod gw-client --wait=false >/dev/null
 }
 
+# Each group must stand alone after setup. "requests" uses the emptyDir
+# workspace of "emptydir", so both stay in one group, in this order.
+group() {
+	case $1 in
+	controlplane) echo webhook gateway tls multinode ;;
+	volumes) echo pvc ephemeral sandbox emptydir singlewriter requests ;;
+	failures) echo chaos ;;
+	esac
+}
+
+# diagnose prints the cluster state when a run fails, so a CI log is enough
+# to tell a product bug from an environment problem.
+diagnose() {
+	local rc=$?
+	((rc == 0)) && return
+	set +e
+	log "diagnostics (exit $rc)"
+	kubectl get nodes -o wide
+	kubectl get pods -A -o wide
+	kubectl get pv
+	kubectl -n "$NS" get pvc,jobs,workspaces,workspacesnapshots,workspacerestores -o wide
+	kubectl -n "$NS" get workspaces -o yaml | grep -A12 '^  status:'
+	kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40
+	for p in $(kubectl -n wsnap-system get pods -l app.kubernetes.io/name=wsnap-controller -o name); do
+		echo "--- $p"
+		kubectl -n wsnap-system logs "$p" --tail=80
+	done
+	for p in $(kubectl -n "$NS" get pods -o name); do
+		echo "--- $p (wsnap)"
+		kubectl -n "$NS" logs "$p" -c wsnap --tail=30 2>/dev/null
+	done
+}
+
 main() {
-	local steps=("$@")
-	((${#steps[@]})) || steps=(setup webhook gateway pvc ephemeral sandbox emptydir singlewriter requests chaos tls multinode)
+	local steps=() s g
+	(($#)) || set -- setup controlplane volumes failures
+	for s in "$@"; do
+		if [[ -n $(group "$s") ]]; then
+			read -ra g <<<"$(group "$s")"
+			steps+=("${g[@]}")
+		else
+			steps+=("$s")
+		fi
+	done
+	trap diagnose EXIT
 	for s in "${steps[@]}"; do
 		case $s in
 		setup) setup ;;
