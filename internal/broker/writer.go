@@ -80,9 +80,9 @@ func (s *Server) checkNoPendingRescue(ctx context.Context, c *caller) error {
 		if a[wsnapv1.AnnotationWorkspaceRef] != ref {
 			continue
 		}
-		hasFinal := a[workspace.AnnotationWriterPod] != "" && a[workspace.AnnotationWriterPod] == a[workspace.AnnotationFinalPod]
+		hasFinal := workspace.HasFinalSnapshot(a)
 		rescue := a[wsnapv1.AnnotationRescue]
-		running := rescue == "running"
+		running := rescue == wsnapv1.RescueRunning
 		awaiting := rescue == "" && !hasFinal && (pv.Status.Phase == corev1.VolumeReleased || s.claimGone(ctx, &pv))
 		if running || awaiting {
 			return fail(http.StatusConflict, "volume %s of workspace %s is being rescued; waiting", pv.Name, id.Name)

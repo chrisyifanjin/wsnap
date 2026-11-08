@@ -220,8 +220,15 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 	return c.Patch(ctx, &pv, patch)
 }
 
+// HasFinalSnapshot reports whether the last Pod that wrote to a PV also
+// took a final snapshot of it: only then is a released PV safe to reclaim
+// without a rescue. a is the PV's annotations.
+func HasFinalSnapshot(a map[string]string) bool {
+	return a[AnnotationWriterPod] != "" && a[AnnotationWriterPod] == a[AnnotationFinalPod]
+}
+
 // Per-PV bookkeeping. A released PV is safe to reclaim only when the last
-// Pod that wrote to it also took a final snapshot of it.
+// Pod that wrote to it also took a final snapshot of it (HasFinalSnapshot).
 const (
 	AnnotationWriterPod = "wsnap.dev/writer-pod-uid"
 	AnnotationFinalPod  = "wsnap.dev/final-pod-uid"
