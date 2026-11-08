@@ -602,12 +602,6 @@ type WorkspaceRestoreList struct {
 	Items           []WorkspaceRestore `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&WorkspaceRestore{}, &WorkspaceRestoreList{})
-	SchemeBuilder.Register(&SnapshotRepository{}, &SnapshotRepositoryList{}, &Workspace{}, &WorkspaceList{},
-		&WorkspaceSnapshot{}, &WorkspaceSnapshotList{})
-}
-
 // Request is implemented by WorkspaceSnapshot and WorkspaceRestore, which
 // share routing and status handling.
 // +kubebuilder:object:generate=false

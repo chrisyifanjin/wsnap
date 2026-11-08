@@ -115,7 +115,7 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// only to the claimant's UID).
 			st.Phase, st.ClaimedBy, st.Executor = wsnapv1.SnapshotPending, "", ""
 			st.Message = "the worker Pod that claimed the request stopped before reporting; routing it again"
-			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, sr.obj)
+			return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, sr.obj)
 		}
 	}
 	live, err := r.liveWriter(ctx, &ws)
@@ -138,7 +138,7 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		st := sr.Status()
 		st.Phase, st.ClaimedBy, st.Executor = wsnapv1.SnapshotPending, "", ""
 		st.Message = "the pod that claimed the request stopped before reporting; routing it again"
-		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, sr.obj)
+		return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, sr.obj)
 	}
 	return r.startJob(ctx, sr, &ws, recheck)
 }

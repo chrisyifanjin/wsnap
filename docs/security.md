@@ -99,7 +99,7 @@ block later maintenance.
 | Provider | How it limits a credential | Unit of isolation |
 |---|---|---|
 | `s3-sts` | STS `AssumeRole` with an inline session policy (AWS S3, MinIO, Ceph RGW). The effective permission is the intersection of the broker user's policy and the session policy. | object prefix |
-| `gcs-downscoped` | A Credential Access Boundary: `objectViewer` for reading, `objectCreator` (cannot overwrite or delete) for writing, `objectUser` only on scratch prefixes. | object prefix |
+| `gcs-downscoped` | Needs a service account key (`external_account` files are refused: they name a file, URL or command the broker would read or run). A Credential Access Boundary: `objectViewer` for reading, `objectCreator` (cannot overwrite or delete) for writing, `objectUser` only on scratch prefixes. | object prefix |
 | `azure-sas` | A service SAS on a container. A service SAS cannot be limited to a prefix in a flat-namespace account. | one container per workspace |
 | `static` | None: the agent gets the admin credential. Use it only where all workspaces trust each other. | none |
 

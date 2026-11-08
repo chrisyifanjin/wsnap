@@ -226,7 +226,7 @@ func cloudStores(t *testing.T, out map[string]store) {
 					// kopia cannot use access tokens: the static path.
 					return protocol.Credentials{GoogleCredentialsJSON: string(keyJSON)}
 				}
-				c, err := credentials.GCSDownscoped{}.Issue(context.Background(), credentials.Request{Role: role, Namespace: "test", Workspace: "ws",
+				c, err := credentials.GCSDownscoped{AllowExternalAccount: true}.Issue(context.Background(), credentials.Request{Role: role, Namespace: "test", Workspace: "ws",
 					Backend: b, Secret: secret, WriterDeletePrefixes: engine.WriterDeletePrefixes(eng)})
 				if err != nil {
 					t.Fatalf("issue %s credential: %v", role, err)

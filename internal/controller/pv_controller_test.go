@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -84,7 +84,7 @@ func newPVReconciler(t *testing.T, objs ...client.Object) (*PVReconciler, client
 	repo := &wsnapv1.SnapshotRepository{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "repo"}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objs, repo)...).
 		WithStatusSubresource(&wsnapv1.Workspace{}, &corev1.PersistentVolume{}, &batchv1.Job{}).Build()
-	return &PVReconciler{Client: uidPVCClient{c}, Reader: c, Recorder: record.NewFakeRecorder(10),
+	return &PVReconciler{Client: uidPVCClient{c}, Reader: c, Recorder: events.NewFakeRecorder(10),
 		Jobs: JobConfig{AgentImage: "agent:test", BrokerURL: "http://broker", Audience: "wsnap"}}, c
 }
 

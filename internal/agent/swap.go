@@ -79,8 +79,13 @@ func (c *Config) doneFile(request string) string {
 
 func (c *Config) saveDone(request string, rep protocol.Report) {
 	b, _ := json.Marshal(rep)
-	if err := os.MkdirAll(filepath.Dir(c.doneFile(request)), 0o700); err == nil {
+	err := os.MkdirAll(filepath.Dir(c.doneFile(request)), 0o700)
+	if err == nil {
 		err = os.WriteFile(c.doneFile(request), b, 0o600)
+	}
+	if err != nil {
+		// Without the record, a redelivered request runs the restore again.
+		c.Log.Warn("cannot record the completed restore", "request", request, "error", err)
 	}
 }
 

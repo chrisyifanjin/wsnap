@@ -13,7 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,7 +47,7 @@ type PVReconciler struct {
 	client.Client
 	Reader   client.Reader
 	Jobs     JobConfig
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -201,7 +201,7 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
 		return fmt.Errorf("create mover job: %w", err)
 	}
-	r.Recorder.Eventf(pv, corev1.EventTypeNormal, "RescueStarted", "mover job %s/%s snapshots this volume", ws.Namespace, job.Name)
+	r.Recorder.Eventf(pv, nil, corev1.EventTypeNormal, "RescueStarted", "Rescue", "mover job %s/%s snapshots this volume", ws.Namespace, job.Name)
 	return nil
 }
 
@@ -251,7 +251,7 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 				return r.restartRescue(ctx, pv, &job)
 			}
 			if cur.Annotations[workspace.AnnotationFinalPod] != want {
-				r.Recorder.Eventf(pv, corev1.EventTypeWarning, "RescueFailed",
+				r.Recorder.Eventf(pv, nil, corev1.EventTypeWarning, "RescueFailed", "Rescue",
 					"mover job %s/%s completed, but the broker recorded no final snapshot of this volume; keeping it", ns, job.Name)
 				return ctrl.Result{}, r.setRescue(ctx, &cur, RescueFailed)
 			}
@@ -271,7 +271,7 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 			if retry {
 				return r.restartRescue(ctx, pv, &job)
 			}
-			r.Recorder.Eventf(pv, corev1.EventTypeWarning, "RescueFailed", "mover job %s/%s failed; keeping the volume", ns, job.Name)
+			r.Recorder.Eventf(pv, nil, corev1.EventTypeWarning, "RescueFailed", "Rescue", "mover job %s/%s failed; keeping the volume", ns, job.Name)
 			return ctrl.Result{}, r.setRescue(ctx, pv, RescueFailed)
 		}
 	}
@@ -281,7 +281,7 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 // restartRescue deletes a finished mover Job so the next reconcile creates
 // a new one: the operator's retry after a failed rescue.
 func (r *PVReconciler) restartRescue(ctx context.Context, pv *corev1.PersistentVolume, job *batchv1.Job) (ctrl.Result, error) {
-	r.Recorder.Eventf(pv, corev1.EventTypeNormal, "RescueRetried", "starting a new mover job; the previous one (%s) did not save the volume", job.Name)
+	r.Recorder.Eventf(pv, nil, corev1.EventTypeNormal, "RescueRetried", "Rescue", "starting a new mover job; the previous one (%s) did not save the volume", job.Name)
 	fg := metav1.DeletePropagationForeground
 	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &fg, Preconditions: &metav1.Preconditions{UID: &job.UID}}); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, err

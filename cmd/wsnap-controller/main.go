@@ -157,7 +157,7 @@ func main() {
 	must((&controller.PodReconciler{Client: mgr.GetClient(), Reader: reader}).SetupWithManager(mgr))
 	must((&controller.WorkerReconciler{Client: mgr.GetClient(), Reader: reader, Jobs: jobs}).SetupWithManager(mgr))
 	must((&controller.PVReconciler{Client: mgr.GetClient(), Reader: reader, Jobs: jobs,
-		Recorder: mgr.GetEventRecorderFor("wsnap")}).SetupWithManager(mgr))
+		Recorder: mgr.GetEventRecorder("wsnap")}).SetupWithManager(mgr))
 	must((&controller.WorkspaceReconciler{Client: mgr.GetClient(), Reader: reader, Jobs: jobs}).SetupWithManager(mgr))
 	must((&controller.RepositoryReconciler{Client: mgr.GetClient(), Reader: reader}).SetupWithManager(mgr))
 	must((&controller.RequestReconciler{Client: mgr.GetClient(), Reader: reader, Jobs: jobs}).SetupWithManager(mgr))
