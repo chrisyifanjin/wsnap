@@ -131,6 +131,9 @@ refuses that combination.
 Container runtimes: runc (containerd) and gVisor (runsc), in both sidecar
 and worker mode. Kata Containers is not tested yet.
 
+Kubernetes versions: every scenario runs on 1.37; the volume and worker
+scenarios also run on 1.30, the oldest supported version.
+
 The end-to-end suite runs on a three-node kind cluster with agent-sandbox.
 It injects failures: the controller stopped, the leader killed during a
 rescue, storage stopped, the sidecar killed, a crash with an immediate
