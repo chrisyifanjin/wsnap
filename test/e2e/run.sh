@@ -1260,6 +1260,11 @@ install_kata() {
 	# the 3 s the shim waits for the guest agent by default.
 	docker exec "$node" sed -i 's/^reconnect_timeout_ms = .*/reconnect_timeout_ms = 60000/' "$cfg"
 	docker exec "$node" grep -q '^reconnect_timeout_ms = 60000' "$cfg" || die "could not raise the Kata agent timeout in $cfg"
+	# Under nested virtualization the guest crashed during boot ("kvm run
+	# failed Bad address") while it set up the NVDIMM (DAX) that holds its
+	# root image. Attach the image as a virtio block device instead.
+	docker exec "$node" sed -i 's/^disable_image_nvdimm = false/disable_image_nvdimm = true/' "$cfg"
+	docker exec "$node" grep -q '^disable_image_nvdimm = true' "$cfg" || die "could not turn off the Kata image NVDIMM in $cfg"
 	if [[ -n ${KATA_DEBUG:-} ]]; then
 		# Hypervisor, agent and runtime debug logs, the guest agent at debug
 		# level; the logs go to the containerd journal of the node.
