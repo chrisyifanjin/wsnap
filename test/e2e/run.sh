@@ -111,11 +111,16 @@ crash_sidecar() {
 	node=$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.nodeName}')
 	docker exec "$node" crictl stop --timeout 0 "${id#containerd://}" >/dev/null
 }
+# crash_pod kills a Pod without a graceful stop. It deletes the Pod first,
+# so the kubelet does not recreate the sandbox (it did once, and the
+# restarted sidecar then took a normal final snapshot), and stops the
+# sandbox right after, before a final snapshot can finish.
 crash_pod() {
 	local node
 	node=$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.nodeName}')
+	kubectl -n "$NS" delete pod "$1" --wait=false >/dev/null
 	docker exec "$node" sh -c "crictl stopp \$(crictl pods --name '^$1\$' --namespace $NS -q)" >/dev/null
-	kubectl -n "$NS" delete pod "$1" --wait=true >/dev/null
+	wait_for 120 "$1 gone after the crash" pod_gone "$1"
 }
 pod_gone() { not_found -n "$NS" pod "$1"; }
 result_has() { kubectl -n "$NS" exec "$1" -c agent -- grep -q "$3" "/workspace/.wsnap/results/$2.json" 2>/dev/null; }
@@ -1242,6 +1247,16 @@ install_kata() {
 	fi
 	docker exec "$node" test -x "$shim" || die "no Kata shim in the $KATA_VERSION release"
 	docker exec "$node" test -f "$cfg" || die "no Kata QEMU configuration in the $KATA_VERSION release"
+	# With the systemd cgroup driver (kind's default), Kata's Rust runtime
+	# creates the sandbox's cgroup through systemd over D-Bus, which a
+	# kind node does not run.
+	docker exec "$node" sh -c '
+		set -e
+		if ! command -v dbus-daemon >/dev/null; then
+			apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dbus >/dev/null
+		fi
+		systemctl start dbus.socket dbus.service
+		test -S /run/dbus/system_bus_socket'
 	docker exec "$node" sh -c '
 		set -e
 		ln -sf "$2" /usr/local/bin/containerd-shim-kata-v2
