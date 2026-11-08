@@ -1,12 +1,23 @@
 package controller
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	wsnapv1 "github.com/chrisyifanjin/wsnap/api/v1alpha1"
 )
@@ -55,5 +66,39 @@ func TestValidateRepository(t *testing.T) {
 				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// With config/namespaced-secrets, a namespace without a RoleBinding makes
+// the Secret read fail with Forbidden. The repository must say so and how
+// to fix it, and check again, since RBAC changes are not watched.
+func TestForbiddenSecretIsReported(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = wsnapv1.AddToScheme(scheme)
+	repo := &wsnapv1.SnapshotRepository{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "repo"},
+		Spec: wsnapv1.SnapshotRepositorySpec{Engine: wsnapv1.EngineSpec{Type: "restic"},
+			Backend:     wsnapv1.BackendSpec{S3: &wsnapv1.S3Backend{Bucket: "b"}},
+			Credentials: wsnapv1.CredentialsSpec{SecretName: "creds"}}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(repo).WithStatusSubresource(repo).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok {
+				return apierrors.NewForbidden(corev1.Resource("secrets"), key.Name, errors.New("no RoleBinding"))
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		}}).Build()
+	r := &RepositoryReconciler{Client: c, Reader: c}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "repo"}})
+	if err != nil {
+		t.Fatalf("a Forbidden Secret read must be reported, not retried as an error: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("no recheck scheduled; a RoleBinding added later would never be noticed")
+	}
+	var got wsnapv1.SnapshotRepository
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "repo"}, &got)
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "SecretForbidden" || !strings.Contains(cond.Message, "wsnap-secret-reader") {
+		t.Fatalf("Ready = %+v", cond)
 	}
 }

@@ -99,7 +99,7 @@ block later maintenance.
 | Provider | How it limits a credential | Unit of isolation |
 |---|---|---|
 | `s3-sts` | STS `AssumeRole` with an inline session policy (AWS S3, MinIO, Ceph RGW). The effective permission is the intersection of the broker user's policy and the session policy. | object prefix |
-| `gcs-downscoped` | A Credential Access Boundary: `objectViewer` for reading, `objectCreator` (cannot overwrite or delete) for writing, `objectUser` only on scratch prefixes. | object prefix |
+| `gcs-downscoped` | Needs a service account key (`external_account` files are refused: they name a file, URL or command the broker would read or run). A Credential Access Boundary: `objectViewer` for reading, `objectCreator` (cannot overwrite or delete) for writing, `objectUser` only on scratch prefixes. | object prefix |
 | `azure-sas` | A service SAS on a container. A service SAS cannot be limited to a prefix in a flat-namespace account. | one container per workspace |
 | `static` | None: the agent gets the admin credential. Use it only where all workspaces trust each other. | none |
 
@@ -189,8 +189,9 @@ resource. The created request records the caller in the
 - **Azure writers can delete** inside their own container. Turn on soft
   delete or versioning.
 - **The filesystem backend has no isolation** between workspaces.
-- **The controller can read every Secret** (`get`). Limit it with a Role per
-  tenant namespace if needed.
+- **By default the controller can read every Secret** (`get`, never list or
+  watch). Install `config/namespaced-secrets` to allow only namespaces
+  that bind `wsnap-secret-reader` (see operations.md).
 - **Editing a SnapshotRepository is an administrator right.** A user who can
   edit one can select the `static` provider (and so get the raw backend
   keys), set the image, volumes and security context of wsnap Jobs, and

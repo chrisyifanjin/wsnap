@@ -58,6 +58,7 @@ pv_policy_is() { [[ $(kubectl get pv "$1" -o jsonpath='{.spec.persistentVolumeRe
 
 # fresh_workspace drops the Workspace record so earlier runs cannot satisfy
 # a check. The repository data in the backend stays.
+repo_reason_is() { [[ $(kubectl -n "$1" get snaprepo "$2" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}') == "$3" ]]; }
 repo_condition() { [[ $(kubectl -n "$NS" get snaprepo "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].status}") == "$3" ]]; }
 
 # tick writes a file so the sidecar sees a change, then checks for a
@@ -271,7 +272,12 @@ setup() {
 	# The TLS scenario patches the Deployment outside kubectl apply's field
 	# ownership. Recreate it so a later setup really returns to the defaults.
 	kubectl -n wsnap-system delete deploy wsnap-controller --ignore-not-found --wait=true >/dev/null
-	kubectl apply -k "$ROOT/config/default" >/dev/null
+	# Least privilege: the controller reads Secrets only where a namespace
+	# binds wsnap-secret-reader.
+	kubectl apply -k "$ROOT/config/namespaced-secrets" >/dev/null
+	kubectl delete clusterrolebinding wsnap-secret-reader --ignore-not-found >/dev/null
+	kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl -n "$NS" apply -f "$ROOT/config/samples/secret-access.yaml" >/dev/null
 	kubectl -n wsnap-system rollout restart deploy/wsnap-controller >/dev/null
 	kubectl -n storage wait --for=condition=complete job/minio-setup --timeout=180s >/dev/null
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
@@ -283,7 +289,13 @@ setup() {
 	repo_condition tar-fs CredentialsScoped False || die "static provider not flagged as unscoped"
 	repo_condition kopia-s3 CredentialsScoped True || die "s3-sts provider not flagged as scoped"
 	kubectl -n wsnap-system get secret wsnap-broker-cert >/dev/null || die "the broker did not create its TLS certificate"
-	pass "setup (repositories validated: Ready, CredentialsScoped reported; broker on TLS with its own certificate)"
+	# A namespace without the RoleBinding: wsnap may not read its Secret.
+	kubectl create namespace e2e-nobind --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl -n e2e-nobind create secret generic creds --from-literal=WSNAP_MASTER_KEY=0123456789abcdef --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: SnapshotRepository\nmetadata: {name: r, namespace: e2e-nobind}\nspec: {engine: {type: restic}, backend: {filesystem: {path: /x}}, credentials: {secretName: creds}}\n' | kubectl apply -f - >/dev/null
+	wait_for 60 "SecretForbidden without a RoleBinding" repo_reason_is e2e-nobind r SecretForbidden
+	kubectl delete namespace e2e-nobind --wait=false >/dev/null
+	pass "setup (repositories Ready, CredentialsScoped reported; broker on TLS; Secrets readable only where bound)"
 }
 
 scenario_pvc() {

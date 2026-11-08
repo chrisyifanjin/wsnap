@@ -1,10 +1,12 @@
 package webhook
 
 import (
-	"github.com/chrisyifanjin/wsnap/internal/workspace"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chrisyifanjin/wsnap/internal/agentpod"
+	"github.com/chrisyifanjin/wsnap/internal/workspace"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,7 +75,7 @@ func TestTLSInjection(t *testing.T) {
 	if err := Mutate(p, c); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(p.Spec.InitContainers[0].Args, " "), "--ca-file=/var/run/wsnap-ca/ca.crt") || !hasVolume(p, caVolume) {
+	if !strings.Contains(strings.Join(p.Spec.InitContainers[0].Args, " "), "--ca-file=/var/run/wsnap-ca/ca.crt") || !hasVolume(p, agentpod.CAVolume) {
 		t.Error("CA not wired into the sidecar")
 	}
 }
@@ -151,7 +153,7 @@ func TestEphemeralContainersCannotReachTheSidecar(t *testing.T) {
 	if err := ValidateEphemeral(debug("wsnap"), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may share the sidecar's process namespace")
 	}
-	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: tokenVolume, MountPath: "/t"}), "wsnap", false); err == nil {
+	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: agentpod.TokenVolume, MountPath: "/t"}), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may mount the wsnap token")
 	}
 }
@@ -206,7 +208,7 @@ func TestWorkloadCannotReachAgentSecretsOrTheAPI(t *testing.T) {
 	if err := Mutate(p, cfg); err != nil {
 		t.Fatal(err)
 	}
-	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: stateVolume, MountPath: "/steal"})
+	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: agentpod.StateVolume, MountPath: "/steal"})
 	p.Annotations = map[string]string{AnnotationInject: "false"}
 	if err := Mutate(p, cfg); err == nil {
 		t.Fatal("a workload container that mounts the sidecar's state volume was admitted")

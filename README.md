@@ -142,6 +142,7 @@ replacement. See [docs/verification.md](docs/verification.md).
 | [operations.md](docs/operations.md) | Install, repositories per backend, workloads, requests, metrics, troubleshooting, uninstall |
 | [api.md](docs/api.md) | Custom resources, labels, broker HTTP API, exec engine contract |
 | [verification.md](docs/verification.md) | Test layers, how to run them, bugs they found |
+| [engineering.md](docs/engineering.md) | How the code is organized and changed: package boundaries, one owner per safety rule, contracts, PR evidence |
 
 ## Development
 

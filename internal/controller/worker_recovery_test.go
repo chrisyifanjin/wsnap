@@ -57,8 +57,8 @@ func TestDeadWorkerClaimIsRerouted(t *testing.T) {
 	ws := wsWith(pvcVol, &wsnapv1.PodRef{Name: "app", UID: "app-uid"})
 	ws.Spec.Execution.Mode = wsnapv1.ExecutionWorker
 	r, c := requestEnv(t, sr, app, deadWorker, ws, boundClaim())
+	reconcileReq(t, r, c)
 	got := reconcileReq(t, r, c)
-	got = reconcileReq(t, r, c)
 	if got.Status.Phase == wsnapv1.SnapshotRunning && got.Status.ClaimedBy == "dead-worker-pod" {
 		t.Errorf("request still Running, claimed by the dead worker Pod (stuck until RunningTimeout=%s): %+v", RunningTimeout, got.Status)
 	}
