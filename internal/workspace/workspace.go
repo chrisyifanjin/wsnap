@@ -157,7 +157,8 @@ func ValidateBinding(ctx context.Context, r client.Reader, namespace string, ref
 func JobRef(job *batchv1.Job) wsnapv1.JobRef {
 	ref := wsnapv1.JobRef{Name: job.Name, UID: string(job.UID), Kind: job.Labels[wsnapv1.LabelJob],
 		ClaimUID: job.Annotations[AnnotationClaimUID], VolumeName: job.Annotations[wsnapv1.AnnotationVolumeName],
-		VolumeUID: job.Annotations[AnnotationPVUID]}
+		VolumeUID:    job.Annotations[AnnotationPVUID],
+		TargetPodUID: job.Annotations[wsnapv1.AnnotationTargetPodUID], TargetPodName: job.Annotations[wsnapv1.AnnotationTargetPodName]}
 	for _, v := range job.Spec.Template.Spec.Volumes {
 		if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
 			ref.ClaimName = v.PersistentVolumeClaim.ClaimName
@@ -165,6 +166,13 @@ func JobRef(job *batchv1.Job) wsnapv1.JobRef {
 		}
 	}
 	return ref
+}
+
+// JobRefMatches reports whether job still matches its registration. The
+// writer epoch is recorded later by the broker and is not part of the Job.
+func JobRefMatches(recorded wsnapv1.JobRef, job *batchv1.Job) bool {
+	recorded.WriterEpoch = 0
+	return recorded == JobRef(job)
 }
 
 // Protect switches the PV behind ref to the Retain reclaim policy, so its
@@ -212,8 +220,15 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 	return c.Patch(ctx, &pv, patch)
 }
 
+// HasFinalSnapshot reports whether the last Pod that wrote to a PV also
+// took a final snapshot of it: only then is a released PV safe to reclaim
+// without a rescue. a is the PV's annotations.
+func HasFinalSnapshot(a map[string]string) bool {
+	return a[AnnotationWriterPod] != "" && a[AnnotationWriterPod] == a[AnnotationFinalPod]
+}
+
 // Per-PV bookkeeping. A released PV is safe to reclaim only when the last
-// Pod that wrote to it also took a final snapshot of it.
+// Pod that wrote to it also took a final snapshot of it (HasFinalSnapshot).
 const (
 	AnnotationWriterPod = "wsnap.dev/writer-pod-uid"
 	AnnotationFinalPod  = "wsnap.dev/final-pod-uid"
@@ -224,6 +239,9 @@ const (
 	// AnnotationWriterEpoch is the Workspace writerEpoch of the last Pod
 	// that the broker admitted as writer on this volume.
 	AnnotationWriterEpoch = "wsnap.dev/writer-epoch"
+	// FinalByMover is AnnotationWriterPod and AnnotationFinalPod's value
+	// when no workspace Pod wrote the volume before a mover Job saved it.
+	FinalByMover = "mover"
 )
 
 // ErrBadVolume marks a Pod whose workspace volume wsnap cannot use, as

@@ -95,14 +95,22 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	var secret *corev1.Secret
 	var s corev1.Secret
 	err := r.Reader.Get(ctx, types.NamespacedName{Namespace: repo.Namespace, Name: repo.Spec.Credentials.SecretName}, &s)
+	forbidden := apierrors.IsForbidden(err)
 	switch {
 	case err == nil:
 		secret = &s
-	case !apierrors.IsNotFound(err):
+	case !apierrors.IsNotFound(err) && !forbidden:
 		return ctrl.Result{}, err
 	}
 	ready := metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Valid", Message: "configuration is valid", ObservedGeneration: repo.Generation}
-	if verr := ValidateRepository(&repo, secret); verr != nil {
+	var result ctrl.Result
+	if forbidden {
+		// Installed with config/namespaced-secrets and this namespace has
+		// no RoleBinding yet. RBAC changes are not watched; check again.
+		ready.Status, ready.Reason = metav1.ConditionFalse, "SecretForbidden"
+		ready.Message = fmt.Sprintf("wsnap may not read secret %q: bind the ClusterRole wsnap-secret-reader to the service account wsnap-system/wsnap-controller in this namespace (config/samples/secret-access.yaml)", repo.Spec.Credentials.SecretName)
+		result.RequeueAfter = time.Minute
+	} else if verr := ValidateRepository(&repo, secret); verr != nil {
 		ready.Status, ready.Reason, ready.Message = metav1.ConditionFalse, "Invalid", verr.Error()
 	}
 	scoped := metav1.Condition{Type: "CredentialsScoped", Status: metav1.ConditionTrue, Reason: "ScopedProvider",
@@ -117,9 +125,9 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// SetStatusCondition keeps lastTransitionTime when the status is
 	// unchanged, so an unchanged repository compares equal.
 	if equality.Semantic.DeepEqual(before, &repo.Status) {
-		return ctrl.Result{}, nil
+		return result, nil
 	}
-	return ctrl.Result{}, r.Status().Update(ctx, &repo)
+	return result, r.Status().Update(ctx, &repo)
 }
 
 // SetupWithManager registers the reconciler. Secrets are not watched (they

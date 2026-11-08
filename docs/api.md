@@ -47,18 +47,19 @@ first Pod. You can create it first, to set `restoreFrom`.
 | Field | Meaning |
 |---|---|
 | `spec.repositoryName` | The SnapshotRepository. |
+| `spec.execution.mode` | `sidecar` (default) or `worker`: the agent runs in a separate Pod on the workload's node and PVC. Cannot change after creation. |
 | `spec.restoreFrom.workspaceName` | Fork: restore another workspace's snapshot into the next empty volume. |
 | `spec.restoreFrom.snapshotID` | Restore this snapshot instead of the newest. |
 | `status.volume` | `kind` (`persistentVolumeClaim`, `ephemeral`, `emptyDir`), `claimName`, `volumeName` of the writer's volume. |
 | `status.writerPod` | The Pod that writes the workspace. |
 | `status.writerEpoch` | Increases each time another Pod becomes the writer. |
-| `status.lastSnapshot` | `id`, `time`, `executor` (`sidecar`, `mover`), `pod`, `volumeName`, `final`, `epoch`. Restores use `id`. A snapshot of an older `epoch` never replaces it. |
+| `status.lastSnapshot` | `id`, `time`, `executor` (`sidecar`, `mover`), `pod`, `volumeName`, `final`, `epoch`. `executor` is `worker` in worker mode. Restores use `id`. A snapshot of an older `epoch` never replaces it. |
 | `status.lastRestore` | `snapshotID`, `sourceWorkspace`, `time`, `pod`. |
 | `status.supersededSnapshots` | Rescue snapshots of older writer epochs (newest 10). Maintenance keeps them; restore one by ID with a `WorkspaceRestore`. |
 | `status.lastError` | The last failure. |
 | `status.snapshotsSinceMaintenance`, `status.lastMaintenance` | Maintenance bookkeeping. |
 | `status.restoreFromGeneration` | The generation whose `restoreFrom` was used (or skipped because the volume already had data). |
-| `status.jobs` | Jobs the controller created for this workspace. The broker serves only these. |
+| `status.jobs` | Jobs the controller created for this workspace, with the PVC and PV UIDs they may use and, for a worker, its workload Pod and writer epoch. The broker serves only these. |
 
 ### WorkspaceSnapshot and WorkspaceRestore
 
@@ -69,7 +70,7 @@ the same workspace).
 | Status field | Meaning |
 |---|---|
 | `phase` | `Pending`, `Running`, `Succeeded` or `Failed`. |
-| `executor` | `sidecar`, `mover` or `restorer`. |
+| `executor` | `sidecar`, `worker`, `mover` or `restorer`. |
 | `claimedBy` | UID of the Pod that serves the request. |
 | `snapshotID` | The snapshot taken, or the snapshot restored. |
 | `message` | The reason for a failure or a wait. |
@@ -94,7 +95,8 @@ restored state is in a new snapshot.
 
 ## Broker HTTP API
 
-The broker listens on `:8080` (`wsnap-broker.wsnap-system.svc`).
+The broker serves HTTPS on `:8443` (`wsnap-broker.wsnap-system.svc`). See
+[security.md](security.md#transport) for its certificate.
 
 ### Agent endpoints
 
@@ -106,6 +108,7 @@ Agents authenticate with a projected service account token (audience
 | `POST /v1/credentials` | `{"role": "restore"\|"snapshot"\|"mover"\|"maintenance", "request": "<WorkspaceRestore>"}` | Engine, backend, scoped credential, repository password, interval, retention. For `restore`: `snapshotID` (pinned) or `latestSnapshotID` (recorded newest). For `maintenance`: `keepIDs`. |
 | `POST /v1/report` | operation, role, snapshot ID, final, reused, request, error | `204`. |
 | `POST /v1/wait` | `{}` | Long poll (up to 50 s): `{"requests": [...], "restores": [...]}` for the caller's workspace: new claims, and the caller's own unfinished claims again. |
+| `POST /v1/worker-state` | `{}` | Worker Jobs only: `{"stop": true}` when the workload Pod has stopped (gone, finished, or replaced by a new Pod with the same name). |
 
 Errors: 4xx means "refused; do not retry" (409: wait for another writer,
 a rescue, or a Job). 503 means "try again": the API server, STS, or an
@@ -130,8 +133,9 @@ timeout (at most 50 s) with the current phase.
 
 ```sh
 TOKEN=$(kubectl -n team-a create token platform)
-curl -X POST -H "Authorization: Bearer $TOKEN" -d '{"wait":true}' \
-  http://wsnap-broker.wsnap-system.svc:8080/v1/namespaces/team-a/workspaces/user-42/snapshots
+kubectl -n wsnap-system get secret wsnap-broker-cert -o jsonpath='{.data.ca\.crt}' | base64 -d > broker-ca.crt
+curl --cacert broker-ca.crt -X POST -H "Authorization: Bearer $TOKEN" -d '{"wait":true}' \
+  https://wsnap-broker.wsnap-system.svc:8443/v1/namespaces/team-a/workspaces/user-42/snapshots
 ```
 
 ## Exec engine contract

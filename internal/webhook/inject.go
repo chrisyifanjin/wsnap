@@ -9,6 +9,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/chrisyifanjin/wsnap/internal/agentpod"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
@@ -38,19 +40,21 @@ type Config struct {
 	AgentImage string
 	BrokerURL  string
 	Audience   string
+	// ExecutionMode comes from Workspace.spec.execution.mode. A missing
+	// Workspace uses the legacy sidecar mode.
+	ExecutionMode string
 	// CAConfigMap names the ConfigMap with the broker's CA; empty for HTTP.
 	CAConfigMap string
+	// CABundle returns the CA of a broker that manages its own
+	// certificate. Agents get it inline in WSNAP_CA_PEM. CAConfigMap wins
+	// when both are set.
+	CABundle func() []byte
 	// AllowAPIToken admits workload containers that mount an API server
 	// token (--allow-automounted-tokens).
 	AllowAPIToken bool
 }
 
 const (
-	tokenVolume = "wsnap-token"
-	stateVolume = "wsnap-state"
-	caVolume    = "wsnap-ca"
-	dataPath    = "/workspace"
-
 	defaultFinalTimeout = 50 * time.Second
 	// defaultWorkloadGrace is the workload's own shutdown budget.
 	defaultWorkloadGrace = 30 * time.Second
@@ -64,6 +68,9 @@ const (
 func Mutate(pod *corev1.Pod, cfg Config) error {
 	if _, err := workspace.FromPod(pod); err != nil {
 		return err
+	}
+	if cfg.ExecutionMode == wsnapv1.ExecutionWorker {
+		return mutateWorkerPod(pod, cfg)
 	}
 	volName := pod.Annotations[wsnapv1.AnnotationVolume]
 	if volName == "" {
@@ -118,29 +125,21 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		return fmt.Errorf("container %q is a regular container; the wsnap sidecar must be a native sidecar (an init container with restartPolicy: Always) so it restores before the workload starts", sidecarName)
 	}
 	if pod.Annotations[AnnotationInject] == "false" || existing != nil {
+		if existing != nil && !agentpod.HasCA(existing) {
+			// A Pod's own sidecar cannot know a CA that the broker made.
+			existing.Env = append(existing.Env, cfg.trust().Env()...)
+		}
 		return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
 	}
 
-	ensureVolume(pod, corev1.Volume{Name: tokenVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-			Audience: cfg.Audience, ExpirationSeconds: ptr.To[int64](600), Path: "token"}}}}}})
-	ensureVolume(pod, corev1.Volume{Name: stateVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
-	args := []string{"sidecar", "--dir=" + dataPath, "--broker-url=" + cfg.BrokerURL,
+	ensureVolume(pod, agentpod.TokenVolumeFor(cfg.Audience))
+	ensureVolume(pod, agentpod.StateVolumeSpec())
+	args := []string{"sidecar", "--dir=" + agentpod.DataPath, "--broker-url=" + cfg.BrokerURL,
 		"--final-timeout=" + finalTimeout.String()}
 	if quiesce > 0 {
 		args = append(args, "--quiesce-timeout="+quiesce.String())
 	}
-	mounts := []corev1.VolumeMount{
-		{Name: volName, MountPath: dataPath},
-		{Name: tokenVolume, MountPath: "/var/run/secrets/wsnap", ReadOnly: true},
-		{Name: stateVolume, MountPath: "/var/lib/wsnap"},
-	}
-	if cfg.CAConfigMap != "" {
-		ensureVolume(pod, corev1.Volume{Name: caVolume, VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-			LocalObjectReference: corev1.LocalObjectReference{Name: cfg.CAConfigMap}}}})
-		mounts = append(mounts, corev1.VolumeMount{Name: caVolume, MountPath: "/var/run/wsnap-ca", ReadOnly: true})
-		args = append(args, "--ca-file=/var/run/wsnap-ca/ca.crt")
-	}
+	mounts := append([]corev1.VolumeMount{{Name: volName, MountPath: agentpod.DataPath}}, agentpod.AgentMounts()...)
 	sidecar := corev1.Container{
 		Name:          sidecarName,
 		Image:         cfg.AgentImage,
@@ -158,33 +157,67 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		VolumeMounts: mounts,
 		Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
 			corev1.ResourceCPU: resource.MustParse("50m"), corev1.ResourceMemory: resource.MustParse("64Mi")}},
-		SecurityContext: AgentSecurityContext(),
+		SecurityContext: agentpod.SecurityContext(),
 	}
+	trust := cfg.trust()
+	if v, ok := trust.Volume(); ok {
+		ensureVolume(pod, v)
+	}
+	trust.Apply(&sidecar)
 	// First, so the restore finishes before any other init container (which
 	// might write to the workspace) starts.
 	pod.Spec.InitContainers = append([]corev1.Container{sidecar}, pod.Spec.InitContainers...)
 	return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
 }
 
-// AgentSecurityContext hardens the agent container. Its root filesystem
-// is read-only, so even a path trick from the workload cannot replace the
-// agent or engine binaries; it keeps only the capabilities needed to read
-// every workspace file and restore owners and modes.
-func AgentSecurityContext() *corev1.SecurityContext {
-	return &corev1.SecurityContext{
-		// Always root, whatever the Pod-level runAsUser: the agent must read
-		// and restore every file, and every agent on a volume (sidecar,
-		// mover, restorer) must be the same uid to trust .wsnap.
-		RunAsUser:                ptr.To[int64](0),
-		RunAsGroup:               ptr.To[int64](0),
-		RunAsNonRoot:             ptr.To(false),
-		ReadOnlyRootFilesystem:   ptr.To(true),
-		AllowPrivilegeEscalation: ptr.To(false),
-		Capabilities: &corev1.Capabilities{
-			Drop: []corev1.Capability{"ALL"},
-			Add:  []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID"},
-		},
+func (cfg Config) trust() agentpod.Trust {
+	return agentpod.Trust{ConfigMap: cfg.CAConfigMap, Bundle: cfg.CABundle}
+}
+
+// mutateWorkerPod gates the workload on a separate worker's restore. The
+// gate has no credential or API token; it only reads a per-Pod readiness
+// marker after the worker has claimed the workspace writer epoch.
+func mutateWorkerPod(pod *corev1.Pod, cfg Config) error {
+	volName := pod.Annotations[wsnapv1.AnnotationVolume]
+	if volName == "" {
+		volName = wsnapv1.DefaultVolumeName
 	}
+	var vol *corev1.Volume
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == volName {
+			vol = &pod.Spec.Volumes[i]
+			break
+		}
+	}
+	if vol == nil || (vol.PersistentVolumeClaim == nil && vol.Ephemeral == nil) {
+		return fmt.Errorf("worker mode requires volume %q to be a persistentVolumeClaim or generic ephemeral PVC", volName)
+	}
+	if vol.Ephemeral != nil && vol.Ephemeral.VolumeClaimTemplate != nil {
+		for _, mode := range vol.Ephemeral.VolumeClaimTemplate.Spec.AccessModes {
+			if mode == corev1.ReadWriteOncePod {
+				return fmt.Errorf("worker mode cannot share a ReadWriteOncePod claim between Pods")
+			}
+		}
+	}
+	if ptr.Deref(pod.Spec.ShareProcessNamespace, false) || pod.Spec.HostPID {
+		return fmt.Errorf("worker mode does not allow shareProcessNamespace or hostPID")
+	}
+	if a := pod.Spec.AutomountServiceAccountToken; a != nil && *a {
+		return fmt.Errorf("automountServiceAccountToken is true: untrusted containers would hold an API token")
+	}
+	pod.Spec.AutomountServiceAccountToken = ptr.To(false)
+	if !cfg.AllowAPIToken {
+		removeAPITokens(pod)
+	}
+	if findContainer(pod.Spec.Containers, agentpod.GateName) != nil {
+		return fmt.Errorf("container name %q is reserved for the worker readiness gate", agentpod.GateName)
+	}
+	// Always wsnap's own gate, first: a gate the Pod brings could let the
+	// workload start before the worker restored the volume.
+	pod.Spec.InitContainers = slices.DeleteFunc(pod.Spec.InitContainers, func(c corev1.Container) bool { return c.Name == agentpod.GateName })
+	gate := agentpod.Gate(cfg.AgentImage, volName)
+	pod.Spec.InitContainers = append([]corev1.Container{gate}, pod.Spec.InitContainers...)
+	return workspace.CheckWorkerIsolation(pod, cfg.Audience, cfg.AllowAPIToken)
 }
 
 // validate checks a Pod that already has its sidecar.

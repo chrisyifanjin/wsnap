@@ -36,7 +36,7 @@ the recovery flow.
 | Storage | S3-compatible (AWS S3, MinIO, Ceph RGW, R2, SeaweedFS, ...), Google Cloud Storage, Azure Blob, shared filesystem |
 | Credentials | One credential per workspace and per role: `s3-sts`, `gcs-downscoped`, `azure-sas`, or `static` |
 | Workspace volume | PVC, generic ephemeral volume, `emptyDir` |
-| Who does the work | An in-Pod sidecar while the Pod runs; a Job when no Pod runs |
+| Who does the work | An in-Pod sidecar, or a worker Pod beside the workload (same node and PVC), while the Pod runs; a Job when no Pod runs |
 | Triggers | Schedule, Pod shutdown, `WorkspaceSnapshot`/`WorkspaceRestore` objects, an HTTP gateway API, a file the agent writes |
 | Restore | Newest snapshot, a pinned snapshot (rollback), or another workspace's snapshot (fork); at start or in a running Pod |
 
@@ -142,6 +142,7 @@ replacement. See [docs/verification.md](docs/verification.md).
 | [operations.md](docs/operations.md) | Install, repositories per backend, workloads, requests, metrics, troubleshooting, uninstall |
 | [api.md](docs/api.md) | Custom resources, labels, broker HTTP API, exec engine contract |
 | [verification.md](docs/verification.md) | Test layers, how to run them, bugs they found |
+| [engineering.md](docs/engineering.md) | How the code is organized and changed: package boundaries, one owner per safety rule, contracts, PR evidence |
 
 ## Development
 

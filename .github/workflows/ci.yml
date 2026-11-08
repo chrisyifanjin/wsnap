@@ -33,13 +33,15 @@ jobs:
           make vet test
       - name: Race detector
         run: go test -race ./internal/...
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       - name: Known vulnerabilities (Go code and dependencies)
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - name: Release manifest renders
         run: make install-manifest VERSION=v0.0.0-ci && rm install.yaml
 
   e2e:
-    # Three groups of scenarios that share no state, each on its own
+    # Groups of scenarios that share no state, each on its own
     # three-node cluster. test/e2e/run.sh defines the groups.
     name: e2e (${{ matrix.group }})
     runs-on: ubuntu-latest
@@ -47,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [controlplane, volumes, failures]
+        group: [controlplane, volumes, failures, worker]
     steps:
       - uses: actions/checkout@v7
       - name: Install kind and kubectl
