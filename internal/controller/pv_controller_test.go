@@ -144,6 +144,58 @@ func TestOriginallyRetainedVolumeStaysRetained(t *testing.T) {
 	}
 }
 
+func TestReclaimRejectsReboundVolumeFromStaleCache(t *testing.T) {
+	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{
+		workspace.AnnotationWriterPod: "u1", workspace.AnnotationFinalPod: "u1",
+	}))
+	stale := getPV(t, c)
+	current := getPV(t, c)
+	current.Annotations[wsnapv1.AnnotationWorkspaceRef] = testNS + "/another-workspace"
+	current.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: "new-claim", UID: "new-uid"}
+	if err := c.Update(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reclaim(context.Background(), stale); err == nil {
+		t.Fatal("reclaimed a volume that changed after the cached read")
+	}
+	got := getPV(t, c)
+	if got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain ||
+		got.Labels[wsnapv1.LabelProtected] != "true" ||
+		got.Annotations[wsnapv1.AnnotationWorkspaceRef] != testNS+"/another-workspace" {
+		t.Fatalf("rebound volume lost its protection: %+v", got)
+	}
+}
+
+type rebindBeforePatchClient struct{ client.Client }
+
+func (c rebindBeforePatchClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	var current corev1.PersistentVolume
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: obj.GetName()}, &current); err != nil {
+		return err
+	}
+	current.Annotations[wsnapv1.AnnotationWorkspaceRef] = testNS + "/another-workspace"
+	if err := c.Client.Update(ctx, &current); err != nil {
+		return err
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestReclaimRejectsRebindBetweenLiveReadAndPatch(t *testing.T) {
+	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{
+		workspace.AnnotationWriterPod: "u1", workspace.AnnotationFinalPod: "u1",
+	}))
+	r.Client = rebindBeforePatchClient{r.Client}
+	if err := r.reclaim(context.Background(), getPV(t, c)); !apierrors.IsConflict(err) {
+		t.Fatalf("reclaim patch after a concurrent rebind: %v, want conflict", err)
+	}
+	got := getPV(t, c)
+	if got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain ||
+		got.Labels[wsnapv1.LabelProtected] != "true" ||
+		got.Annotations[wsnapv1.AnnotationWorkspaceRef] != testNS+"/another-workspace" {
+		t.Fatalf("concurrently rebound volume lost its protection: %+v", got)
+	}
+}
+
 func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 	// The writer (u2) is newer than the last final snapshot (u1).
 	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{
