@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"github.com/chrisyifanjin/wsnap/internal/workspace"
 	"slices"
 	"time"
+
+	"github.com/chrisyifanjin/wsnap/internal/agentpod"
+	"github.com/chrisyifanjin/wsnap/internal/workspace"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,7 +20,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	wsnapv1 "github.com/chrisyifanjin/wsnap/api/v1alpha1"
-	"github.com/chrisyifanjin/wsnap/internal/webhook"
 )
 
 // JobConfig holds what every controller-created Job needs.
@@ -33,15 +34,14 @@ type JobConfig struct {
 	// that holds the CA of the broker's TLS certificate. Empty for a plain
 	// HTTP broker. trust-manager can keep it in sync across namespaces.
 	CAConfigMap string
+	// CABundle returns the CA of a broker that manages its own
+	// certificate; Jobs get it in WSNAP_CA_PEM.
+	CABundle func() []byte
 }
 
 const (
-	tokenMountPath = "/var/run/secrets/wsnap"
-	dataMountPath  = "/workspace"
-	stateMountPath = "/var/lib/wsnap"
-	// tokenExpiry is the projected token lifetime. Kubernetes refreshes the
-	// file before it expires; 600 seconds is the minimum it accepts.
-	tokenExpiry = 600
+	// dataMountPath is where a Job's agent sees the workspace volume.
+	dataMountPath = agentpod.DataPath
 	// jobDeadline stops a Job that cannot finish, for example a mover whose
 	// node-local PV sits on a dead node. The rescue then shows as failed
 	// instead of running forever.
@@ -58,8 +58,9 @@ func shortHash(parts ...string) string {
 	return hex.EncodeToString(h.Sum(nil))[:10]
 }
 
-// newAgentJob builds a Job that runs the agent once. kind is mover or
-// maintenance.
+// newAgentJob builds a Job that runs the agent. kind is a wsnapv1.Job*
+// constant; the container comes from agentpod, as the injected sidecar's
+// does.
 func (c JobConfig) newAgentJob(kind string, name string, ws *wsnapv1.Workspace, repo *wsnapv1.SnapshotRepository, args []string, extraVolumes []corev1.Volume, extraMounts []corev1.VolumeMount) *batchv1.Job {
 	image := repo.Spec.Jobs.Image
 	if image == "" {
@@ -71,26 +72,22 @@ func (c JobConfig) newAgentJob(kind string, name string, ws *wsnapv1.Workspace, 
 		wsnapv1.LabelJobWorkspace: ws.Name,
 		wsnapv1.LabelRepository:   ws.Spec.RepositoryName,
 	}
-	volumes := append([]corev1.Volume{
-		{Name: "wsnap-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-				Audience: c.Audience, ExpirationSeconds: ptr.To[int64](tokenExpiry), Path: "token",
-			}}},
-		}}},
-		{Name: "wsnap-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-	}, extraVolumes...)
+	volumes := append([]corev1.Volume{agentpod.TokenVolumeFor(c.Audience), agentpod.StateVolumeSpec()}, extraVolumes...)
 	volumes = append(volumes, repo.Spec.Jobs.Volumes...)
-	mounts := append([]corev1.VolumeMount{
-		{Name: "wsnap-token", MountPath: tokenMountPath, ReadOnly: true},
-		{Name: "wsnap-state", MountPath: stateMountPath},
-	}, extraMounts...)
+	mounts := append(agentpod.AgentMounts(), extraMounts...)
 	mounts = append(mounts, repo.Spec.Jobs.VolumeMounts...)
-	if c.CAConfigMap != "" {
-		volumes = append(volumes, corev1.Volume{Name: "wsnap-ca", VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: c.CAConfigMap}}}})
-		mounts = append(mounts, corev1.VolumeMount{Name: "wsnap-ca", MountPath: "/var/run/wsnap-ca", ReadOnly: true})
-		args = append(args, "--ca-file=/var/run/wsnap-ca/ca.crt")
+	trust := agentpod.Trust{ConfigMap: c.CAConfigMap, Bundle: c.CABundle}
+	if v, ok := trust.Volume(); ok {
+		volumes = append(volumes, v)
 	}
+	agent := corev1.Container{
+		Name:            wsnapv1.DefaultSidecarName,
+		Image:           image,
+		Args:            append(args, "--broker-url="+c.BrokerURL, "--token-file="+agentpod.TokenPath+"/token", "--state-dir="+agentpod.StatePath),
+		VolumeMounts:    mounts,
+		SecurityContext: agentpod.SecurityContext(),
+	}
+	trust.Apply(&agent)
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ws.Namespace, Name: name, Labels: labels},
 		Spec: batchv1.JobSpec{
@@ -105,13 +102,7 @@ func (c JobConfig) newAgentJob(kind string, name string, ws *wsnapv1.Workspace, 
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext:              repo.Spec.Jobs.SecurityContext,
 					Volumes:                      volumes,
-					Containers: []corev1.Container{{
-						Name:            wsnapv1.DefaultSidecarName,
-						Image:           image,
-						Args:            append(args, "--broker-url="+c.BrokerURL, "--token-file="+tokenMountPath+"/token", "--state-dir="+stateMountPath),
-						VolumeMounts:    mounts,
-						SecurityContext: webhook.AgentSecurityContext(),
-					}},
+					Containers:                   []corev1.Container{agent},
 				},
 			},
 		},
@@ -147,7 +138,12 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 		if err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: wsName}, &ws); err != nil {
 			return err
 		}
-		if slices.ContainsFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool { return j.UID == string(existing.UID) }) {
+		if slices.ContainsFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool {
+			return workspace.JobRefMatches(j, &existing) && j.ClaimName == workspace.JobRef(job).ClaimName &&
+				j.ClaimUID == job.Annotations[workspace.AnnotationClaimUID] &&
+				j.VolumeName == job.Annotations[wsnapv1.AnnotationVolumeName] &&
+				j.VolumeUID == job.Annotations[workspace.AnnotationPVUID]
+		}) {
 			*job = existing
 			return nil
 		}
@@ -163,7 +159,7 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 		}
 		return fmt.Errorf("job %s/%s existed but was not registered by wsnap; deleted it, will create it again", job.Namespace, job.Name)
 	}
-	ref := wsnapv1.JobRef{Name: job.Name, UID: string(job.UID), Kind: job.Labels[wsnapv1.LabelJob]}
+	ref := workspace.JobRef(job)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var ws wsnapv1.Workspace
 		if err := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: wsName}, &ws); err != nil {

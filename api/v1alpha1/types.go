@@ -23,7 +23,7 @@ const (
 	AnnotationSidecar = "wsnap.dev/sidecar"
 
 	// LabelJob marks Jobs the controller creates, and their Pods. The value
-	// is mover or maintenance.
+	// is the Job's kind: JobMover, JobRestorer, JobMaintenance or JobWorker.
 	LabelJob = "wsnap.dev/job"
 	// LabelJobWorkspace names the workspace of a controller-created Job.
 	// Jobs do not carry LabelWorkspace, which marks workload Pods.
@@ -41,12 +41,15 @@ const (
 	// to restore once the volume's data is safe.
 	AnnotationOriginalReclaimPolicy = "wsnap.dev/original-reclaim-policy"
 	// AnnotationRescue on a protected PV tracks the rescue of a released
-	// volume. See RescuePhase.
+	// volume: one of the Rescue* phases.
 	AnnotationRescue = "wsnap.dev/rescue"
 	// AnnotationVolumeName on a mover Job names the PV it snapshots. On a
 	// WorkspaceSnapshot it targets that PV instead of the writer's volume
 	// (the broker uses it to save a stopped writer's volume).
 	AnnotationVolumeName = "wsnap.dev/volume-name"
+	// Worker Jobs identify the workload Pod whose PVC they share.
+	AnnotationTargetPodName = "wsnap.dev/target-pod-name"
+	AnnotationTargetPodUID  = "wsnap.dev/target-pod-uid"
 	// AnnotationRequest on a mover Job names the WorkspaceSnapshot it
 	// serves.
 	AnnotationRequest = "wsnap.dev/request"
@@ -300,10 +303,63 @@ type RestoreSource struct {
 	SnapshotID string `json:"snapshotID,omitempty"`
 }
 
+// Rescue phases: the value of AnnotationRescue on a protected PV.
+//
+// A protected PV whose claim is deleted goes to Released with its data
+// intact. If its last writer took a final snapshot, the controller
+// restores the original reclaim policy and Kubernetes reclaims it; no
+// rescue phase is set. Otherwise:
+//
+//	(none) ──▶ running ──▶ done ──▶ reclaimed
+//	              │
+//	              └──▶ failed (kept for an operator; remove the annotation to retry)
+//
+// While a PV is running, or released without a final snapshot and not yet
+// running, the broker makes the workspace's next writer wait, so it cannot
+// restore older data than the rescue will save.
+const (
+	RescueRunning = "running"
+	RescueDone    = "done"
+	RescueFailed  = "failed"
+	// RescueSkippedNewerWriter was set by earlier versions when a newer
+	// writer existed. Writer epochs made the skip unnecessary; such PVs are
+	// still left for an operator.
+	RescueSkippedNewerWriter = "skipped-newer-writer"
+)
+
+// Kinds of Job the controller creates: the value of LabelJob and of
+// JobRef.Kind.
+const (
+	// JobMover snapshots a volume no Pod is using (a rescue or a request).
+	JobMover = "mover"
+	// JobRestorer restores a snapshot into a volume no Pod is using.
+	JobRestorer = "restorer"
+	// JobMaintenance applies retention to a workspace repository.
+	JobMaintenance = "maintenance"
+	// JobWorker takes live snapshots beside a workload in worker mode.
+	JobWorker = "worker"
+)
+
+// Executors: what took a snapshot or served a request (status.executor
+// of SnapshotRecord, WorkspaceSnapshot and WorkspaceRestore).
+const (
+	ExecutorSidecar  = "sidecar"
+	ExecutorWorker   = "worker"
+	ExecutorMover    = "mover"
+	ExecutorRestorer = "restorer"
+)
+
 // WorkspaceSpec is the durable identity of a workspace.
+// A running Pod cannot change its executor placement, so mode is immutable.
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.execution) ? (has(self.execution) && self.execution.mode == oldSelf.execution.mode) : (!has(self.execution) || self.execution.mode == 'sidecar')",message="execution mode is immutable"
 type WorkspaceSpec struct {
 	// repositoryName is the SnapshotRepository holding this workspace.
 	RepositoryName string `json:"repositoryName"`
+	// execution selects where live snapshots run. The default is sidecar.
+	// Worker requires a PVC that a second Pod can mount and a Workspace
+	// created before its first workload Pod.
+	// +optional
+	Execution WorkspaceExecutionSpec `json:"execution,omitempty"`
 	// restoreFrom applies to the next restore after it is set or changed,
 	// and only once: status.restoreFromGeneration records that it was used.
 	// Create a Workspace with restoreFrom before its first Pod to fork.
@@ -311,14 +367,43 @@ type WorkspaceSpec struct {
 	RestoreFrom *RestoreSource `json:"restoreFrom,omitempty"`
 }
 
+// WorkspaceExecutionSpec chooses the live snapshot agent placement.
+type WorkspaceExecutionSpec struct {
+	// mode is sidecar (the default) or worker (a separate Pod sharing the PVC).
+	// +kubebuilder:validation:Enum=sidecar;worker
+	// +kubebuilder:default=sidecar
+	// +optional
+	Mode string `json:"mode,omitempty"`
+}
+
+const (
+	ExecutionSidecar = "sidecar"
+	ExecutionWorker  = "worker"
+)
+
+// ExecutionMode returns the effective mode, including older objects that
+// predate this field.
+func (s WorkspaceSpec) ExecutionMode() string {
+	if s.Execution.Mode == "" {
+		return ExecutionSidecar
+	}
+	return s.Execution.Mode
+}
+
 // VolumeRef is the volume currently holding a workspace's data.
 type VolumeRef struct {
 	// claimName is empty for emptyDir workspaces.
 	// +optional
 	ClaimName string `json:"claimName,omitempty"`
+	// claimUID prevents a deleted claim's replacement from inheriting its identity.
+	// +optional
+	ClaimUID string `json:"claimUID,omitempty"`
 	// volumeName is the bound PersistentVolume.
 	// +optional
 	VolumeName string `json:"volumeName,omitempty"`
+	// volumeUID prevents a replacement PV with the same name from being trusted.
+	// +optional
+	VolumeUID string `json:"volumeUID,omitempty"`
 	// kind is persistentVolumeClaim, ephemeral or emptyDir.
 	Kind string `json:"kind"`
 }
@@ -328,6 +413,26 @@ type JobRef struct {
 	Name string `json:"name"`
 	UID  string `json:"uid"`
 	Kind string `json:"kind"`
+	// The volume identity a mover or restorer was created to use. Empty for
+	// maintenance Jobs, which do not mount a workspace PVC.
+	// +optional
+	ClaimName string `json:"claimName,omitempty"`
+	// +optional
+	ClaimUID string `json:"claimUID,omitempty"`
+	// +optional
+	VolumeName string `json:"volumeName,omitempty"`
+	// +optional
+	VolumeUID string `json:"volumeUID,omitempty"`
+	// The workload Pod a worker Job serves. The Job's annotations can be
+	// edited; this record cannot.
+	// +optional
+	TargetPodUID string `json:"targetPodUID,omitempty"`
+	// +optional
+	TargetPodName string `json:"targetPodName,omitempty"`
+	// writerEpoch is the epoch a worker Job claimed for its workload Pod.
+	// The broker sets it; it orders a late report against a newer writer.
+	// +optional
+	WriterEpoch int64 `json:"writerEpoch,omitempty"`
 }
 
 // PodRef identifies one Pod incarnation.
@@ -541,12 +646,6 @@ type WorkspaceRestoreList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []WorkspaceRestore `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&WorkspaceRestore{}, &WorkspaceRestoreList{})
-	SchemeBuilder.Register(&SnapshotRepository{}, &SnapshotRepositoryList{}, &Workspace{}, &WorkspaceList{},
-		&WorkspaceSnapshot{}, &WorkspaceSnapshotList{})
 }
 
 // Request is implemented by WorkspaceSnapshot and WorkspaceRestore, which

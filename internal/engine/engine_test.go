@@ -151,6 +151,7 @@ func stores(t *testing.T) map[string]store {
 			},
 		}
 	}
+	cloudStores(t, out)
 	endpoint := os.Getenv("WSNAP_TEST_S3_ENDPOINT")
 	if endpoint == "" {
 		return out
@@ -178,6 +179,79 @@ func stores(t *testing.T) map[string]store {
 		},
 	}
 	return out
+}
+
+// cloudStores adds real AWS, GCS and Azure, each with the scoped provider
+// wsnap ships for it (.github/workflows/cloud-conformance.yml). The base
+// credentials come from the workflow's OIDC login, as a broker's would
+// come from its Secret.
+func cloudStores(t *testing.T, out map[string]store) {
+	prefix := "conformance/" + strconv.FormatInt(time.Now().UnixNano(), 36) + "/"
+	if bucket := os.Getenv("WSNAP_TEST_AWS_BUCKET"); bucket != "" {
+		region := os.Getenv("WSNAP_TEST_AWS_REGION")
+		p := credentials.S3STS{RoleARN: os.Getenv("WSNAP_TEST_AWS_ROLE_ARN"), Region: region}
+		secret := map[string][]byte{
+			credentials.KeyAWSAccessKeyID:     []byte(os.Getenv("AWS_ACCESS_KEY_ID")),
+			credentials.KeyAWSSecretAccessKey: []byte(os.Getenv("AWS_SECRET_ACCESS_KEY")),
+			credentials.KeyAWSSessionToken:    []byte(os.Getenv("AWS_SESSION_TOKEN")),
+		}
+		out["s3-sts-aws"] = store{
+			backend: func(ws string) protocol.Backend {
+				return protocol.Backend{S3: &protocol.S3Backend{Endpoint: "s3." + region + ".amazonaws.com", Bucket: bucket, Region: region, Prefix: prefix + ws}}
+			},
+			issue: func(t *testing.T, role protocol.Role, b protocol.Backend, eng protocol.Engine) protocol.Credentials {
+				t.Helper()
+				c, err := p.Issue(context.Background(), credentials.Request{Role: role, Namespace: "test", Workspace: "ws",
+					Backend: b, Secret: secret, WriterDeletePrefixes: engine.WriterDeletePrefixes(eng)})
+				if err != nil {
+					t.Fatalf("issue %s credential: %v", role, err)
+				}
+				return c
+			},
+		}
+	}
+	if bucket := os.Getenv("WSNAP_TEST_GCP_BUCKET"); bucket != "" {
+		keyJSON, err := os.ReadFile(os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+		if err != nil {
+			t.Fatalf("WSNAP_TEST_GCP_BUCKET needs GOOGLE_APPLICATION_CREDENTIALS: %v", err)
+		}
+		secret := map[string][]byte{credentials.KeyGoogleCredentials: keyJSON}
+		out["gcs-downscoped-gcp"] = store{
+			backend: func(ws string) protocol.Backend {
+				return protocol.Backend{GCS: &protocol.GCSBackend{Bucket: bucket, Prefix: prefix + ws}}
+			},
+			issue: func(t *testing.T, role protocol.Role, b protocol.Backend, eng protocol.Engine) protocol.Credentials {
+				t.Helper()
+				if eng.Type == protocol.EngineKopia {
+					// kopia cannot use access tokens: the static path.
+					return protocol.Credentials{GoogleCredentialsJSON: string(keyJSON)}
+				}
+				c, err := credentials.GCSDownscoped{AllowExternalAccount: true}.Issue(context.Background(), credentials.Request{Role: role, Namespace: "test", Workspace: "ws",
+					Backend: b, Secret: secret, WriterDeletePrefixes: engine.WriterDeletePrefixes(eng)})
+				if err != nil {
+					t.Fatalf("issue %s credential: %v", role, err)
+				}
+				return c
+			},
+		}
+	}
+	if account := os.Getenv("WSNAP_TEST_AZURE_ACCOUNT"); account != "" {
+		secret := map[string][]byte{credentials.KeyAzureAccountKey: []byte(os.Getenv("WSNAP_TEST_AZURE_ACCOUNT_KEY"))}
+		run := strconv.FormatInt(time.Now().UnixNano(), 36)
+		out["azure-sas-cloud"] = store{
+			backend: func(ws string) protocol.Backend {
+				return protocol.Backend{Azure: &protocol.AzureBackend{Account: account, Container: credentials.AzureWorkspaceContainer("c"+run, "test", ws)}}
+			},
+			issue: func(t *testing.T, role protocol.Role, b protocol.Backend, _ protocol.Engine) protocol.Credentials {
+				t.Helper()
+				c, err := credentials.AzureSAS{}.Issue(context.Background(), credentials.Request{Role: role, Namespace: "test", Workspace: "ws", Backend: b, Secret: secret})
+				if err != nil {
+					t.Fatalf("issue %s SAS: %v", role, err)
+				}
+				return c
+			},
+		}
+	}
 }
 
 func createAzureContainer(serviceURL, account, key, name string) error {
@@ -238,7 +312,7 @@ func TestRoundTrip(t *testing.T) {
 			if espec.Type == protocol.EngineExec && sname != "filesystem" {
 				continue // the example tar engine supports filesystem only
 			}
-			if espec.Type == protocol.EngineRestic && sname == "azure-sas" {
+			if espec.Type == protocol.EngineRestic && strings.HasPrefix(sname, "azure-sas") {
 				// restic's init calls Get Container Properties, which a
 				// container-scoped service SAS cannot authorize. The
 				// repository validator rejects this combination.
@@ -384,32 +458,44 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-// TestS3Isolation checks that a credential for one workspace cannot open
-// another workspace's repository.
-func TestS3Isolation(t *testing.T) {
-	st, ok := stores(t)["s3-sts"]
-	if !ok {
-		t.Skip("WSNAP_TEST_S3_ENDPOINT not set")
+// TestScopedIsolation: a credential for workspace b must not open
+// workspace a's repository, on every store with a scoped provider.
+func TestScopedIsolation(t *testing.T) {
+	ran := false
+	for name, st := range stores(t) {
+		spec := protocol.Engine{Type: protocol.EngineRestic}
+		switch {
+		case name == "s3-sts" || name == "s3-sts-aws" || name == "gcs-downscoped-gcp":
+		case strings.HasPrefix(name, "azure-sas"):
+			spec.Type = protocol.EngineKopia // restic cannot init with a container SAS
+		default:
+			continue
+		}
+		if _, err := exec.LookPath(string(spec.Type)); err != nil {
+			t.Skip(err)
+		}
+		ran = true
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			eng, _ := engine.New(spec)
+			a, b := st.backend("iso-a"), st.backend("iso-b")
+			wa := engine.Target{Backend: a, Credentials: st.issue(t, protocol.RoleSnapshot, a, spec), Password: "p", Workspace: "iso-a", StateDir: t.TempDir()}
+			if err := eng.Init(ctx, wa); err != nil {
+				t.Fatal(err)
+			}
+			// Workspace b's credential pointed at workspace a's repository.
+			stolen := engine.Target{Backend: a, Credentials: st.issue(t, protocol.RoleMaintenance, b, spec), Password: "p", Workspace: "iso-b", StateDir: t.TempDir()}
+			err := eng.Init(ctx, stolen)
+			if err == nil {
+				t.Fatal("workspace b's credential opened workspace a's repository")
+			}
+			if strings.HasPrefix(name, "s3-sts") && !strings.Contains(err.Error(), "Access Denied") {
+				t.Fatalf("want Access Denied, got %v", err)
+			}
+		})
 	}
-	if _, err := exec.LookPath("restic"); err != nil {
-		t.Skip(err)
-	}
-	ctx := context.Background()
-	spec := protocol.Engine{Type: protocol.EngineRestic}
-	eng, _ := engine.New(spec)
-	a, b := st.backend("iso-a"), st.backend("iso-b")
-	wa := engine.Target{Backend: a, Credentials: st.issue(t, protocol.RoleSnapshot, a, spec), Password: "p", Workspace: "iso-a", StateDir: t.TempDir()}
-	if err := eng.Init(ctx, wa); err != nil {
-		t.Fatal(err)
-	}
-	// Workspace b's credential pointed at workspace a's repository.
-	stolen := engine.Target{Backend: a, Credentials: st.issue(t, protocol.RoleMaintenance, b, spec), Password: "p", Workspace: "iso-b", StateDir: t.TempDir()}
-	err := eng.Init(ctx, stolen)
-	if err == nil {
-		t.Fatal("workspace b's credential opened workspace a's repository")
-	}
-	if !strings.Contains(err.Error(), "Access Denied") {
-		t.Fatalf("want Access Denied, got %v", err)
+	if !ran {
+		t.Skip("no store with a scoped provider is configured")
 	}
 }
 

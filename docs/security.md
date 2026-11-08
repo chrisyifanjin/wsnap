@@ -57,7 +57,7 @@ sequenceDiagram
 | Role | Granted to | Storage permission |
 |---|---|---|
 | `restore` | a workspace Pod before any workload container started; after that, only for a `WorkspaceRestore` this Pod claimed | read |
-| `snapshot` | the writer Pod of the workspace | read, write; delete only engine scratch objects |
+| `snapshot` | the writer Pod of the workspace; in worker mode, its registered worker Job | read, write; delete only engine scratch objects |
 | `mover` | Pods of wsnap mover and restorer Jobs | as `snapshot` |
 | `maintenance` | Pods of wsnap maintenance Jobs | read, write, delete |
 
@@ -73,6 +73,15 @@ serves a Job Pod only when all of these are true:
    arguments, environment, mounts, security context), and every template
    volume is unchanged. Containers that an admission webhook adds (a
    service mesh proxy) are allowed if they cannot read the token.
+
+In worker mode the workload Pod has no wsnap token at all, and the broker
+refuses it any credential. The worker Job is served only while its
+workload Pod (name and UID), node, and PVC/PV UIDs match the record in
+Workspace status, and its final mark names the registered workload, not
+an editable Job annotation. The gate container in the workload Pod has no
+credential; it only reads a marker file, through `os.Root`, and accepts it
+only if the worker refreshed it in the last 20 s. The worker writes the
+marker through `os.Root` too.
 
 Engine scratch objects:
 
@@ -90,7 +99,7 @@ block later maintenance.
 | Provider | How it limits a credential | Unit of isolation |
 |---|---|---|
 | `s3-sts` | STS `AssumeRole` with an inline session policy (AWS S3, MinIO, Ceph RGW). The effective permission is the intersection of the broker user's policy and the session policy. | object prefix |
-| `gcs-downscoped` | A Credential Access Boundary: `objectViewer` for reading, `objectCreator` (cannot overwrite or delete) for writing, `objectUser` only on scratch prefixes. | object prefix |
+| `gcs-downscoped` | Needs a service account key (`external_account` files are refused: they name a file, URL or command the broker would read or run). A Credential Access Boundary: `objectViewer` for reading, `objectCreator` (cannot overwrite or delete) for writing, `objectUser` only on scratch prefixes. | object prefix |
 | `azure-sas` | A service SAS on a container. A service SAS cannot be limited to a prefix in a flat-namespace account. | one container per workspace |
 | `static` | None: the agent gets the admin credential. Use it only where all workspaces trust each other. | none |
 
@@ -149,16 +158,21 @@ credentials there open only the attacker's own workspace.
 
 ## Transport
 
-The broker serves plain HTTP unless you set `--tls-cert-file` and
-`--tls-key-file`. Without TLS, credentials cross the Pod network
-unencrypted. **With untrusted workloads, TLS is required, not optional:**
-the workload shares the sidecar's network namespace, and container runtimes
-grant `CAP_NET_RAW` by default, so over plain HTTP the workload can capture
-the sidecar's token and the credential in the broker's answer. Either serve
-the broker over TLS, or drop `NET_RAW` from workload containers (Pod
-Security `restricted` does). With TLS, give agents the CA with `--ca-file`. Give Jobs the
-CA with `--agent-ca-configmap`. The broker reloads a rotated certificate
-from disk.
+The broker serves TLS by default. Without `--tls-cert-file`, the
+controller creates a CA and a serving certificate for
+`wsnap-broker.wsnap-system.svc` in the Secret `wsnap-broker-cert`. The
+webhook and the Job template give agents the CA in `WSNAP_CA_PEM`; a Pod's
+own sidecar gets it too unless it sets `--ca-file`. Agents read the CA
+once, at start. So the CA lives 10 years and only the serving certificate
+is renewed (yearly, 30 days before it expires), signed by the same CA.
+
+To use your own certificate (cert-manager), set `--tls-cert-file` and
+`--tls-key-file`, and give agents the CA with `--agent-ca-configmap`. The
+broker reloads a rotated certificate from disk.
+
+Plain HTTP is served only with `--broker-plain-addr` (for an upgrade) or
+with `--broker-manage-certs=false` and no certificate. Then credentials
+cross the Pod network unencrypted.
 
 ## Gateway API
 
@@ -175,8 +189,9 @@ resource. The created request records the caller in the
 - **Azure writers can delete** inside their own container. Turn on soft
   delete or versioning.
 - **The filesystem backend has no isolation** between workspaces.
-- **The controller can read every Secret** (`get`). Limit it with a Role per
-  tenant namespace if needed.
+- **By default the controller can read every Secret** (`get`, never list or
+  watch). Install `config/namespaced-secrets` to allow only namespaces
+  that bind `wsnap-secret-reader` (see operations.md).
 - **Editing a SnapshotRepository is an administrator right.** A user who can
   edit one can select the `static` provider (and so get the raw backend
   keys), set the image, volumes and security context of wsnap Jobs, and

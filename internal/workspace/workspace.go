@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -99,8 +100,79 @@ func ResolveVolume(ctx context.Context, r client.Reader, pod *corev1.Pod) (wsnap
 	if err != nil {
 		return ref, err
 	}
+	ref.ClaimUID = string(pvc.UID)
 	ref.VolumeName = pvc.Spec.VolumeName
+	if ref.VolumeName == "" {
+		return ref, nil // WaitForFirstConsumer has not bound the claim yet.
+	}
+	var pv corev1.PersistentVolume
+	if err := r.Get(ctx, client.ObjectKey{Name: ref.VolumeName}, &pv); err != nil {
+		return ref, fmt.Errorf("%w: get volume %s: %v", ErrBadVolume, ref.VolumeName, err)
+	}
+	if err := CheckBinding(pod.Namespace, ref, &pvc, &pv); err != nil {
+		return ref, err
+	}
+	ref.VolumeUID = string(pv.UID)
 	return ref, nil
+}
+
+// CheckBinding rejects a stale or pre-bound claim before its PV can be
+// protected or used by a writer or maintenance Job. In particular, a claim
+// with the same name but a new UID is a different volume owner.
+func CheckBinding(namespace string, ref wsnapv1.VolumeRef, pvc *corev1.PersistentVolumeClaim, pv *corev1.PersistentVolume) error {
+	if ref.ClaimName == "" || ref.ClaimUID == "" || ref.VolumeName == "" ||
+		pvc.Namespace != namespace || pvc.Name != ref.ClaimName || string(pvc.UID) != ref.ClaimUID ||
+		pvc.Spec.VolumeName != ref.VolumeName ||
+		pv.Name != ref.VolumeName || (ref.VolumeUID != "" && string(pv.UID) != ref.VolumeUID) ||
+		pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Namespace != namespace ||
+		pv.Spec.ClaimRef.Name != pvc.Name || pv.Spec.ClaimRef.UID != pvc.UID {
+		return fmt.Errorf("%w: claim %s/%s is not bound to volume %s with the recorded identity", ErrBadVolume, namespace, ref.ClaimName, ref.VolumeName)
+	}
+	return nil
+}
+
+// ValidateBinding reads both objects live to check a recorded VolumeRef.
+// It also rejects legacy records without a claim UID: a same-name claim
+// could have replaced them while no Pod was running.
+func ValidateBinding(ctx context.Context, r client.Reader, namespace string, ref wsnapv1.VolumeRef) error {
+	if ref.Kind == KindEmptyDir {
+		return nil
+	}
+	if ref.ClaimUID == "" || ref.VolumeUID == "" || ref.VolumeName == "" {
+		return fmt.Errorf("%w: workspace volume has no complete claim and PV identity", ErrBadVolume)
+	}
+	var pvc corev1.PersistentVolumeClaim
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.ClaimName}, &pvc); err != nil {
+		return err
+	}
+	var pv corev1.PersistentVolume
+	if err := r.Get(ctx, client.ObjectKey{Name: ref.VolumeName}, &pv); err != nil {
+		return err
+	}
+	return CheckBinding(namespace, ref, &pvc, &pv)
+}
+
+// JobRef records the controller's intended volume identity in Workspace
+// status, outside mutable Job metadata.
+func JobRef(job *batchv1.Job) wsnapv1.JobRef {
+	ref := wsnapv1.JobRef{Name: job.Name, UID: string(job.UID), Kind: job.Labels[wsnapv1.LabelJob],
+		ClaimUID: job.Annotations[AnnotationClaimUID], VolumeName: job.Annotations[wsnapv1.AnnotationVolumeName],
+		VolumeUID:    job.Annotations[AnnotationPVUID],
+		TargetPodUID: job.Annotations[wsnapv1.AnnotationTargetPodUID], TargetPodName: job.Annotations[wsnapv1.AnnotationTargetPodName]}
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
+			ref.ClaimName = v.PersistentVolumeClaim.ClaimName
+			break
+		}
+	}
+	return ref
+}
+
+// JobRefMatches reports whether job still matches its registration. The
+// writer epoch is recorded later by the broker and is not part of the Job.
+func JobRefMatches(recorded wsnapv1.JobRef, job *batchv1.Job) bool {
+	recorded.WriterEpoch = 0
+	return recorded == JobRef(job)
 }
 
 // Protect switches the PV behind ref to the Retain reclaim policy, so its
@@ -111,15 +183,28 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 	if ref.VolumeName == "" {
 		return nil
 	}
+	if ref.ClaimUID == "" || ref.VolumeUID == "" {
+		return fmt.Errorf("%w: volume %s has no complete claim and PV identity", ErrBadVolume, ref.VolumeName)
+	}
 	var pv corev1.PersistentVolume
 	if err := r.Get(ctx, client.ObjectKey{Name: ref.VolumeName}, &pv); err != nil {
-		return client.IgnoreNotFound(err)
+		return err
+	}
+	var pvc corev1.PersistentVolumeClaim
+	if err := r.Get(ctx, client.ObjectKey{Namespace: id.Namespace, Name: ref.ClaimName}, &pvc); err != nil {
+		return err
+	}
+	if err := CheckBinding(id.Namespace, ref, &pvc, &pv); err != nil {
+		return err
 	}
 	wsRef := id.Namespace + "/" + id.Name
+	if owner := pv.Annotations[wsnapv1.AnnotationWorkspaceRef]; owner != "" && owner != wsRef {
+		return fmt.Errorf("%w: volume %s belongs to workspace %s", ErrBadVolume, pv.Name, owner)
+	}
 	if pv.Labels[wsnapv1.LabelProtected] == "true" && pv.Annotations[wsnapv1.AnnotationWorkspaceRef] == wsRef {
 		return nil
 	}
-	patch := client.MergeFrom(pv.DeepCopy())
+	patch := client.MergeFromWithOptions(pv.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	if pv.Labels == nil {
 		pv.Labels = map[string]string{}
 	}
@@ -135,14 +220,28 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 	return c.Patch(ctx, &pv, patch)
 }
 
+// HasFinalSnapshot reports whether the last Pod that wrote to a PV also
+// took a final snapshot of it: only then is a released PV safe to reclaim
+// without a rescue. a is the PV's annotations.
+func HasFinalSnapshot(a map[string]string) bool {
+	return a[AnnotationWriterPod] != "" && a[AnnotationWriterPod] == a[AnnotationFinalPod]
+}
+
 // Per-PV bookkeeping. A released PV is safe to reclaim only when the last
-// Pod that wrote to it also took a final snapshot of it.
+// Pod that wrote to it also took a final snapshot of it (HasFinalSnapshot).
 const (
 	AnnotationWriterPod = "wsnap.dev/writer-pod-uid"
 	AnnotationFinalPod  = "wsnap.dev/final-pod-uid"
+	// Job volume identities are checked again when a mover or restorer asks
+	// for credentials, after the Job Pod has mounted its PVC by name.
+	AnnotationClaimUID = "wsnap.dev/claim-uid"
+	AnnotationPVUID    = "wsnap.dev/pv-uid"
 	// AnnotationWriterEpoch is the Workspace writerEpoch of the last Pod
 	// that the broker admitted as writer on this volume.
 	AnnotationWriterEpoch = "wsnap.dev/writer-epoch"
+	// FinalByMover is AnnotationWriterPod and AnnotationFinalPod's value
+	// when no workspace Pod wrote the volume before a mover Job saved it.
+	FinalByMover = "mover"
 )
 
 // ErrBadVolume marks a Pod whose workspace volume wsnap cannot use, as

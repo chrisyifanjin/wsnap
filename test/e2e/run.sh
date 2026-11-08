@@ -10,14 +10,21 @@
 #   singlewriter two Pods, one workspace       kopia  + S3 (STS)   second Pod waits, then restores the first's final
 #   requests   control-plane CRs and data-plane files: capture/restore in the Pod or by a Job, fork
 #   chaos      broker down, leader killed mid-rescue, storage outage, sidecar SIGKILL, crash + replacement race
-#   tls        broker over HTTPS: sidecars and Jobs verify its CA; plain HTTP and an untrusted CA are refused
+#   tls        broker with an operator's certificate: sidecars and Jobs verify its CA; plain HTTP and an untrusted CA are refused
+#              (every other scenario runs over the TLS certificate that the broker manages itself)
 #   multinode  (needs 2+ workers) cross-node restore; the mover follows a node-local PV; drain takes a final snapshot
 #   webhook    sidecar injection into bare Pods and Sandboxes; unsafe Pods refused; fail closed while down
 #   gateway    REST gateway API gated by RBAC; data-plane request through the agent-sandbox router and sandboxd
+#   worker     worker mode: live snapshots from a separate Pod on the same node and PVC; RWOP claims refused
 #
 # The harness writes files through "kubectl exec" only to play the agent;
 # wsnap itself never uses exec.
-# Usage: test/e2e/run.sh [setup] [scenario...]
+# Usage: test/e2e/run.sh [setup] [scenario|group...]
+#
+# The groups split the scenarios into sets of about equal length that
+# share no state, so CI runs each set on its own cluster in parallel.
+# Without arguments, every group runs in order on one cluster.
+# SKIP_IMAGE_BUILD=1 makes setup load images that are already built.
 set -euo pipefail
 
 ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
@@ -51,6 +58,7 @@ pv_policy_is() { [[ $(kubectl get pv "$1" -o jsonpath='{.spec.persistentVolumeRe
 
 # fresh_workspace drops the Workspace record so earlier runs cannot satisfy
 # a check. The repository data in the backend stays.
+repo_reason_is() { [[ $(kubectl -n "$1" get snaprepo "$2" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}') == "$3" ]]; }
 repo_condition() { [[ $(kubectl -n "$NS" get snaprepo "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].status}") == "$3" ]]; }
 
 # tick writes a file so the sidecar sees a change, then checks for a
@@ -83,7 +91,10 @@ pv_phase_is() { [[ $(kubectl get pv "$1" -o jsonpath='{.status.phase}' 2>/dev/nu
 logs_contain() { kubectl -n "$NS" logs "$1" -c wsnap 2>/dev/null | grep -q "$2"; }
 sidecar_restarts() { kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.initContainerStatuses[?(@.name=="wsnap")].restartCount}'; }
 sidecar_restarted() { (( $(sidecar_restarts "$1") > $2 )); }
-no_pods() { ! kubectl -n "$1" get pods -l "$2" -o name 2>/dev/null | grep -q .; }
+# An API error must not count as "nothing there": these predicates answer
+# true only when the API server confirmed the absence.
+no_pods() { local out; out=$(kubectl -n "$1" get pods -l "$2" -o name 2>/dev/null) && [[ -z $out ]]; }
+not_found() { local out; out=$(kubectl get "$@" 2>&1) && return 1; [[ $out == *NotFound* || $out == *"not found"* ]]; }
 pv_rescue_started() { local r; r=$(pv_annotation "$1" rescue); [[ $r == running || $r == done ]] || pv_gone "$1"; }
 # retry_request asks for a snapshot again until one succeeds.
 retry_request() {
@@ -104,7 +115,7 @@ crash_pod() {
 	docker exec "$node" sh -c "crictl stopp \$(crictl pods --name '^$1\$' --namespace $NS -q)" >/dev/null
 	kubectl -n "$NS" delete pod "$1" --wait=true >/dev/null
 }
-pod_gone() { ! kubectl -n "$NS" get pod "$1" >/dev/null 2>&1; }
+pod_gone() { not_found -n "$NS" pod "$1"; }
 result_has() { kubectl -n "$NS" exec "$1" -c agent -- grep -q "$3" "/workspace/.wsnap/results/$2.json" 2>/dev/null; }
 result_id() { kubectl -n "$NS" exec "$1" -c agent -- cat "/workspace/.wsnap/results/$2.json" | sed -n 's/.*"snapshotID":"\([^"]*\)".*/\1/p'; }
 
@@ -124,7 +135,7 @@ EOF
       image: wsnap-agent:dev
       imagePullPolicy: IfNotPresent
       restartPolicy: Always
-      args: [sidecar, --dir=/workspace, --final-timeout=50s, --operation-timeout=60s${SIDECAR_TLS_ARGS:-}]
+      args: [sidecar, --dir=/workspace, --final-timeout=50s, --operation-timeout=${SIDECAR_OP_TIMEOUT:-60s}${SIDECAR_TLS_ARGS:-}]
       startupProbe:
         exec: {command: [/usr/local/bin/wsnap-agent, ready, --state-dir=/var/lib/wsnap]}
         periodSeconds: 1
@@ -236,16 +247,18 @@ EOF
 }
 
 pv_of() { kubectl -n "$NS" get pvc "$1" -o jsonpath='{.spec.volumeName}'; }
-pv_gone() { ! kubectl get pv "$1" >/dev/null 2>&1; }
-pvc_gone() { ! kubectl -n "$NS" get pvc "$1" >/dev/null 2>&1; }
+pv_gone() { not_found pv "$1"; }
+pvc_gone() { not_found -n "$NS" pvc "$1"; }
 pod_ready() { [[ $(kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]; }
 read_file() { kubectl -n "$NS" exec "$1" -c agent -- cat "$2"; }
 write_file() { kubectl -n "$NS" exec "$1" -c agent -- sh -c "echo '$3' > $2"; }
 
 setup() {
 	log "build and load images"
-	docker build -q --target controller -t wsnap-controller:dev "$ROOT" >/dev/null
-	docker build -q --target agent -t wsnap-agent:dev "$ROOT" >/dev/null
+	if [[ -z ${SKIP_IMAGE_BUILD:-} ]]; then
+		docker build -q --target controller -t wsnap-controller:dev "$ROOT" >/dev/null
+		docker build -q --target agent -t wsnap-agent:dev "$ROOT" >/dev/null
+	fi
 	# Only locally built images need loading; the node pulls public ones.
 	# (kind cannot import multi-arch images that are only partly present.)
 	for img in wsnap-controller:dev wsnap-agent:dev; do
@@ -257,9 +270,14 @@ setup() {
 	kubectl -n storage delete job minio-setup --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	kubectl apply -f "$M/minio.yaml" >/dev/null
 	# The TLS scenario patches the Deployment outside kubectl apply's field
-	# ownership. Recreate it so a later setup really returns to plain HTTP.
+	# ownership. Recreate it so a later setup really returns to the defaults.
 	kubectl -n wsnap-system delete deploy wsnap-controller --ignore-not-found --wait=true >/dev/null
-	kubectl apply -k "$ROOT/config/default" >/dev/null
+	# Least privilege: the controller reads Secrets only where a namespace
+	# binds wsnap-secret-reader.
+	kubectl apply -k "$ROOT/config/namespaced-secrets" >/dev/null
+	kubectl delete clusterrolebinding wsnap-secret-reader --ignore-not-found >/dev/null
+	kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl -n "$NS" apply -f "$ROOT/config/samples/secret-access.yaml" >/dev/null
 	kubectl -n wsnap-system rollout restart deploy/wsnap-controller >/dev/null
 	kubectl -n storage wait --for=condition=complete job/minio-setup --timeout=180s >/dev/null
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
@@ -270,7 +288,14 @@ setup() {
 	done
 	repo_condition tar-fs CredentialsScoped False || die "static provider not flagged as unscoped"
 	repo_condition kopia-s3 CredentialsScoped True || die "s3-sts provider not flagged as scoped"
-	pass "setup (repositories validated: Ready, CredentialsScoped reported)"
+	kubectl -n wsnap-system get secret wsnap-broker-cert >/dev/null || die "the broker did not create its TLS certificate"
+	# A namespace without the RoleBinding: wsnap may not read its Secret.
+	kubectl create namespace e2e-nobind --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl -n e2e-nobind create secret generic creds --from-literal=WSNAP_MASTER_KEY=0123456789abcdef --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: SnapshotRepository\nmetadata: {name: r, namespace: e2e-nobind}\nspec: {engine: {type: restic}, backend: {filesystem: {path: /x}}, credentials: {secretName: creds}}\n' | kubectl apply -f - >/dev/null
+	wait_for 60 "SecretForbidden without a RoleBinding" repo_reason_is e2e-nobind r SecretForbidden
+	kubectl delete namespace e2e-nobind --wait=false >/dev/null
+	pass "setup (repositories Ready, CredentialsScoped reported; broker on TLS; Secrets readable only where bound)"
 }
 
 scenario_pvc() {
@@ -281,8 +306,13 @@ scenario_pvc() {
 	wait_for 180 "pvc-1 ready" pod_ready pvc-1
 	write_file pvc-1 /workspace/hello.txt v1
 	local pv; pv=$(pv_of pvc-a)
+	local claim_uid pv_uid
+	claim_uid=$(kubectl -n "$NS" get pvc pvc-a -o jsonpath='{.metadata.uid}')
+	pv_uid=$(kubectl get pv "$pv" -o jsonpath='{.metadata.uid}')
+	[[ $(ws_field ws-pvc .status.volume.claimUID) == "$claim_uid" && $(ws_field ws-pvc .status.volume.volumeUID) == "$pv_uid" ]] ||
+		die "Workspace did not record the bound PVC and PV UIDs"
 	[[ $(kubectl get pv "$pv" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}') == Retain ]] || die "PV $pv not protected"
-	pass "PV $pv switched to Retain while the workspace is in use"
+	pass "PV $pv switched to Retain; Workspace recorded its PVC and PV UIDs"
 
 	kubectl -n "$NS" delete pod pvc-1 --wait=true >/dev/null
 	[[ $(ws_field ws-pvc .status.lastSnapshot.final) == true ]] || die "no final snapshot after graceful delete"
@@ -350,7 +380,7 @@ scenario_sandbox() {
 	local pv; pv=$(pv_of workspace-sb-1)
 
 	kubectl -n "$NS" patch sandbox sb-1 --type merge -p '{"spec":{"operatingMode":"Suspended"}}' >/dev/null
-	wait_for 120 "sandbox pod deleted" bash -c "! kubectl -n $NS get pod sb-1"
+	wait_for 120 "sandbox pod deleted" pod_gone sb-1
 	[[ $(ws_field ws-sb .status.lastSnapshot.final) == true ]] || die "suspend did not take a final snapshot"
 	kubectl -n "$NS" get pvc workspace-sb-1 >/dev/null || die "suspend deleted the PVC"
 	pass "Suspended: pod gone, final snapshot taken, PVC kept"
@@ -397,7 +427,7 @@ scenario_emptydir() {
 	log "isolation: the workload container cannot get credentials"
 	local code
 	code=$(kubectl -n "$NS" exec tmp-2 -c agent -- sh -c \
-		'wget -q -S -O- --post-data={\"role\":\"snapshot\"} http://wsnap-broker.wsnap-system.svc:8080/v1/credentials 2>&1 | grep -o "HTTP/1.1 [0-9]*" | head -1' || true)
+		'wget -q -S -O- --no-check-certificate --post-data={\"role\":\"snapshot\"} https://wsnap-broker.wsnap-system.svc:8443/v1/credentials 2>&1 | grep -o "HTTP/1.1 [0-9]*" | head -1' || true)
 	[[ $code == "HTTP/1.1 401" ]] || die "broker answered the workload container with: $code"
 	kubectl -n "$NS" exec tmp-2 -c agent -- test ! -e /var/run/secrets/wsnap/token || die "workload container sees the token"
 	pass "workload container: no token mounted, broker returns 401"
@@ -416,9 +446,8 @@ scenario_singlewriter() {
 	wait_for 180 "one-1 ready" pod_ready one-1
 	write_file one-1 /workspace/owner.txt first-writer
 	apply_pod one-2 ws-one kopia-s3 pvc:one-b yes >/dev/null
-	sleep 30
+	wait_for 120 "second Pod refused as writer" logs_contain one-2 "is written by pod one-1"
 	pod_ready one-2 && die "a second writer became ready while the first still runs"
-	kubectl -n "$NS" logs one-2 -c wsnap | grep -q "is written by pod one-1" || die "second Pod not waiting for the first"
 	local stopped
 	pass "second Pod waits: the broker allows one live writer per workspace"
 	kubectl -n "$NS" delete pod one-1 --wait=true >/dev/null
@@ -545,7 +574,7 @@ scenario_chaos() {
 	fi
 	wait_for 240 "rescue finished by the new leader" ws_is ws-chaos .status.lastSnapshot.executor mover
 	wait_for 120 "PV reclaimed" pv_gone "$pv"
-	apply_pod chaos-2 ws-chaos restic-s3 ephemeral yes >/dev/null
+	SIDECAR_OP_TIMEOUT=20s apply_pod chaos-2 ws-chaos restic-s3 ephemeral yes >/dev/null
 	wait_for 180 "chaos-2 ready" pod_ready chaos-2
 	[[ $(read_file chaos-2 /workspace/precious.txt) == survived-outage ]] || die "data lost across the outage"
 	pass "after the outage and a leader failover, the rescued data was restored"
@@ -601,19 +630,30 @@ scenario_chaos() {
 broker_tls() { # on|off
 	local args
 	if [[ $1 == on ]]; then
-		args='["--broker-addr=:8080","--broker-url=https://wsnap-broker.wsnap-system.svc:8080","--agent-image=wsnap-agent:dev","--leader-elect","--tls-cert-file=/tls/tls.crt","--tls-key-file=/tls/tls.key","--agent-ca-configmap=wsnap-ca"]'
+		args='["--broker-addr=:8443","--broker-url=https://wsnap-broker.wsnap-system.svc:8443","--agent-image=wsnap-agent:dev","--leader-elect","--tls-cert-file=/tls/tls.crt","--tls-key-file=/tls/tls.key","--agent-ca-configmap=wsnap-ca"]'
 		kubectl -n wsnap-system patch deploy wsnap-controller --type strategic -p '{"spec":{"template":{"spec":{
 			"volumes":[{"name":"tls","secret":{"secretName":"wsnap-broker-tls"}}],
 			"containers":[{"name":"controller","args":'"$args"',
 				"volumeMounts":[{"name":"tls","mountPath":"/tls","readOnly":true}]}]}}}}' >/dev/null
 	else
-		args='["--broker-addr=:8080","--broker-url=http://wsnap-broker.wsnap-system.svc:8080","--agent-image=wsnap-agent:dev","--leader-elect"]'
+		args='["--broker-addr=:8443","--broker-url=https://wsnap-broker.wsnap-system.svc:8443","--agent-image=wsnap-agent:dev","--leader-elect"]'
 		kubectl -n wsnap-system patch deploy wsnap-controller --type strategic -p '{"spec":{"template":{"spec":{
 			"volumes":[{"name":"tls","$patch":"delete"}],
 			"containers":[{"name":"controller","args":'"$args"',
 				"volumeMounts":[{"mountPath":"/tls","$patch":"delete"}]}]}}}}' >/dev/null
 	fi
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
+	# An old leader can still hold the lease after the rollout and create
+	# Jobs with the old broker settings. Wait for a leader with the new flags.
+	wait_for 120 "leader with operator certificate $1" leader_operator_cert "$1"
+}
+
+leader_operator_cert() { # on|off
+	local leader args; leader=$(leader_pod)
+	[[ -n $leader ]] || return 1
+	args=$(kubectl -n wsnap-system get pod "$leader" -o jsonpath='{.metadata.deletionTimestamp} {.spec.containers[0].args}') || return 1
+	[[ $args == " "* ]] || return 1 # terminating
+	if [[ $1 == on ]]; then [[ $args == *--tls-cert-file* ]]; else [[ $args != *--tls-cert-file* ]]; fi
 }
 
 scenario_tls() {
@@ -632,8 +672,8 @@ scenario_tls() {
 	kubectl -n "$NS" delete pvc tls-a --ignore-not-found --wait=true >/dev/null
 	fresh_workspace ws-tls
 	apply_pvc tls-a >/dev/null
-	WSNAP_TLS=trusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8080, --ca-file=/var/run/wsnap-ca/ca.crt" \
-		wait_for 60 "webhook admission after TLS rollout" apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes
+	WSNAP_TLS=trusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8443, --ca-file=/var/run/wsnap-ca/ca.crt" \
+		wait_for 60 "webhook admission after the TLS rollout" apply_pod tls-1 ws-tls kopia-keep pvc:tls-a yes
 	wait_for 180 "tls-1 ready" pod_ready tls-1
 	write_file tls-1 /workspace/secret.txt over-tls
 	kubectl -n "$NS" delete pod tls-1 --wait=true >/dev/null
@@ -645,14 +685,14 @@ scenario_tls() {
 	pass "controller-created mover Job trusted the CA through --agent-ca-configmap"
 
 	fresh_workspace ws-tls-bad
-	WSNAP_TLS=untrusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8080" \
+	WSNAP_TLS=untrusted SIDECAR_TLS_ARGS=", --broker-url=https://wsnap-broker.wsnap-system.svc:8443" \
 		apply_pod tls-bad ws-tls-bad kopia-keep emptydir yes >/dev/null
 	wait_for 60 "untrusted refusal" logs_contain tls-bad "certificate signed by unknown authority"
 	pod_ready tls-bad && die "a sidecar that does not trust the CA became ready"
 	pass "a sidecar without the CA refuses the broker (x509: unknown authority)"
 	kubectl -n "$NS" delete pod tls-bad --wait=true >/dev/null
 
-	apply_pod tls-plain ws-tls-bad kopia-keep emptydir yes >/dev/null
+	SIDECAR_TLS_ARGS=", --broker-url=http://wsnap-broker.wsnap-system.svc:8443" apply_pod tls-plain ws-tls-bad kopia-keep emptydir yes >/dev/null
 	wait_for 60 "plain HTTP refusal" logs_contain tls-plain "initialization failed"
 	pod_ready tls-plain && die "a plain-HTTP sidecar became ready against a TLS broker"
 	pass "plain HTTP to the TLS broker is refused"
@@ -660,7 +700,7 @@ scenario_tls() {
 	kubectl -n "$NS" delete pvc tls-a >/dev/null
 
 	broker_tls off
-	pass "broker back on plain HTTP for the other scenarios"
+	pass "broker back on its own certificate for the other scenarios"
 	rm -rf "$dir"
 }
 
@@ -738,12 +778,28 @@ ${3:-}
   containers:
   - name: agent
     image: alpine:3.22
-    command: [sleep, infinity]
+    command: [sh, -c, 'trap "exit 0" TERM; sleep infinity & wait']
     volumeMounts: [{name: workspace, mountPath: /workspace}]
   volumes:
   - name: workspace
     ephemeral: {volumeClaimTemplate: {spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}}}
 EOF
+}
+
+# probe_pod asks the API server to admit a labeled Pod without creating it.
+probe_pod() {
+	kubectl -n "$NS" apply --dry-run=server -f - 2>&1 <<EOF
+{"apiVersion": "v1", "kind": "Pod",
+ "metadata": {"name": "probe", "namespace": "$NS",
+  "labels": {"wsnap.dev/workspace": "ws-probe", "wsnap.dev/repository": "restic-s3"}},
+ "spec": {"containers": [{"name": "a", "image": "alpine:3.22", "volumeMounts": [{"name": "workspace", "mountPath": "/w"}]}],
+  "volumes": [{"name": "workspace", "emptyDir": {}}]}}
+EOF
+}
+webhook_admits() { probe_pod >/dev/null; }
+webhook_refuses() {
+	local out; out=$(probe_pod) && return 1
+	[[ $out == *"failed calling webhook"* || $out == *"no endpoints"* || $out == *"connection refused"* ]]
 }
 
 scenario_webhook() {
@@ -774,7 +830,7 @@ spec:
       containers:
       - name: agent
         image: alpine:3.22
-        command: [sleep, infinity]
+        command: [sh, -c, 'trap "exit 0" TERM; sleep infinity & wait']
         volumeMounts: [{name: workspace, mountPath: /workspace}]
 EOF
 	wait_for 180 "sandbox pod" kubectl -n "$NS" get pod sb-inj
@@ -799,6 +855,10 @@ EOF
 
 	kubectl -n wsnap-system scale deploy/wsnap-controller --replicas=0 >/dev/null
 	wait_for 90 "controller down" no_pods wsnap-system app.kubernetes.io/name=wsnap-controller
+	# Endpoint removal reaches the API server's webhook client a moment
+	# after the Pods are gone. A webhook that fails open never refuses, so
+	# this wait still fails then.
+	wait_for 60 "admission refuses labeled Pods" webhook_refuses
 	out=$(labels_only_pod down-1 ws-down 2>&1 || true)
 	[[ $out == *"failed calling webhook"* || $out == *"no endpoints"* || $out == *"connection refused"* ]] || die "a labeled Pod was admitted while the webhook was down: $out"
 	kubectl -n "$NS" run plain-pod --image=alpine:3.22 --restart=Never -- sleep 5 >/dev/null || die "an unlabeled Pod was blocked"
@@ -806,11 +866,19 @@ EOF
 	pass "webhook down: labeled Pods are refused (fail closed); unlabeled Pods are unaffected"
 	kubectl -n wsnap-system scale deploy/wsnap-controller --replicas=2 >/dev/null
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
-	wait_for 60 "webhook back" bash -c "kubectl -n $NS apply --dry-run=server -f - <<<'{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"probe\",\"namespace\":\"$NS\",\"labels\":{\"wsnap.dev/workspace\":\"ws-probe\",\"wsnap.dev/repository\":\"restic-s3\"}},\"spec\":{\"containers\":[{\"name\":\"a\",\"image\":\"alpine:3.22\",\"volumeMounts\":[{\"name\":\"workspace\",\"mountPath\":\"/w\"}]}],\"volumes\":[{\"name\":\"workspace\",\"emptyDir\":{}}]}}'"
+	wait_for 60 "webhook back" webhook_admits
 }
 
-gw_curl() { kubectl -n "$NS" exec gw-client -- curl -sS "$@"; }
-gw_status() { kubectl -n "$NS" exec gw-client -- curl -s -o /dev/null -w '%{http_code}' "$@"; }
+# copy_broker_ca puts the broker's CA into gw-client. It passes the CA as
+# an argument, not on stdin: "kubectl exec -i" can drop stdin and leave an
+# empty file. It succeeds only when a PEM certificate landed.
+copy_broker_ca() {
+	local ca
+	ca=$(kubectl -n wsnap-system get secret wsnap-broker-cert -o jsonpath='{.data.ca\.crt}') && [[ -n $ca ]] || return 1
+	kubectl -n "$NS" exec gw-client -- sh -c "echo '$ca' | base64 -d > /tmp/broker-ca.crt && grep -q 'BEGIN CERTIFICATE' /tmp/broker-ca.crt"
+}
+gw_curl() { kubectl -n "$NS" exec gw-client -- curl -sS --cacert /tmp/broker-ca.crt "$@"; }
+gw_status() { kubectl -n "$NS" exec gw-client -- curl -s --cacert /tmp/broker-ca.crt -o /dev/null -w '%{http_code}' "$@"; }
 
 scenario_gateway() {
 	log "gateway: REST API for platforms and gateways, authorized by Kubernetes RBAC"
@@ -846,7 +914,8 @@ EOF
 	local tok nob url resp
 	tok=$(kubectl -n "$NS" create token platform)
 	nob=$(kubectl -n "$NS" create token nobody)
-	url=http://wsnap-broker.wsnap-system.svc:8080/v1/namespaces/$NS/workspaces/ws-gw
+	wait_for 60 "broker CA in gw-client" copy_broker_ca
+	url=https://wsnap-broker.wsnap-system.svc:8443/v1/namespaces/$NS/workspaces/ws-gw
 	resp=$(gw_curl -X POST -H "Authorization: Bearer $tok" -d '{"wait":true,"timeoutSeconds":45}' "$url/snapshots")
 	[[ $resp == *'"phase":"Succeeded"'* && $resp == *'"executor":"sidecar"'* ]] || die "gateway snapshot did not succeed: $resp"
 	pass "POST .../snapshots with wait=true: $resp"
@@ -894,9 +963,127 @@ EOF
 	kubectl -n "$NS" delete pod gw-client --wait=false >/dev/null
 }
 
+# Each group must stand alone after setup. "requests" uses the emptyDir
+# workspace of "emptydir", so both stay in one group, in this order.
+group() {
+	case $1 in
+	controlplane) echo webhook gateway tls multinode ;;
+	volumes) echo pvc ephemeral sandbox emptydir singlewriter requests ;;
+	failures) echo chaos ;;
+	worker) echo worker ;;
+	esac
+}
+
+# diagnose prints the cluster state when a run fails, so a CI log is enough
+# to tell a product bug from an environment problem.
+diagnose() {
+	local rc=$?
+	((rc == 0)) && return
+	set +e
+	log "diagnostics (exit $rc)"
+	kubectl get nodes -o wide
+	kubectl get pods -A -o wide
+	kubectl get pv
+	kubectl -n "$NS" get pvc,jobs,workspaces,workspacesnapshots,workspacerestores -o wide
+	kubectl -n "$NS" get workspaces -o yaml | grep -A12 '^  status:'
+	kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40
+	for p in $(kubectl -n wsnap-system get pods -l app.kubernetes.io/name=wsnap-controller -o name); do
+		echo "--- $p"
+		kubectl -n wsnap-system logs "$p" --tail=80
+	done
+	for p in $(kubectl -n "$NS" get pods -o name); do
+		echo "--- $p (wsnap)"
+		kubectl -n "$NS" logs "$p" -c wsnap --tail=30 2>/dev/null
+	done
+}
+
+worker_pod() { # name workspace claim
+	kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $1
+  namespace: $NS
+  labels: {wsnap.dev/workspace: $2, wsnap.dev/repository: restic-s3}
+spec:
+  containers:
+  - name: agent
+    image: alpine:3.22
+    command: [sh, -c, 'trap "exit 0" TERM; sleep infinity & wait']
+    volumeMounts: [{name: workspace, mountPath: /workspace}]
+  volumes:
+  - name: workspace
+    persistentVolumeClaim: {claimName: $3}
+EOF
+}
+worker_job_of() { kubectl -n "$NS" get jobs -l "wsnap.dev/job=worker,wsnap.dev/job-workspace=$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
+worker_pod_node() { kubectl -n "$NS" get pods -l "wsnap.dev/job=worker,wsnap.dev/job-workspace=$1" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null; }
+# A worker Job has TTL 0: once it succeeds, Kubernetes deletes it.
+job_succeeded_or_gone() { [[ $(kubectl -n "$NS" get job "$1" -o jsonpath='{.status.succeeded}' 2>/dev/null) == 1 ]] || not_found -n "$NS" job "$1"; }
+
+scenario_worker() {
+	log "worker: live snapshots from a separate Pod that shares the PVC"
+	kubectl -n "$NS" delete pod wk-1 wk-2 wk-rwop --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc wk-a wk-b wk-rwop --ignore-not-found --wait=true >/dev/null
+	fresh_workspace ws-wk
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: Workspace\nmetadata: {name: ws-wk, namespace: %s}\nspec: {repositoryName: restic-s3, execution: {mode: worker}}\n' "$NS" | kubectl apply -f - >/dev/null
+	apply_pvc wk-a >/dev/null
+	worker_pod wk-1 ws-wk wk-a >/dev/null
+	wait_for 180 "wk-1 ready" pod_ready wk-1
+	local inits; inits=$(kubectl -n "$NS" get pod wk-1 -o jsonpath='{.spec.initContainers[*].name}')
+	[[ $inits == wsnap-gate ]] || die "worker-mode Pod has init containers '$inits'; want only the gate"
+	kubectl -n "$NS" get pod wk-1 -o jsonpath='{.spec.volumes[*].projected}' | grep -q wsnap && die "worker-mode workload got a wsnap token"
+	local job; job=$(worker_job_of ws-wk)
+	[[ -n $job ]] || die "no worker Job"
+	[[ $(worker_pod_node ws-wk) == $(kubectl -n "$NS" get pod wk-1 -o jsonpath='{.spec.nodeName}') ]] || die "worker Pod not on the workload's node"
+	pass "workload Pod has only a credential-free gate; worker Job $job runs on its node"
+
+	write_file wk-1 /workspace/live.txt from-the-workload
+	apply_request wssnap wk-live ws-wk >/dev/null
+	wait_for 90 "live snapshot by the worker" req_is wssnap wk-live Succeeded
+	[[ $(req_field wssnap wk-live .status.executor) == worker ]] || die "live request not served by the worker"
+	pass "WorkspaceSnapshot on a live workload: the separate worker took $(req_field wssnap wk-live .status.snapshotID)"
+
+	# Write, then stop at once: the final snapshot must wait for the
+	# workload and include this write.
+	write_file wk-1 /workspace/live.txt last-write
+	kubectl -n "$NS" delete pod wk-1 --wait=true >/dev/null
+	wait_for 120 "worker Job finished" job_succeeded_or_gone "$job"
+	[[ $(ws_field ws-wk .status.lastSnapshot.final) == true && $(ws_field ws-wk .status.lastSnapshot.executor) == worker ]] ||
+		die "no final snapshot by the worker: $(ws_field ws-wk .status.lastSnapshot)"
+	pass "the workload stopped; the worker took the final snapshot, then finished"
+
+	apply_pvc wk-b >/dev/null
+	worker_pod wk-2 ws-wk wk-b >/dev/null
+	wait_for 180 "wk-2 ready" pod_ready wk-2
+	[[ $(read_file wk-2 /workspace/live.txt) == last-write ]] || die "cold restore by a worker returned $(read_file wk-2 /workspace/live.txt)"
+	pass "a new workload on a new PVC got the last write: its worker restored before the gate opened"
+	kubectl -n "$NS" delete pod wk-2 --wait=true >/dev/null
+
+	kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: wk-rwop, namespace: $NS}
+spec: {accessModes: [ReadWriteOncePod], resources: {requests: {storage: 1Gi}}}
+EOF
+	local out; out=$(worker_pod wk-rwop ws-wk wk-rwop 2>&1 || true)
+	[[ $out == *ReadWriteOncePod* ]] || die "a ReadWriteOncePod claim was admitted in worker mode: $out"
+	pass "a ReadWriteOncePod claim is refused at admission: no worker could mount it"
+	kubectl -n "$NS" delete pvc wk-a wk-b wk-rwop --wait=false >/dev/null
+}
+
 main() {
-	local steps=("$@")
-	((${#steps[@]})) || steps=(setup webhook gateway pvc ephemeral sandbox emptydir singlewriter requests chaos tls multinode)
+	local steps=() s g
+	(($#)) || set -- setup controlplane volumes failures worker
+	for s in "$@"; do
+		if [[ -n $(group "$s") ]]; then
+			read -ra g <<<"$(group "$s")"
+			steps+=("${g[@]}")
+		else
+			steps+=("$s")
+		fi
+	done
+	trap diagnose EXIT
 	for s in "${steps[@]}"; do
 		case $s in
 		setup) setup ;;

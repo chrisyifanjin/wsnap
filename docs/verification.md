@@ -46,6 +46,27 @@ docker run --rm --network container:<azurite> -v $PWD:/t --entrypoint /t/engine.
   -e WSNAP_TEST_AZURE_KEY=<azurite key> wsnap-agent:dev -test.run 'TestRoundTrip/.*/azure'
 ```
 
+## Real clouds
+
+`.github/workflows/cloud-conformance.yml` runs the engine round trip
+(snapshot, restore, maintenance) and `TestScopedIsolation` (workspace b's
+credential cannot open workspace a's repository) against real AWS S3,
+Google Cloud Storage and Azure Blob, each with its scoped provider. It
+runs weekly and on demand. A cloud runs only when its repository
+variables are set. The login uses GitHub OIDC, so GitHub stores no cloud
+key. Use a dedicated bucket or account, with a lifecycle rule that deletes
+`conformance/` objects after one day.
+
+**Status:** the workflow has not run against a real cloud yet. Until it
+does, the tables above are the evidence: S3 with STS against MinIO, GCS
+against an emulator, and Azure against Azurite.
+
+| Cloud | Repository variables | Cloud-side setup |
+|---|---|---|
+| AWS (`s3-sts`) | `WSNAP_AWS_CI_ROLE_ARN`, `WSNAP_AWS_REGION`, `WSNAP_AWS_BUCKET`, `WSNAP_AWS_WORKSPACE_ROLE_ARN` | The CI role trusts the GitHub OIDC provider (`token.actions.githubusercontent.com`, subject `repo:<owner>/wsnap:*`) and may `sts:AssumeRole` the workspace role. It plays the broker. The workspace role trusts the CI role and allows `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket` on the bucket. wsnap's session policy narrows that to one workspace and role. |
+| GCP (`gcs-downscoped`) | `WSNAP_GCP_WORKLOAD_IDENTITY_PROVIDER`, `WSNAP_GCP_SERVICE_ACCOUNT`, `WSNAP_GCP_BUCKET` | A workload identity pool with a GitHub provider. The service account has `roles/storage.objectAdmin` on the bucket and grants `roles/iam.workloadIdentityUser` to the repository's principal set. The tests use the external-account credential file as the broker's `GOOGLE_CREDENTIALS_JSON`. |
+| Azure (`azure-sas`) | `WSNAP_AZURE_CLIENT_ID`, `WSNAP_AZURE_TENANT_ID`, `WSNAP_AZURE_SUBSCRIPTION_ID`, `WSNAP_AZURE_ACCOUNT` | An app registration with a federated credential for the repository, and the role `Storage Account Key Operator Service Role` on the storage account. The workflow reads the account key, as the broker's `AZURE_ACCOUNT_KEY`. Each run creates per-workspace containers; delete old ones from time to time. |
+
 ## End-to-end scenarios
 
 `test/e2e/run.sh` runs on a kind cluster. Use three nodes for the
@@ -65,6 +86,22 @@ multi-node scenario: `kind create cluster --name wsnap --config test/e2e/kind-mu
 | `chaos` | Controller stopped while a Pod dies, leader killed during a rescue, storage stopped and started, sidecar killed with SIGKILL, a crash with an immediate replacement Pod. |
 | `tls` | The broker over HTTPS: sidecars and Jobs verify its CA; an untrusted CA and plain HTTP are refused. |
 | `multinode` | Restore on another node, a mover that follows a node-local PV, a drain that takes a final snapshot. |
+| `worker` | Worker mode: the workload Pod gets only a gate; a worker on its node serves a live request, takes the final snapshot with the last write after the workload stops, and restores a new workload on a new PVC. A `ReadWriteOncePod` claim is refused. |
+
+The scenarios form four groups that share no state:
+
+| Group | Scenarios |
+|---|---|
+| `controlplane` | `webhook`, `gateway`, `tls`, `multinode` |
+| `volumes` | `pvc`, `ephemeral`, `sandbox`, `emptydir`, `singlewriter`, `requests` |
+| `failures` | `chaos` |
+| `worker` | `worker` |
+
+`test/e2e/run.sh` with no arguments runs `setup` and then all four groups
+on one cluster. `test/e2e/run.sh setup volumes` runs one group. CI runs
+each group on its own cluster at the same time. When a run fails, the
+script prints the Pods, volumes, wsnap objects, events and logs, and CI
+uploads the kind node logs.
 
 The harness uses `kubectl exec` only to act as the agent (to write files).
 wsnap itself never uses exec.
@@ -345,6 +382,25 @@ Found by the sixth independent review, and fixed:
   and the workload must exit on SIGTERM. The second was found by the
   end-to-end suite, whose test workload ignored SIGTERM.
 
+PVC identity and provisioning checks:
+
+- `Workspace.status.volume` records the claim and PV UIDs as well as their
+  names. A writer cannot receive credentials until both sides of the
+  binding agree. Protection refuses a PV already owned by another
+  workspace (`TestResolveVolumeRequiresClaimAndPVIdentity`).
+- An idle request Job refuses a replacement claim with the same name;
+  a registered mover or restorer checks the same identity again when its
+  Pod asks for credentials. The controller records that identity in
+  Workspace status, so editing the Job's annotations cannot change it
+  (`TestIdleRequestRejectsReplacedClaim`, `TestJobRoles`).
+- A rescue PVC is pinned to its released PV and the PV is pre-bound to
+  the new claim UID. A preexisting same-name claim cannot cause a mover
+  Job to start (`TestRescueRefusesPreexistingSameNameClaim`).
+- The sample `LimitRange`, `ResourceQuota`, and StorageClass admission
+  policy were applied to an isolated Kubernetes 1.37 namespace. A claim
+  using the reviewed class was admitted; an unreviewed class and a 20Gi
+  claim above the 10Gi limit were rejected.
+
 ## Known limits
 
 - A root workload can race the staging directory during an in-place
@@ -358,3 +414,8 @@ Found by the sixth independent review, and fixed:
 - A restore must finish within `--operation-timeout` (default 30 minutes),
   and the repository's `credentials.ttl` must be at least 5 minutes longer.
   Raise both for very large workspaces.
+- If the controller stops after creating a rescue PVC but before recording
+  its UID on the PV, it leaves the PV retained and refuses an automatic
+  retry. An operator must inspect and remove that orphaned rescue PVC
+  before retrying; it will not mount a same-name claim without proof of
+  ownership.

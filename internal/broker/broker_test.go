@@ -5,13 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"golang.org/x/time/rate"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
@@ -78,6 +79,156 @@ type env struct {
 
 func newEnv(t *testing.T, objs ...client.Object) *env {
 	t.Helper()
+	// Fake clients do not run Kubernetes' PV binder. Give ordinary Pod
+	// fixtures a real claim/PV identity so writer checks exercise production
+	// bindings rather than an impossible running Pod with an unbound claim.
+	claims := map[string]*corev1.PersistentVolumeClaim{}
+	volumes := map[string]*corev1.PersistentVolume{}
+	for _, o := range objs {
+		switch v := o.(type) {
+		case *corev1.PersistentVolumeClaim:
+			claims[v.Name] = v
+		case *corev1.PersistentVolume:
+			volumes[v.Name] = v
+		}
+	}
+	for _, o := range objs {
+		p, ok := o.(*corev1.Pod)
+		if !ok || p.Labels[wsnapv1.LabelWorkspace] == "" {
+			continue
+		}
+		for _, v := range p.Spec.Volumes {
+			if v.PersistentVolumeClaim == nil {
+				continue
+			}
+			name := v.PersistentVolumeClaim.ClaimName
+			if claims[name] == nil {
+				claims[name] = &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: name},
+					Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-" + name}}
+				objs = append(objs, claims[name])
+			}
+		}
+	}
+	// Mover and restorer fixtures also need the PVC that a real Job Pod
+	// mounts. The Job controller does not run in the fake client.
+	for _, o := range objs {
+		j, ok := o.(*batchv1.Job)
+		if !ok || (j.Labels[wsnapv1.LabelJob] != "mover" && j.Labels[wsnapv1.LabelJob] != "restorer") {
+			continue
+		}
+		if j.Annotations == nil {
+			j.Annotations = map[string]string{}
+		}
+		pvName := j.Annotations[wsnapv1.AnnotationVolumeName]
+		if pvName == "" {
+			pvName = "pv-" + j.Name
+			j.Annotations[wsnapv1.AnnotationVolumeName] = pvName
+		}
+		claimName := ""
+		for _, v := range j.Spec.Template.Spec.Volumes {
+			if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
+				claimName = v.PersistentVolumeClaim.ClaimName
+			}
+		}
+		if claimName == "" {
+			for _, pvc := range claims {
+				if pvc.Spec.VolumeName == pvName {
+					claimName = pvc.Name
+					break
+				}
+			}
+		}
+		if claimName == "" {
+			claimName = "job-claim-" + j.Name
+		}
+		if claims[claimName] == nil {
+			claims[claimName] = &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: j.Namespace, Name: claimName},
+				Spec: corev1.PersistentVolumeClaimSpec{VolumeName: pvName}}
+			objs = append(objs, claims[claimName])
+		}
+		if volumes[pvName] == nil {
+			volumes[pvName] = &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: pvName}}
+			objs = append(objs, volumes[pvName])
+		}
+		pv := volumes[pvName]
+		if pv.Annotations == nil {
+			pv.Annotations = map[string]string{}
+		}
+		if pv.Annotations[wsnapv1.AnnotationWorkspaceRef] == "" && j.Labels[wsnapv1.LabelJobWorkspace] != "" {
+			pv.Annotations[wsnapv1.AnnotationWorkspaceRef] = j.Namespace + "/" + j.Labels[wsnapv1.LabelJobWorkspace]
+		}
+		v := corev1.Volume{Name: "workspace", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName}}}
+		found := false
+		for _, existing := range j.Spec.Template.Spec.Volumes {
+			found = found || existing.Name == "workspace"
+		}
+		if !found {
+			j.Spec.Template.Spec.Volumes = append(j.Spec.Template.Spec.Volumes, v)
+		}
+		for _, other := range objs {
+			p, ok := other.(*corev1.Pod)
+			if !ok || metav1.GetControllerOf(p) == nil || metav1.GetControllerOf(p).UID != j.UID {
+				continue
+			}
+			found := false
+			for _, existing := range p.Spec.Volumes {
+				found = found || existing.Name == "workspace"
+			}
+			if !found {
+				p.Spec.Volumes = append(p.Spec.Volumes, v)
+			}
+		}
+	}
+	for _, pvc := range claims {
+		if pvc.UID == "" {
+			pvc.UID = types.UID("uid-" + pvc.Name)
+		}
+		if pvc.Spec.VolumeName == "" {
+			continue
+		}
+		pv := volumes[pvc.Spec.VolumeName]
+		if pv == nil {
+			pv = &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: pvc.Spec.VolumeName},
+				Spec: corev1.PersistentVolumeSpec{PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete}}
+			volumes[pv.Name] = pv
+			objs = append(objs, pv)
+		}
+		if pv.UID == "" {
+			pv.UID = types.UID("uid-" + pv.Name)
+		}
+		if pv.Spec.ClaimRef == nil {
+			pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: pvc.Namespace, Name: pvc.Name, UID: pvc.UID}
+		} else if pv.Spec.ClaimRef.Namespace == pvc.Namespace && pv.Spec.ClaimRef.Name == pvc.Name && pv.Spec.ClaimRef.UID == "" {
+			pv.Spec.ClaimRef.UID = pvc.UID
+		}
+	}
+	for _, o := range objs {
+		j, ok := o.(*batchv1.Job)
+		if !ok || (j.Labels[wsnapv1.LabelJob] != "mover" && j.Labels[wsnapv1.LabelJob] != "restorer") {
+			continue
+		}
+		for _, v := range j.Spec.Template.Spec.Volumes {
+			if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
+				j.Annotations[workspace.AnnotationClaimUID] = string(claims[v.PersistentVolumeClaim.ClaimName].UID)
+				j.Annotations[workspace.AnnotationPVUID] = string(volumes[j.Annotations[wsnapv1.AnnotationVolumeName]].UID)
+			}
+		}
+	}
+	for _, o := range objs {
+		ws, ok := o.(*wsnapv1.Workspace)
+		if !ok {
+			continue
+		}
+		for i := range ws.Status.Jobs {
+			for _, other := range objs {
+				j, ok := other.(*batchv1.Job)
+				if ok && ws.Status.Jobs[i].UID == string(j.UID) {
+					ws.Status.Jobs[i] = workspace.JobRef(j)
+				}
+			}
+		}
+	}
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = wsnapv1.AddToScheme(scheme)
@@ -233,6 +384,31 @@ func TestJobRoles(t *testing.T) {
 	}
 	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMaintenance}); rec.Code != 403 {
 		t.Errorf("mover pod got maintenance: %d", rec.Code)
+	}
+	// Replacing the mounted claim under the same name invalidates the
+	// registered Job's credential, even though its template still matches.
+	claimName := job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName
+	var mounted corev1.PersistentVolumeClaim
+	if err := e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: claimName}, &mounted); err != nil {
+		t.Fatal(err)
+	}
+	mounted.UID = "replacement-claim"
+	if err := e.client.Update(context.Background(), &mounted); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != http.StatusForbidden {
+		t.Fatalf("replacement claim got a mover credential: %d %s", rec.Code, rec.Body.String())
+	}
+	var edited batchv1.Job
+	if err := e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: job.Name}, &edited); err != nil {
+		t.Fatal(err)
+	}
+	edited.Annotations[workspace.AnnotationClaimUID] = string(mounted.UID)
+	if err := e.client.Update(context.Background(), &edited); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != http.StatusForbidden {
+		t.Fatalf("edited Job annotation bypassed the status registration: %d %s", rec.Code, rec.Body.String())
 	}
 
 	// A user-made Job that copies the labels but lacks managed-by.
@@ -660,7 +836,7 @@ func TestWritersWaitForAJobOnTheirVolume(t *testing.T) {
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	_ = e.client.Status().Update(context.Background(), job)
 	if rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
-		t.Fatalf("writer got %d after the job finished", rec.Code)
+		t.Fatalf("writer got %d after the job finished: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -854,7 +1030,12 @@ func TestWriterEpochs(t *testing.T) {
 	if err := e.client.Delete(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "w1"}}); err != nil {
 		t.Fatal(err)
 	}
-	for _, o := range []client.Object{workloadPod("w2", "u2", "ws1"), claim("w2", "pv-2"), vol("pv-2")} {
+	pvc2 := claim("w2", "pv-2").(*corev1.PersistentVolumeClaim)
+	pvc2.UID = "uid-data-w2"
+	pv2 := vol("pv-2").(*corev1.PersistentVolume)
+	pv2.UID = "uid-pv-2"
+	pv2.Spec.ClaimRef = &corev1.ObjectReference{Namespace: ns, Name: pvc2.Name, UID: pvc2.UID}
+	for _, o := range []client.Object{workloadPod("w2", "u2", "ws1"), pvc2, pv2} {
 		if err := e.client.Create(context.Background(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -1251,5 +1432,198 @@ func TestUnsetOperationTimeoutIsNotSent(t *testing.T) {
 	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
 	if _, r := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleRestore}); r.OperationTimeout.Duration != 0 {
 		t.Fatalf("broker sent operationTimeout %s for a repository that sets none", r.OperationTimeout.Duration)
+	}
+}
+
+// workerEnv has a worker-mode workspace, its workload Pod on node-a, and a
+// registered worker Job whose Pod shares the workload's claim.
+func workerEnv(t *testing.T) (*env, *corev1.Pod) {
+	t.Helper()
+	app := workloadPod("app", "app-uid", "ws1", func(p *corev1.Pod) {
+		p.Spec.NodeName = "node-a"
+		p.Spec.InitContainers = []corev1.Container{{Name: "wsnap-gate",
+			VolumeMounts: []corev1.VolumeMount{{Name: "workspace", MountPath: "/workspace", ReadOnly: true}}}}
+		p.Spec.Volumes = p.Spec.Volumes[:1] // no wsnap token in a worker-mode workload
+	})
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-app", UID: "claim-uid"},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-app"}}
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-app", UID: "pv-uid"},
+		Spec: corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: ns, Name: "data-app", UID: "claim-uid"}}}
+	vols := []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-app"}}}}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-worker-x", UID: "worker-job-uid",
+			Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "worker",
+				wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"},
+			Annotations: map[string]string{wsnapv1.AnnotationTargetPodName: "app", wsnapv1.AnnotationTargetPodUID: "app-uid",
+				wsnapv1.AnnotationVolumeName: "pv-app", workspace.AnnotationClaimUID: "claim-uid", workspace.AnnotationPVUID: "pv-uid"}},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: vols}}},
+	}
+	worker := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "worker-pod", UID: "wp",
+		Labels:          map[string]string{wsnapv1.LabelJob: "worker"},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: job.Name, UID: job.UID, Controller: ptr.To(true)}}},
+		Spec: corev1.PodSpec{NodeName: "node-a", Volumes: vols}}
+	ws := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"},
+		Spec:   wsnapv1.WorkspaceSpec{RepositoryName: "repo", Execution: wsnapv1.WorkspaceExecutionSpec{Mode: wsnapv1.ExecutionWorker}},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{workspace.JobRef(job)}}}
+	return newEnv(t, app, claim, pv, job, worker, ws), app
+}
+
+func workerStop(t *testing.T, e *env) bool {
+	t.Helper()
+	rec, _ := e.call(t, "/v1/worker-state", "token-worker-pod", struct{}{})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("worker-state: %d %s", rec.Code, rec.Body.String())
+	}
+	var st struct{ Stop bool }
+	_ = json.Unmarshal(rec.Body.Bytes(), &st)
+	return st.Stop
+}
+
+func TestWorkerServesItsWorkload(t *testing.T) {
+	e, _ := workerEnv(t)
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
+		t.Fatalf("worker restore before the workload started: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("worker snapshot: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-app", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != http.StatusForbidden {
+		t.Errorf("a worker-mode workload Pod got a credential: %d", rec.Code)
+	}
+	var ws wsnapv1.Workspace
+	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &ws)
+	if ws.Status.WriterPod == nil || ws.Status.WriterPod.UID != "app-uid" || ws.Status.Jobs[0].WriterEpoch != ws.Status.WriterEpoch {
+		t.Fatalf("writer %+v, job epoch %d, workspace epoch %d", ws.Status.WriterPod, ws.Status.Jobs[0].WriterEpoch, ws.Status.WriterEpoch)
+	}
+	rec, _ := e.call(t, "/v1/report", "token-worker-pod", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot,
+		SnapshotID: "s1", EndTime: time.Now()})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("worker report: %d %s", rec.Code, rec.Body.String())
+	}
+	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &ws)
+	if l := ws.Status.LastSnapshot; l == nil || l.Executor != "worker" || l.Epoch != ws.Status.WriterEpoch || l.Pod.UID != "app-uid" {
+		t.Fatalf("lastSnapshot = %+v", ws.Status.LastSnapshot)
+	}
+}
+
+// A worker outlives its workload to take the final snapshot. A missing
+// workload, or a new Pod that reuses its name, means the workload stopped;
+// refusing the worker would leave it, and the volume, stuck.
+func TestWorkerSeesItsWorkloadStop(t *testing.T) {
+	ctx := context.Background()
+	e, app := workerEnv(t)
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("worker snapshot: %d %s", rec.Code, rec.Body.String())
+	}
+	if workerStop(t, e) {
+		t.Fatal("stop while the workload runs")
+	}
+	if err := e.client.Delete(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	replacement := app.DeepCopy()
+	replacement.ResourceVersion, replacement.UID = "", "app-uid-2"
+	if err := e.client.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if !workerStop(t, e) {
+		t.Fatal("a same-name replacement Pod kept the old worker running")
+	}
+	rec, _ := e.call(t, "/v1/report", "token-worker-pod", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot,
+		SnapshotID: "final", Final: true, EndTime: time.Now()})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("final report after the workload stopped: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerMustShareItsWorkloadsVolume(t *testing.T) {
+	ctx := context.Background()
+	e, _ := workerEnv(t)
+	var claim corev1.PersistentVolumeClaim
+	if err := e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "data-app"}, &claim); err != nil {
+		t.Fatal(err)
+	}
+	claim.UID = "replacement-claim"
+	if err := e.client.Update(ctx, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code < 400 || rec.Code >= 500 {
+		t.Fatalf("worker got a credential for a replaced claim: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func workerState(t *testing.T, e *env) protocol.WorkerState {
+	t.Helper()
+	rec, _ := e.call(t, "/v1/worker-state", "token-worker-pod", struct{}{})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("worker-state: %d %s", rec.Code, rec.Body.String())
+	}
+	var st protocol.WorkerState
+	_ = json.Unmarshal(rec.Body.Bytes(), &st)
+	return st
+}
+
+// "Stopped" (every container exited) allows a final snapshot at once;
+// "gone" (the object vanished, e.g. a forced deletion) does not, since
+// the containers may still run.
+func TestWorkerStateTellsStoppedFromGone(t *testing.T) {
+	ctx := context.Background()
+	e, _ := workerEnv(t)
+	if st := workerState(t, e); st.Stop || st.Gone {
+		t.Fatalf("running workload: %+v", st)
+	}
+	var app corev1.Pod
+	_ = e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "app"}, &app)
+	app.Finalizers = []string{"test/hold"}
+	if err := e.client.Update(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.client.Delete(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if st := workerState(t, e); st.Stop {
+		t.Fatalf("terminating workload whose containers still run: %+v", st)
+	}
+	_ = e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "app"}, &app)
+	app.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "agent", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}}}}
+	if err := e.client.Status().Update(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if st := workerState(t, e); !st.Stop || st.Gone {
+		t.Fatalf("every container exited: %+v", st)
+	}
+	app.Finalizers = nil
+	if err := e.client.Update(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if st := workerState(t, e); !st.Gone {
+		t.Fatalf("deleted workload: %+v", st)
+	}
+}
+
+// The final mark names the registered workload, not the Job's editable
+// writer annotation.
+func TestWorkerFinalMarkUsesTheRegisteredWorkload(t *testing.T) {
+	ctx := context.Background()
+	e, _ := workerEnv(t)
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("worker snapshot: %d %s", rec.Code, rec.Body.String())
+	}
+	var job batchv1.Job
+	_ = e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "wsnap-worker-x"}, &job)
+	job.Annotations[workspace.AnnotationWriterPod] = "someone-else"
+	if err := e.client.Update(ctx, &job); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := e.call(t, "/v1/report", "token-worker-pod", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot,
+		SnapshotID: "final", Final: true, EndTime: time.Now()})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("report: %d %s", rec.Code, rec.Body.String())
+	}
+	var pv corev1.PersistentVolume
+	_ = e.client.Get(ctx, types.NamespacedName{Name: "pv-app"}, &pv)
+	if got := pv.Annotations[workspace.AnnotationFinalPod]; got != "app-uid" {
+		t.Fatalf("final pod = %q, want the registered workload app-uid", got)
 	}
 }
