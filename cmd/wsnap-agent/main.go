@@ -38,6 +38,7 @@ func main() {
 	fs.StringVar(&cfg.Dir, "dir", envOr("WSNAP_DIR", "/workspace"), "workspace directory")
 	fs.StringVar(&cfg.StateDir, "state-dir", envOr("WSNAP_STATE_DIR", "/var/lib/wsnap"), "private state directory")
 	fs.StringVar(&cfg.WorkerPodUID, "pod-uid", "", "workload Pod UID for worker readiness")
+	fs.DurationVar(&cfg.WorkloadGrace, "workload-grace", 30*time.Second, "worker: how long the workload's containers may run after its Pod is deleted")
 	fs.DurationVar(&cfg.FinalTimeout, "final-timeout", 25*time.Second, "time limit for the final snapshot after SIGTERM")
 	fs.DurationVar(&cfg.IntervalOverride, "interval", 0, "override the repository's snapshot interval")
 	caFile := fs.String("ca-file", os.Getenv("WSNAP_CA_FILE"), "CA bundle that signs the broker's TLS certificate")

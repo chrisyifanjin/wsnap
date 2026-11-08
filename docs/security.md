@@ -77,8 +77,11 @@ serves a Job Pod only when all of these are true:
 In worker mode the workload Pod has no wsnap token at all, and the broker
 refuses it any credential. The worker Job is served only while its
 workload Pod (name and UID), node, and PVC/PV UIDs match the record in
-Workspace status. The gate container in the workload Pod has no
-credential; it only reads a marker file.
+Workspace status, and its final mark names the registered workload, not
+an editable Job annotation. The gate container in the workload Pod has no
+credential; it only reads a marker file, through `os.Root`, and accepts it
+only if the worker refreshed it in the last 20 s. The worker writes the
+marker through `os.Root` too.
 
 Engine scratch objects:
 

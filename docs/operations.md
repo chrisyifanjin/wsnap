@@ -280,15 +280,25 @@ spec:
 Then label the workload Pod as usual. What happens:
 
 1. The webhook adds a gate init container (`wsnap-gate`) to the workload
-   Pod. It has no credentials; it waits for a marker file on the volume.
-2. When the Pod is scheduled, the controller creates a worker Job on the
-   same node that mounts the same PVC.
-3. The worker restores the workspace, writes the marker, and the gate
-   lets the workload start.
-4. The worker snapshots while the workload runs and serves requests.
-5. When the workload Pod stops, the worker takes the final snapshot and
-   finishes. If the worker gets SIGTERM first (a drain), it waits up to
-   half its final timeout for the workload to stop.
+   Pod, replacing any container of that name. It has no credentials; it
+   waits for a fresh marker file on the volume.
+2. When the Pod is scheduled, the controller creates a worker Job that
+   mounts the same PVC. The scheduler places it on the same node (node
+   affinity) with the workload's tolerations and priority class, and it
+   requests 50m CPU and 64Mi memory.
+3. The worker restores the workspace and refreshes the marker every 5 s;
+   the gate lets the workload start. After a node reboot the old marker is
+   stale, so the workload waits for its worker again.
+4. The worker snapshots while the workload runs and serves requests. If
+   the worker Pod dies, the Job replaces it and requests it had claimed go
+   to the new Pod.
+5. When the workload's containers have stopped, the worker takes the
+   final snapshot and finishes; the Job is deleted at once, so the claim
+   is free. If the Pod object disappears without being seen stopped (a
+   forced deletion), the worker first waits the workload's
+   `terminationGracePeriodSeconds`, since its containers may still run.
+   If the worker gets SIGTERM first (a drain), it waits up to that grace
+   for the workload to stop; otherwise its last snapshot is not final.
 
 Limits:
 

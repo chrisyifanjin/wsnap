@@ -1551,3 +1551,78 @@ func TestWorkerMustShareItsWorkloadsVolume(t *testing.T) {
 		t.Fatalf("worker got a credential for a replaced claim: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func workerState(t *testing.T, e *env) protocol.WorkerState {
+	t.Helper()
+	rec, _ := e.call(t, "/v1/worker-state", "token-worker-pod", struct{}{})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("worker-state: %d %s", rec.Code, rec.Body.String())
+	}
+	var st protocol.WorkerState
+	_ = json.Unmarshal(rec.Body.Bytes(), &st)
+	return st
+}
+
+// "Stopped" (every container exited) allows a final snapshot at once;
+// "gone" (the object vanished, e.g. a forced deletion) does not, since
+// the containers may still run.
+func TestWorkerStateTellsStoppedFromGone(t *testing.T) {
+	ctx := context.Background()
+	e, _ := workerEnv(t)
+	if st := workerState(t, e); st.Stop || st.Gone {
+		t.Fatalf("running workload: %+v", st)
+	}
+	var app corev1.Pod
+	_ = e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "app"}, &app)
+	app.Finalizers = []string{"test/hold"}
+	if err := e.client.Update(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.client.Delete(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if st := workerState(t, e); st.Stop {
+		t.Fatalf("terminating workload whose containers still run: %+v", st)
+	}
+	_ = e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "app"}, &app)
+	app.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "agent", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}}}}
+	if err := e.client.Status().Update(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if st := workerState(t, e); !st.Stop || st.Gone {
+		t.Fatalf("every container exited: %+v", st)
+	}
+	app.Finalizers = nil
+	if err := e.client.Update(ctx, &app); err != nil {
+		t.Fatal(err)
+	}
+	if st := workerState(t, e); !st.Gone {
+		t.Fatalf("deleted workload: %+v", st)
+	}
+}
+
+// The final mark names the registered workload, not the Job's editable
+// writer annotation.
+func TestWorkerFinalMarkUsesTheRegisteredWorkload(t *testing.T) {
+	ctx := context.Background()
+	e, _ := workerEnv(t)
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("worker snapshot: %d %s", rec.Code, rec.Body.String())
+	}
+	var job batchv1.Job
+	_ = e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "wsnap-worker-x"}, &job)
+	job.Annotations[workspace.AnnotationWriterPod] = "someone-else"
+	if err := e.client.Update(ctx, &job); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := e.call(t, "/v1/report", "token-worker-pod", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot,
+		SnapshotID: "final", Final: true, EndTime: time.Now()})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("report: %d %s", rec.Code, rec.Body.String())
+	}
+	var pv corev1.PersistentVolume
+	_ = e.client.Get(ctx, types.NamespacedName{Name: "pv-app"}, &pv)
+	if got := pv.Annotations[workspace.AnnotationFinalPod]; got != "app-uid" {
+		t.Fatalf("final pod = %q, want the registered workload app-uid", got)
+	}
+}
