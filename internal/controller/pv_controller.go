@@ -296,20 +296,31 @@ func (r *PVReconciler) restartRescue(ctx context.Context, pv *corev1.PersistentV
 // controller then deletes the volume. A PV that was Retain to begin with is
 // left Released, as its owner intended.
 func (r *PVReconciler) reclaim(ctx context.Context, pv *corev1.PersistentVolume) error {
-	original := corev1.PersistentVolumeReclaimPolicy(pv.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy])
+	// Reconcile starts from a cached object. A different controller or an
+	// operator may have rebound or repurposed the PV since that read. A
+	// reclaim patch based on the old object could otherwise restore Delete
+	// and remove protection from a newly owned volume.
+	var cur corev1.PersistentVolume
+	if err := r.Reader.Get(ctx, types.NamespacedName{Name: pv.Name}, &cur); err != nil {
+		return err
+	}
+	if cur.UID != pv.UID || cur.ResourceVersion != pv.ResourceVersion {
+		return fmt.Errorf("volume %s changed before reclaim; retrying with its current state", pv.Name)
+	}
+	original := corev1.PersistentVolumeReclaimPolicy(cur.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy])
 	if original == "" {
 		original = corev1.PersistentVolumeReclaimDelete
 	}
-	patch := client.MergeFrom(pv.DeepCopy())
-	delete(pv.Labels, wsnapv1.LabelProtected)
+	patch := client.MergeFromWithOptions(cur.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	delete(cur.Labels, wsnapv1.LabelProtected)
 	// A Retain PV can later be cleaned and bound to another workspace.
 	// Its old ownership and writer marks must not follow the asset.
 	for _, key := range []string{wsnapv1.AnnotationWorkspaceRef, wsnapv1.AnnotationOriginalReclaimPolicy,
 		wsnapv1.AnnotationRescue, workspace.AnnotationWriterPod, workspace.AnnotationWriterEpoch, workspace.AnnotationFinalPod} {
-		delete(pv.Annotations, key)
+		delete(cur.Annotations, key)
 	}
-	pv.Spec.PersistentVolumeReclaimPolicy = original
-	return r.Patch(ctx, pv, patch)
+	cur.Spec.PersistentVolumeReclaimPolicy = original
+	return r.Patch(ctx, &cur, patch)
 }
 
 // SetupWithManager registers the reconciler. It also watches mover Jobs so
