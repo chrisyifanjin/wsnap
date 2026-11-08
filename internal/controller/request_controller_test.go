@@ -25,6 +25,35 @@ import (
 
 func requestEnv(t *testing.T, objs ...client.Object) (*RequestReconciler, client.Client) {
 	t.Helper()
+	volumes := map[string]*corev1.PersistentVolume{}
+	for _, o := range objs {
+		if pv, ok := o.(*corev1.PersistentVolume); ok {
+			volumes[pv.Name] = pv
+		}
+	}
+	for _, o := range objs {
+		pvc, ok := o.(*corev1.PersistentVolumeClaim)
+		if !ok || pvc.Spec.VolumeName == "" {
+			continue
+		}
+		if pvc.UID == "" {
+			pvc.UID = types.UID("uid-" + pvc.Name)
+		}
+		pv := volumes[pvc.Spec.VolumeName]
+		if pv == nil {
+			pv = &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: pvc.Spec.VolumeName}}
+			volumes[pv.Name] = pv
+			objs = append(objs, pv)
+		}
+		if pv.UID == "" {
+			pv.UID = types.UID("uid-" + pv.Name)
+		}
+		if pv.Spec.ClaimRef == nil {
+			pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: pvc.Namespace, Name: pvc.Name, UID: pvc.UID}
+		} else if pv.Spec.ClaimRef.Namespace == pvc.Namespace && pv.Spec.ClaimRef.Name == pvc.Name && pv.Spec.ClaimRef.UID == "" {
+			pv.Spec.ClaimRef.UID = pvc.UID
+		}
+	}
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = wsnapv1.AddToScheme(scheme)
@@ -68,10 +97,24 @@ func reconcileReq(t *testing.T, r *RequestReconciler, c client.Client) *wsnapv1.
 	return &out
 }
 
-var pvcVol = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: "data", VolumeName: "pv-1"}
+var pvcVol = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: "data", ClaimUID: "uid-data", VolumeName: "pv-1", VolumeUID: "uid-pv-1"}
 
 func boundClaim() *corev1.PersistentVolumeClaim {
-	return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "data"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+	return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "data", UID: "uid-data"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+}
+
+func TestIdleRequestRejectsReplacedClaim(t *testing.T) {
+	claim := boundClaim()
+	claim.UID = "replacement-uid" // same name and PV, different object
+	r, c := requestEnv(t, wsWith(pvcVol, nil), claim, snapReq(time.Now(), "", ""))
+	got := reconcileReq(t, r, c)
+	if got.Status.Phase != wsnapv1.SnapshotFailed {
+		t.Fatalf("request phase %q: replaced claim was accepted", got.Status.Phase)
+	}
+	var jobs batchv1.JobList
+	if err := c.List(context.Background(), &jobs); err != nil || len(jobs.Items) != 0 {
+		t.Fatalf("started a Job on a replacement claim: %v, %d Jobs", err, len(jobs.Items))
+	}
 }
 
 func TestRequestRouting(t *testing.T) {
@@ -438,7 +481,7 @@ func TestSnapshotAndRestoreNeverStartTwoJobsOnOneVolume(t *testing.T) {
 // snapshot (terminating) on a generic ephemeral volume. No Job may start
 // on that volume until the Pod is gone.
 func TestJobWaitsForAStartingOrStoppingWriter(t *testing.T) {
-	ephemeralVol := &wsnapv1.VolumeRef{Kind: workspace.KindEphemeral, ClaimName: "p-workspace", VolumeName: "pv-1"}
+	ephemeralVol := &wsnapv1.VolumeRef{Kind: workspace.KindEphemeral, ClaimName: "p-workspace", ClaimUID: "uid-p-workspace", VolumeName: "pv-1", VolumeUID: "uid-pv-1"}
 	for name, mutate := range map[string]func(*corev1.Pod){
 		"pending":     func(p *corev1.Pod) { p.Status.Phase = corev1.PodPending },
 		"terminating": func(p *corev1.Pod) { p.DeletionTimestamp = ptr.To(metav1.Now()); p.Finalizers = []string{"test/keep"} },
