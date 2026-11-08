@@ -1243,3 +1243,13 @@ func TestLostWriterVolumeIsRescuedWithoutBlocking(t *testing.T) {
 		t.Fatalf("no rescue request for the lost writer's volume: %+v", reqs.Items)
 	}
 }
+
+// TestUnsetOperationTimeoutIsNotSent: an unset spec.operationTimeout must
+// not override the agent's --operation-timeout with the default (found by
+// the e2e storage-outage scenario).
+func TestUnsetOperationTimeoutIsNotSent(t *testing.T) {
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
+	if _, r := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleRestore}); r.OperationTimeout.Duration != 0 {
+		t.Fatalf("broker sent operationTimeout %s for a repository that sets none", r.OperationTimeout.Duration)
+	}
+}

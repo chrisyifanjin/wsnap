@@ -570,10 +570,12 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 	return &protocol.CredentialsResponse{
 		Namespace: c.id.Namespace, Workspace: c.id.Name, Role: req.Role,
 		Engine: eng, Backend: backend, Credentials: creds, RepositoryPassword: password,
-		Interval:         protocol.Duration{Duration: workspace.Interval(&repo)},
-		KeepLast:         workspace.KeepLast(&repo),
-		KeepDaily:        workspace.KeepDaily(&repo),
-		OperationTimeout: protocol.Duration{Duration: workspace.OperationTimeout(&repo)},
+		Interval:  protocol.Duration{Duration: workspace.Interval(&repo)},
+		KeepLast:  workspace.KeepLast(&repo),
+		KeepDaily: workspace.KeepDaily(&repo),
+		// Only an explicit setting: an unset field must not override the
+		// agent's own --operation-timeout with the default.
+		OperationTimeout: protocol.Duration{Duration: repo.Spec.OperationTimeout.Duration},
 		SnapshotID:       snapshotID, SourceWorkspace: source, RestoreFromGeneration: restoreGen,
 		LatestSnapshotID: latestID, KeepIDs: keep,
 	}, nil

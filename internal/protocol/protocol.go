@@ -152,7 +152,8 @@ type CredentialsResponse struct {
 	// Interval is how often the sidecar takes a periodic snapshot.
 	Interval Duration `json:"interval"`
 	// OperationTimeout bounds one snapshot or restore (the repository's
-	// spec.operationTimeout). Zero: the agent's own default.
+	// spec.operationTimeout). Zero when the repository does not set it: the
+	// agent then uses its --operation-timeout.
 	OperationTimeout Duration `json:"operationTimeout,omitempty"`
 	// KeepLast and KeepDaily are the retention for maintenance.
 	KeepLast  int `json:"keepLast"`
