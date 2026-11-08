@@ -1247,6 +1247,10 @@ install_kata() {
 	fi
 	docker exec "$node" test -x "$shim" || die "no Kata shim in the $KATA_VERSION release"
 	docker exec "$node" test -f "$cfg" || die "no Kata QEMU configuration in the $KATA_VERSION release"
+	# The VM boots under nested virtualization on CI machines, slower than
+	# the 3 s the shim waits for the guest agent by default.
+	docker exec "$node" sed -i 's/^reconnect_timeout_ms = .*/reconnect_timeout_ms = 60000/' "$cfg"
+	docker exec "$node" grep -q '^reconnect_timeout_ms = 60000' "$cfg" || die "could not raise the Kata agent timeout in $cfg"
 	# With the systemd cgroup driver (kind's default), Kata's Rust runtime
 	# creates the sandbox's cgroup through systemd over D-Bus, which a
 	# kind node does not run.
