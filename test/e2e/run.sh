@@ -1232,18 +1232,26 @@ install_kata() {
 	rm -f "$dir/kata.tar.zst"
 	tar -C "$dir" -cf - opt/kata | docker exec -i "$node" tar -C / -xf -
 	rm -rf "$dir"
-	cfg=/opt/kata/share/defaults/kata-containers/configuration-qemu.toml
-	docker exec "$node" test -f "$cfg" || cfg=/opt/kata/share/defaults/kata-containers/configuration.toml
+	# Kata 4 ships the Rust runtime (runtime-rs) in this tarball; 3.x
+	# shipped the Go runtime under /opt/kata/bin.
+	local shim=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2
+	cfg=/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml
+	if ! docker exec "$node" test -x "$shim"; then
+		shim=/opt/kata/bin/containerd-shim-kata-v2
+		cfg=/opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+	fi
+	docker exec "$node" test -x "$shim" || die "no Kata shim in the $KATA_VERSION release"
+	docker exec "$node" test -f "$cfg" || die "no Kata QEMU configuration in the $KATA_VERSION release"
 	docker exec "$node" sh -c '
 		set -e
-		ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
+		ln -sf "$2" /usr/local/bin/containerd-shim-kata-v2
 		if grep -q "^version = 3" /etc/containerd/config.toml; then
 			plugin="plugins.\"io.containerd.cri.v1.runtime\""
 		else
 			plugin="plugins.\"io.containerd.grpc.v1.cri\""
 		fi
 		printf "\n[%s.containerd.runtimes.kata]\n  runtime_type = \"io.containerd.kata.v2\"\n  privileged_without_host_devices = true\n[%s.containerd.runtimes.kata.options]\n  ConfigPath = \"%s\"\n" "$plugin" "$plugin" "$1" >> /etc/containerd/config.toml
-		systemctl restart containerd' sh "$cfg"
+		systemctl restart containerd' sh "$cfg" "$shim"
 	kubectl label node "$node" wsnap-e2e/kata=true --overwrite >/dev/null
 	kubectl apply -f - >/dev/null <<EOF
 apiVersion: node.k8s.io/v1
