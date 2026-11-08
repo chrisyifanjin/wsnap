@@ -312,6 +312,39 @@ Found by the fifth independent review, and fixed:
 - A targeted rescue request is never claimed by a sidecar, and the Pod
   controller reads the Pod live before it marks a PV's writer.
 
+Found by the sixth independent review, and fixed:
+
+- **The forged-Job fix could be bypassed with an exec hook or probe** on
+  the agent container, which runs inside it and can read the token. Job
+  Pods must now match the template's hooks, probes, working directory and
+  TTY settings too (`TestJobPodMustRunTheJobTemplate`).
+- **A writer on a lost node: the rescue was never asked for.** The broker
+  now asks for it, without blocking the replacement; when it lands it is
+  kept as superseded (`TestLostWriterVolumeIsRescuedWithoutBlocking`).
+- **Rescue failures were silent.** The alert read `status.lastError`,
+  which the next success clears. New gauges count failed rescue requests
+  and workspaces with superseded snapshots until an operator acts
+  (`WsnapRescueRequestFailed`, `WsnapSupersededSnapshots`).
+- **A restore whose report was lost ran twice**, rolling back work done
+  after it. The sidecar now records completed restores on its private
+  volume and resends the saved report (`TestRestoreRequestRunsOnce`).
+- **A sidecar not yet admitted could clear a volume** another Pod was
+  restoring into. It is now admitted first.
+- **A partial safety snapshot was followed by the swap**, deleting files
+  in no snapshot. It now stops the restore
+  (`TestPartialSafetySnapshotKeepsLiveData`).
+- **"Remove the annotation to retry" did not retry** a failed rescue. It
+  now starts a new mover (`TestRemovingFailedAnnotationRetriesTheRescue`).
+- **The workload could lock its sidecar out** with bad tokens (the per-IP
+  limit added after review 5). Only TokenReviews of unknown tokens are
+  limited now; a known valid token always passes
+  (`TestGarbageTokensDoNotFloodTheAPIServer`).
+- **CI skipped the real-engine tests.** CI and releases now install Kopia
+  and restic at the Dockerfile's versions.
+- Documented: TLS is required with untrusted workloads (`CAP_NET_RAW`),
+  and the workload must exit on SIGTERM. The second was found by the
+  end-to-end suite, whose test workload ignored SIGTERM.
+
 ## Known limits
 
 - A root workload can race the staging directory during an in-place

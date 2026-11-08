@@ -395,3 +395,23 @@ func TestCompleteJobWithoutRecordedSnapshotKeepsTheVolume(t *testing.T) {
 		t.Fatalf("rescue %q, policy %s; an unrecorded rescue must keep the volume", a, pv.Spec.PersistentVolumeReclaimPolicy)
 	}
 }
+
+// TestRemovingFailedAnnotationRetriesTheRescue (reviewer #6 finding 7):
+// the documented retry must start a new mover, not re-read the old Job.
+func TestRemovingFailedAnnotationRetriesTheRescue(t *testing.T) {
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: ""}) // the operator removed "failed"
+	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName("pv-1"), UID: "c"}
+	pv.Status.Phase = corev1.VolumeBound
+	failed := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: moverJobName("pv-1"), UID: "old-job"},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}}}}
+	r, c := newPVReconciler(t, testWorkspace(), pv, failed)
+	reconcilePV(t, r) // deletes the failed Job
+	reconcilePV(t, r) // creates a new one
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {
+		t.Fatalf("rescue = %q after the retry, want running", a)
+	}
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job); err != nil || job.UID == "old-job" {
+		t.Fatalf("no new mover job (err %v, uid %s)", err, job.UID)
+	}
+}

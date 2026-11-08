@@ -326,6 +326,9 @@ type snapOpts struct {
 	request string
 	// noQuiesce skips the handshake when the caller already froze the agent.
 	noQuiesce bool
+	// complete makes a partial snapshot an error: the caller is about to
+	// delete the live data (the safety snapshot before a restore).
+	complete bool
 }
 
 // takeSnapshot snapshots the volume unless nothing changed since st. An
@@ -383,6 +386,9 @@ func (c *Config) takeSnapshot(ctx context.Context, role protocol.Role, o snapOpt
 	}
 	if err := c.report(context.WithoutCancel(ctx), rep); err != nil {
 		return st, "", err
+	}
+	if snap.Partial && o.complete {
+		return st, snap.ID, fmt.Errorf("snapshot %s is partial: some files could not be read, so the live data is kept", snap.ID)
 	}
 	if snap.Partial && o.final && role == protocol.RoleMover {
 		return st, snap.ID, fmt.Errorf("snapshot %s is partial: some files could not be read; keeping the volume", snap.ID)
@@ -461,6 +467,11 @@ func (c *Config) initialize(ctx context.Context) (state, error) {
 		return state{}, c.prepareTriggerDirs()
 	}
 	if _, err := v.Lstat(restoring); err == nil {
+		// Get admitted before deleting anything: another Pod on this volume
+		// (RWX, or RWO on the same node) may be the writer mid-restore.
+		if _, err := c.credentialsFor(ctx, protocol.CredentialsRequest{Role: protocol.RoleRestore}); err != nil {
+			return state{}, err
+		}
 		c.Log.Warn("a previous restore was interrupted; clearing the partial data")
 		if err := clearWorkspace(v, c.Dir); err != nil {
 			return state{}, err
@@ -1121,12 +1132,22 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 		thaw := c.quiesce(ctx)
 		defer thaw()
 	}
+	// A restore that already ran (its report was lost, so the broker
+	// delivers it again) must not run twice: that would roll back work done
+	// since. Send the saved report again instead.
+	if done, ok := c.loadDone(request); ok {
+		c.Log.Info("restore already done; reporting it again", "request", request, "id", done.SnapshotID)
+		c.report(context.WithoutCancel(ctx), done)
+		return state{}, done.SnapshotID, nil
+	}
 	start := time.Now().UTC()
 	rep := protocol.Report{Role: protocol.RoleRestore, Operation: protocol.OpRestore, Request: request, StartTime: start}
 	finish := func(st state, id string, err error) (state, string, error) {
 		rep.EndTime, rep.SnapshotID = time.Now().UTC(), id
 		if err != nil {
 			rep.Error = err.Error()
+		} else {
+			c.saveDone(request, rep)
 		}
 		c.report(context.WithoutCancel(ctx), rep)
 		return st, id, err
@@ -1138,7 +1159,7 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 	rep.SourceWorkspace = creds.SourceWorkspace
 	id, err := c.restoreAndSwap(ctx, creds, func() error {
 		var err error
-		if cur, _, err = c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true}, cur); err != nil {
+		if cur, _, err = c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true, complete: true}, cur); err != nil {
 			return fmt.Errorf("could not save the live data before the restore: %w", err)
 		}
 		return nil
@@ -1154,6 +1175,25 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 		return finish(state{}, id, fmt.Errorf("restored %s but could not snapshot the result: %w", id, err))
 	}
 	return finish(st, id, nil)
+}
+
+// doneDir holds one file per restore request this Pod completed, on the
+// sidecar's private volume, which survives container restarts.
+func (c *Config) doneFile(request string) string {
+	return filepath.Join(c.StateDir, "done", request+".json")
+}
+
+func (c *Config) saveDone(request string, rep protocol.Report) {
+	b, _ := json.Marshal(rep)
+	if err := os.MkdirAll(filepath.Dir(c.doneFile(request)), 0o700); err == nil {
+		err = os.WriteFile(c.doneFile(request), b, 0o600)
+	}
+}
+
+func (c *Config) loadDone(request string) (protocol.Report, bool) {
+	var rep protocol.Report
+	b, err := os.ReadFile(c.doneFile(request))
+	return rep, err == nil && json.Unmarshal(b, &rep) == nil
 }
 
 // restoreAndSwap downloads the snapshot into .wsnap/staging, calls
@@ -1358,7 +1398,7 @@ func (c *Config) RunRestorer(ctx context.Context) error {
 			return fmt.Errorf("check the volume: %w", err)
 		}
 		if reason == "" {
-			if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{}, state{}); err != nil {
+			if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{complete: true}, state{}); err != nil {
 				return fmt.Errorf("could not save the volume before the restore: %w", err)
 			}
 		}

@@ -151,7 +151,12 @@ credentials there open only the attacker's own workspace.
 
 The broker serves plain HTTP unless you set `--tls-cert-file` and
 `--tls-key-file`. Without TLS, credentials cross the Pod network
-unencrypted. With TLS, give agents the CA with `--ca-file`. Give Jobs the
+unencrypted. **With untrusted workloads, TLS is required, not optional:**
+the workload shares the sidecar's network namespace, and container runtimes
+grant `CAP_NET_RAW` by default, so over plain HTTP the workload can capture
+the sidecar's token and the credential in the broker's answer. Either serve
+the broker over TLS, or drop `NET_RAW` from workload containers (Pod
+Security `restricted` does). With TLS, give agents the CA with `--ca-file`. Give Jobs the
 CA with `--agent-ca-configmap`. The broker reloads a rotated certificate
 from disk.
 

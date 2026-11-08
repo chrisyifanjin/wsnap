@@ -53,9 +53,10 @@ type Server struct {
 	AllowAutomountedTokens bool
 	// Limiter bounds requests per Pod. Nil disables limiting.
 	Limiter *PodLimiter
-	// FailedLogins bounds failed logins per client IP. Nil: the default.
-	FailedLogins *PodLimiter
-	failedOnce   sync.Once
+	// ReviewsPerIP bounds TokenReviews (for tokens not in the cache) per
+	// client IP. Nil: the default.
+	ReviewsPerIP *PodLimiter
+	reviewsOnce  sync.Once
 	// Hub wakes long polls when requests appear. Nil falls back to
 	// periodic checks only.
 	Hub *Hub
@@ -160,31 +161,40 @@ func (s *Server) resolve(r *http.Request) (*caller, error) {
 	return c, nil
 }
 
-// authenticate validates an agent token. A client whose tokens keep
-// failing is refused (429) before its next token reaches the API server.
+// authenticate validates an agent token. A token the broker validated
+// recently is answered from its cache; any other token costs a TokenReview,
+// which is limited per client IP (429).
 func (s *Server) authenticate(r *http.Request, token string) (Identity, error) {
-	ip := clientIP(r)
-	if s.failedLogins().Blocked(ip) {
-		return Identity{}, fail(http.StatusTooManyRequests, "too many failed logins from %s", ip)
+	var (
+		ident Identity
+		err   error
+		known bool
+	)
+	if ca, ok := s.Auth.(*CachingAuthenticator); ok {
+		ident, err, known = ca.Known(token)
 	}
-	ident, err := s.Auth.Authenticate(r.Context(), token)
+	if !known {
+		if ip := clientIP(r); !s.reviews().Allow(ip) {
+			return Identity{}, fail(http.StatusTooManyRequests, "too many token reviews from %s", ip)
+		}
+		ident, err = s.Auth.Authenticate(r.Context(), token)
+	}
 	if errors.Is(err, ErrAuthUnavailable) {
 		return ident, fail(http.StatusServiceUnavailable, "%v", err)
 	}
 	if err != nil {
-		s.failedLogins().Allow(ip) // spend one failure
 		return ident, fail(http.StatusUnauthorized, "%v", err)
 	}
 	return ident, nil
 }
 
-func (s *Server) failedLogins() *PodLimiter {
-	s.failedOnce.Do(func() {
-		if s.FailedLogins == nil {
-			s.FailedLogins = newFailedLoginLimiter()
+func (s *Server) reviews() *PodLimiter {
+	s.reviewsOnce.Do(func() {
+		if s.ReviewsPerIP == nil {
+			s.ReviewsPerIP = newReviewLimiter()
 		}
 	})
-	return s.FailedLogins
+	return s.ReviewsPerIP
 }
 
 // checkNoAPIToken refuses workload Pods that mount the default API token.
@@ -296,12 +306,21 @@ func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 	for _, c := range tmpl.Containers {
 		tmplContainers[c.Name] = c
 	}
+	// Everything that decides what runs inside the container, including
+	// lifecycle hooks and probes: an exec hook or probe runs in the agent
+	// container and can read its token and state (reviewer #6).
 	same := func(p corev1.Container) bool {
 		t, ok := tmplContainers[p.Name]
 		return ok && p.Image == t.Image && equality.Semantic.DeepEqual(p.Command, t.Command) &&
 			equality.Semantic.DeepEqual(p.Args, t.Args) && equality.Semantic.DeepEqual(p.Env, t.Env) &&
 			equality.Semantic.DeepEqual(p.EnvFrom, t.EnvFrom) && equality.Semantic.DeepEqual(p.VolumeMounts, t.VolumeMounts) &&
-			equality.Semantic.DeepEqual(p.SecurityContext, t.SecurityContext)
+			equality.Semantic.DeepEqual(p.SecurityContext, t.SecurityContext) &&
+			equality.Semantic.DeepEqual(p.Lifecycle, t.Lifecycle) &&
+			equality.Semantic.DeepEqual(p.LivenessProbe, t.LivenessProbe) &&
+			equality.Semantic.DeepEqual(p.ReadinessProbe, t.ReadinessProbe) &&
+			equality.Semantic.DeepEqual(p.StartupProbe, t.StartupProbe) &&
+			equality.Semantic.DeepEqual(p.VolumeDevices, t.VolumeDevices) &&
+			p.WorkingDir == t.WorkingDir && p.Stdin == t.Stdin && p.StdinOnce == t.StdinOnce && p.TTY == t.TTY
 	}
 	// Every template volume is private to the template's containers except
 	// ConfigMaps: besides the token, the state volume holds the engine's
@@ -719,8 +738,9 @@ func (s *Server) checkNoPendingRescue(ctx context.Context, c *caller) error {
 // eviction gives no grace period) keeps its ephemeral claim until it is
 // deleted. Its data is newer than lastSnapshot. The broker asks for a
 // snapshot of exactly that volume and makes restores wait for it. A
-// failed rescue does not block forever: as with a Released PV whose rescue
-// failed, the operator is alerted (status.lastError) and restores go on.
+// failed rescue does not block forever: the failed request stays, the
+// WsnapRescueRequestFailed alert fires (wsnap_rescue_requests_failed), and
+// restores go on.
 func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Identity, pv *corev1.PersistentVolume) error {
 	writer := pv.Annotations[workspace.AnnotationWriterPod]
 	if writer == "" {
@@ -730,10 +750,21 @@ func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Iden
 	if err := s.Reader.List(ctx, &pods, client.InNamespace(id.Namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: id.Name}); err != nil {
 		return upstream(err, "list workspace pods")
 	}
-	for _, p := range pods.Items {
-		if string(p.UID) == writer && p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+	stuck := false
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if string(p.UID) != writer {
+			continue
+		}
+		if stillWriting(p, time.Now()) {
 			return nil // still running: the single-writer rule applies
 		}
+		// Terminating far past its deadline (a lost node): its volume is
+		// probably unreachable, so waiting for the rescue could take hours.
+		// Ask for it anyway, but let the restore go on. When the node
+		// comes back, the rescue lands in status.supersededSnapshots
+		// (pinned), and the WsnapSupersededSnapshots alert fires.
+		stuck = p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed
 	}
 	h := sha256.Sum256([]byte(pv.Name + "\x00" + writer))
 	name := "wsnap-unsaved-" + hex.EncodeToString(h[:])[:10]
@@ -749,7 +780,15 @@ func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Iden
 		if err := s.Client.Create(ctx, &req); err != nil && !apierrors.IsAlreadyExists(err) {
 			return upstream(err, "create rescue request")
 		}
+		if stuck {
+			s.Log.Info("restoring while a lost writer's volume holds unsaved data; its rescue will be kept as superseded",
+				"workspace", id.Name, "pv", pv.Name, "request", name)
+			return nil
+		}
 		return fail(http.StatusConflict, "volume %s of stopped pod holds unsaved data; saving it first (request %s)", pv.Name, name)
+	}
+	if stuck {
+		return nil
 	}
 	if err != nil {
 		return upstream(err, "rescue request %s", name)

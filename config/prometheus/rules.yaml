@@ -20,6 +20,28 @@ spec:
           {{ $value }} PV(s) carry wsnap.dev/rescue=failed. wsnap keeps them
           (reclaim policy Retain). Read the mover Pod's log, fix the cause,
           then remove the annotation to retry. See docs/operations.md.
+    - alert: WsnapRescueRequestFailed
+      expr: max(wsnap_rescue_requests_failed) > 0
+      for: 5m
+      labels: {severity: critical}
+      annotations:
+        summary: A stopped writer's volume could not be saved.
+        description: >-
+          A wsnap-unsaved-* WorkspaceSnapshot failed. The volume may hold data
+          that is in no snapshot, and the workspace went on from older history.
+          Run: kubectl get wssnap -A -l app.kubernetes.io/managed-by=wsnap.
+          Fix the cause, save the volume by hand if needed, then delete the request.
+    - alert: WsnapSupersededSnapshots
+      expr: max(wsnap_workspaces_with_superseded_snapshots) > 0
+      for: 5m
+      labels: {severity: warning}
+      annotations:
+        summary: An older writer's data was saved after newer history.
+        description: >-
+          A rescue (for example of a Pod on a lost node) finished after a newer
+          Pod had written the workspace. Its snapshot is kept in
+          status.supersededSnapshots and is not what restores use. Merge it by
+          hand if needed, then remove the entry.
     - alert: WsnapRescueStuck
       expr: max(wsnap_volumes_rescue{phase="running"}) > 0
       for: 3h

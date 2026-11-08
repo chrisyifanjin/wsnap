@@ -29,14 +29,6 @@ type bucket struct {
 	seen time.Time
 }
 
-// Blocked reports whether key has no tokens left, without spending one.
-func (p *PodLimiter) Blocked(key string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	b, ok := p.buckets[key]
-	return ok && b.l.Tokens() < 1
-}
-
 // Allow reports whether the Pod may make another request now.
 func (p *PodLimiter) Allow(podUID string) bool {
 	p.mu.Lock()
@@ -63,11 +55,14 @@ func (p *PodLimiter) Allow(podUID string) bool {
 	return b.l.Allow()
 }
 
-// newFailedLoginLimiter bounds failed logins per client IP: after a burst
-// of rejected tokens, a client waits before the broker sends its tokens to
-// the API server again. A real agent's token almost never fails.
-func newFailedLoginLimiter() *PodLimiter {
-	return &PodLimiter{Rate: rate.Every(10 * time.Second), Burst: 10}
+// newReviewLimiter bounds TokenReviews per client IP. Only tokens the
+// broker has not validated recently count: a known valid token is never
+// limited, so a workload that floods the broker with bad tokens cannot lock
+// out its sidecar's current token, and slows down at most its own Pod's
+// next token renewal (agents retry 429). One review per second is far more
+// than an agent needs: its token changes every few minutes.
+func newReviewLimiter() *PodLimiter {
+	return &PodLimiter{Rate: 1, Burst: 10}
 }
 
 // clientIP is the remote address without its port.
@@ -102,6 +97,17 @@ type cachedIdentity struct {
 // failureTTL is how long a rejected token stays rejected without another
 // TokenReview.
 const failureTTL = 10 * time.Second
+
+// Known returns the cached result for token, if there is one.
+func (c *CachingAuthenticator) Known(token string) (Identity, error, bool) {
+	key := sha256.Sum256([]byte(token))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.cache[key]; ok && time.Now().Before(e.expires) {
+		return e.id, e.err, true
+	}
+	return Identity{}, nil, false
+}
 
 func (c *CachingAuthenticator) Authenticate(ctx context.Context, token string) (Identity, error) {
 	key := sha256.Sum256([]byte(token))

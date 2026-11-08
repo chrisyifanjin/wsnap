@@ -148,7 +148,10 @@ EOF
     - name: agent
       image: alpine:3.22
       imagePullPolicy: IfNotPresent
-      command: [sleep, infinity]
+      # Exit on SIGTERM, as a real workload must: a bare "sleep" as PID 1
+      # ignores it, eats the grace period, and leaves the sidecar 2 s for
+      # its final snapshot.
+      command: [sh, -c, 'trap "exit 0" TERM; sleep infinity & wait']
       volumeMounts:
       - {name: workspace, mountPath: /workspace}
     volumes:

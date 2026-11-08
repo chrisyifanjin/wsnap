@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/time/rate"
 	"net/http"
 	"strings"
 	"time"
@@ -46,9 +47,14 @@ type GatewayAuth interface {
 // ordinary service account and user tokens work) and SubjectAccessReview.
 type KubeGatewayAuth struct {
 	Client kubernetes.Interface
+	// Reviews bounds TokenReviews for gateway callers. Nil: no bound.
+	Reviews *rate.Limiter
 }
 
 func (k KubeGatewayAuth) AuthenticateUser(ctx context.Context, token string) (authnv1.UserInfo, error) {
+	if k.Reviews != nil && !k.Reviews.Allow() {
+		return authnv1.UserInfo{}, fmt.Errorf("%w: too many token reviews; try again", ErrAuthUnavailable)
+	}
 	r, err := k.Client.AuthenticationV1().TokenReviews().Create(ctx, &authnv1.TokenReview{Spec: authnv1.TokenReviewSpec{Token: token}}, metav1.CreateOptions{})
 	if err != nil {
 		return authnv1.UserInfo{}, fmt.Errorf("%w: token review: %w", ErrAuthUnavailable, err)
@@ -116,16 +122,13 @@ func (s *Server) gatewayCaller(r *http.Request, verb, ns, resource string) (auth
 	if !ok || token == "" {
 		return authnv1.UserInfo{}, fail(http.StatusUnauthorized, "missing bearer token")
 	}
-	ip := clientIP(r)
-	if s.failedLogins().Blocked(ip) {
-		return authnv1.UserInfo{}, fail(http.StatusTooManyRequests, "too many failed logins from %s", ip)
-	}
+	// Gateway callers are platforms, often behind one proxy IP; they share
+	// the global TokenReview cap, not a per-IP budget.
 	user, err := s.Gateway.AuthenticateUser(r.Context(), token)
 	if errors.Is(err, ErrAuthUnavailable) {
 		return user, fail(http.StatusServiceUnavailable, "%v", err)
 	}
 	if err != nil {
-		s.failedLogins().Allow(ip)
 		return user, fail(http.StatusUnauthorized, "%v", err)
 	}
 	if s.Limiter != nil && !s.Limiter.Allow("user/"+user.Username) {

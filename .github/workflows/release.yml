@@ -23,7 +23,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Unit tests
+      - name: Install the engine CLIs
+        run: |
+          hack/install-engines.sh "$RUNNER_TEMP/engines"
+          echo "$RUNNER_TEMP/engines" >> "$GITHUB_PATH"
+      - name: Unit tests (engine tests run with real Kopia and restic)
         run: make vet test
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
