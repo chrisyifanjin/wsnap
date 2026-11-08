@@ -7,6 +7,7 @@ package webhook
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,10 @@ type Config struct {
 	ExecutionMode string
 	// CAConfigMap names the ConfigMap with the broker's CA; empty for HTTP.
 	CAConfigMap string
+	// CABundle returns the CA of a broker that manages its own
+	// certificate. Agents get it inline in WSNAP_CA_PEM. CAConfigMap wins
+	// when both are set.
+	CABundle func() []byte
 	// AllowAPIToken admits workload containers that mount an API server
 	// token (--allow-automounted-tokens).
 	AllowAPIToken bool
@@ -124,6 +129,10 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		return fmt.Errorf("container %q is a regular container; the wsnap sidecar must be a native sidecar (an init container with restartPolicy: Always) so it restores before the workload starts", sidecarName)
 	}
 	if pod.Annotations[AnnotationInject] == "false" || existing != nil {
+		if existing != nil && !hasCA(existing) {
+			// A Pod's own sidecar cannot know a CA that the broker made.
+			existing.Env = append(existing.Env, cfg.CAEnv()...)
+		}
 		return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
 	}
 
@@ -151,6 +160,7 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		Name:          sidecarName,
 		Image:         cfg.AgentImage,
 		Args:          args,
+		Env:           cfg.CAEnv(),
 		RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
 		// The workload starts only after the volume is restored. A failed
 		// probe restarts the sidecar, which starts the restore again from
@@ -170,6 +180,31 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 	// might write to the workspace) starts.
 	pod.Spec.InitContainers = append([]corev1.Container{sidecar}, pod.Spec.InitContainers...)
 	return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
+}
+
+// CAEnv passes a self-managed broker CA to an agent.
+func (cfg Config) CAEnv() []corev1.EnvVar {
+	if cfg.CAConfigMap != "" || cfg.CABundle == nil {
+		return nil
+	}
+	if b := cfg.CABundle(); len(b) > 0 {
+		return []corev1.EnvVar{{Name: "WSNAP_CA_PEM", Value: string(b)}}
+	}
+	return nil
+}
+
+func hasCA(c *corev1.Container) bool {
+	for _, e := range c.Env {
+		if e.Name == "WSNAP_CA_PEM" || e.Name == "WSNAP_CA_FILE" {
+			return true
+		}
+	}
+	for _, a := range c.Args {
+		if strings.HasPrefix(a, "--ca-file") {
+			return true
+		}
+	}
+	return false
 }
 
 // mutateWorkerPod gates the workload on a separate worker's restore. The

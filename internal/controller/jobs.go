@@ -33,6 +33,9 @@ type JobConfig struct {
 	// that holds the CA of the broker's TLS certificate. Empty for a plain
 	// HTTP broker. trust-manager can keep it in sync across namespaces.
 	CAConfigMap string
+	// CABundle returns the CA of a broker that manages its own
+	// certificate; Jobs get it in WSNAP_CA_PEM.
+	CABundle func() []byte
 }
 
 const (
@@ -109,6 +112,7 @@ func (c JobConfig) newAgentJob(kind string, name string, ws *wsnapv1.Workspace, 
 						Name:            wsnapv1.DefaultSidecarName,
 						Image:           image,
 						Args:            append(args, "--broker-url="+c.BrokerURL, "--token-file="+tokenMountPath+"/token", "--state-dir="+stateMountPath),
+						Env:             webhook.Config{CAConfigMap: c.CAConfigMap, CABundle: c.CABundle}.CAEnv(),
 						VolumeMounts:    mounts,
 						SecurityContext: webhook.AgentSecurityContext(),
 					}},

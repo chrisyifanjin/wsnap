@@ -41,8 +41,10 @@ import (
 
 func main() {
 	var (
-		brokerAddr  = flag.String("broker-addr", ":8080", "broker listen address")
-		brokerURL   = flag.String("broker-url", "http://wsnap-broker.wsnap-system.svc:8080", "broker URL that agents use")
+		brokerAddr  = flag.String("broker-addr", ":8443", "broker listen address (TLS unless --broker-manage-certs=false and no --tls-cert-file)")
+		plainAddr   = flag.String("broker-plain-addr", "", "also serve plain HTTP here, for agents started before an upgrade to TLS (for example :8080)")
+		brokerURL   = flag.String("broker-url", "https://wsnap-broker.wsnap-system.svc:8443", "broker URL that agents use")
+		brokerCerts = flag.Bool("broker-manage-certs", true, "without --tls-cert-file, generate the broker certificate into a shared Secret and give agents its CA")
 		audience    = flag.String("audience", "wsnap", "audience of agent service account tokens")
 		agentImage  = flag.String("agent-image", "ghcr.io/chrisyifanjin/wsnap-agent:dev", "default agent image for Jobs")
 		metricsAddr = flag.String("metrics-addr", ":8081", "metrics listen address")
@@ -98,6 +100,15 @@ func main() {
 		}
 		return
 	}
+	// The broker's own certificate, unless the operator brings one.
+	var brokerTLS *broker.ManagedCerts
+	if *tlsCert == "" && *brokerCerts {
+		c, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		must(err)
+		brokerTLS = &broker.ManagedCerts{Client: c, Namespace: *namespace, SecretName: "wsnap-broker-cert",
+			DNSNames: []string{"wsnap-broker." + *namespace + ".svc", "wsnap-broker." + *namespace + ".svc.cluster.local"}}
+		must(brokerTLS.Ensure(context.Background()))
+	}
 	if *manageCerts {
 		// Before the manager starts: the webhook server needs its
 		// certificate on disk when it begins listening.
@@ -132,10 +143,14 @@ func main() {
 	})
 	must(err)
 
-	jobs := controller.JobConfig{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA}
+	var caBundle func() []byte
+	if brokerTLS != nil {
+		caBundle = brokerTLS.CABundle
+	}
+	jobs := controller.JobConfig{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA, CABundle: caBundle}
 	reader := mgr.GetAPIReader()
 	mgr.GetWebhookServer().Register("/mutate-pods", &admission.Webhook{Handler: &webhook.Handler{
-		Config:  webhook.Config{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA, AllowAPIToken: *allowAPITok},
+		Config:  webhook.Config{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA, CABundle: caBundle, AllowAPIToken: *allowAPITok},
 		Reader:  reader,
 		Decoder: admission.NewDecoder(scheme),
 	}})
@@ -202,8 +217,29 @@ func main() {
 			must(err)
 		}
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: reloader.GetCertificate}
+	} else if brokerTLS != nil {
+		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: brokerTLS.GetCertificate}
+		// Load a certificate that another replica renewed.
+		must(mgr.Add(allReplicas(func(ctx context.Context) error {
+			t := time.NewTicker(time.Hour)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-t.C:
+					if err := brokerTLS.Ensure(ctx); err != nil {
+						log.Error(err, "broker certificate check failed; retrying in 1h")
+					}
+				}
+			}
+		})))
 	} else {
-		log.Info("broker serves plain HTTP; credentials cross the Pod network unencrypted (set --tls-cert-file)")
+		log.Info("broker serves plain HTTP; credentials cross the Pod network unencrypted (set --tls-cert-file or --broker-manage-certs)")
+	}
+	if *plainAddr != "" {
+		log.Info("broker also serves plain HTTP for agents started before TLS; remove --broker-plain-addr when they are gone", "addr", *plainAddr)
+		must(mgr.Add(brokerRunnable{addr: *plainAddr, handler: srv.Handler()}))
 	}
 	// The broker serves on every replica; it does not need the leader lock.
 	// Health gauges for alerts (config/prometheus), read from the cache.

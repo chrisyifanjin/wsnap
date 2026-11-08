@@ -95,7 +95,8 @@ restored state is in a new snapshot.
 
 ## Broker HTTP API
 
-The broker listens on `:8080` (`wsnap-broker.wsnap-system.svc`).
+The broker serves HTTPS on `:8443` (`wsnap-broker.wsnap-system.svc`). See
+[security.md](security.md#transport) for its certificate.
 
 ### Agent endpoints
 
@@ -132,8 +133,9 @@ timeout (at most 50 s) with the current phase.
 
 ```sh
 TOKEN=$(kubectl -n team-a create token platform)
-curl -X POST -H "Authorization: Bearer $TOKEN" -d '{"wait":true}' \
-  http://wsnap-broker.wsnap-system.svc:8080/v1/namespaces/team-a/workspaces/user-42/snapshots
+kubectl -n wsnap-system get secret wsnap-broker-cert -o jsonpath='{.data.ca\.crt}' | base64 -d > broker-ca.crt
+curl --cacert broker-ca.crt -X POST -H "Authorization: Bearer $TOKEN" -d '{"wait":true}' \
+  https://wsnap-broker.wsnap-system.svc:8443/v1/namespaces/team-a/workspaces/user-42/snapshots
 ```
 
 ## Exec engine contract

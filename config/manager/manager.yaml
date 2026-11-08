@@ -39,12 +39,18 @@ spec:
         image: wsnap-controller:dev
         imagePullPolicy: IfNotPresent
         args:
-        - --broker-addr=:8080
-        - --broker-url=http://wsnap-broker.wsnap-system.svc:8080
+        # TLS with a certificate the controller generates into the Secret
+        # wsnap-broker-cert. To upgrade from a plain-HTTP install, also add
+        # --broker-plain-addr=:8080 until every Pod started before the
+        # upgrade is gone.
+        - --broker-addr=:8443
+        - --broker-url=https://wsnap-broker.wsnap-system.svc:8443
         - --agent-image=wsnap-agent:dev
         - --leader-elect
         ports:
         - name: broker
+          containerPort: 8443
+        - name: broker-plain
           containerPort: 8080
         - name: webhook
           containerPort: 9443
@@ -104,8 +110,12 @@ spec:
     app.kubernetes.io/name: wsnap-controller
   ports:
   - name: broker
-    port: 8080
+    port: 8443
     targetPort: broker
+  # Serves only with --broker-plain-addr=:8080 (upgrades from plain HTTP).
+  - name: broker-plain
+    port: 8080
+    targetPort: broker-plain
 ---
 apiVersion: v1
 kind: Service

@@ -155,16 +155,21 @@ credentials there open only the attacker's own workspace.
 
 ## Transport
 
-The broker serves plain HTTP unless you set `--tls-cert-file` and
-`--tls-key-file`. Without TLS, credentials cross the Pod network
-unencrypted. **With untrusted workloads, TLS is required, not optional:**
-the workload shares the sidecar's network namespace, and container runtimes
-grant `CAP_NET_RAW` by default, so over plain HTTP the workload can capture
-the sidecar's token and the credential in the broker's answer. Either serve
-the broker over TLS, or drop `NET_RAW` from workload containers (Pod
-Security `restricted` does). With TLS, give agents the CA with `--ca-file`. Give Jobs the
-CA with `--agent-ca-configmap`. The broker reloads a rotated certificate
-from disk.
+The broker serves TLS by default. Without `--tls-cert-file`, the
+controller creates a CA and a serving certificate for
+`wsnap-broker.wsnap-system.svc` in the Secret `wsnap-broker-cert`. The
+webhook and the Job template give agents the CA in `WSNAP_CA_PEM`; a Pod's
+own sidecar gets it too unless it sets `--ca-file`. Agents read the CA
+once, at start. So the CA lives 10 years and only the serving certificate
+is renewed (yearly, 30 days before it expires), signed by the same CA.
+
+To use your own certificate (cert-manager), set `--tls-cert-file` and
+`--tls-key-file`, and give agents the CA with `--agent-ca-configmap`. The
+broker reloads a rotated certificate from disk.
+
+Plain HTTP is served only with `--broker-plain-addr` (for an upgrade) or
+with `--broker-manage-certs=false` and no certificate. Then credentials
+cross the Pod network unencrypted.
 
 ## Gateway API
 

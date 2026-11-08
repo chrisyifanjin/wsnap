@@ -249,3 +249,51 @@ func TestAdmissionPluginTokenIsRemoved(t *testing.T) {
 		t.Fatal("the isolation check accepted a workload that mounts an API token")
 	}
 }
+
+func TestManagedBrokerCAIsInjected(t *testing.T) {
+	ca := func() []byte { return []byte("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n") }
+	c := cfg
+	c.CABundle = ca
+	p := labeledPod()
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	env := p.Spec.InitContainers[0].Env
+	if len(env) != 1 || env[0].Name != "WSNAP_CA_PEM" || env[0].Value != string(ca()) {
+		t.Fatalf("sidecar env = %+v; want the broker CA in WSNAP_CA_PEM", env)
+	}
+	c.CAConfigMap = "wsnap-ca" // an operator-provided CA wins
+	p = labeledPod()
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	if env := p.Spec.InitContainers[0].Env; len(env) != 0 {
+		t.Fatalf("both a ConfigMap CA and an inline CA: %+v", env)
+	}
+}
+
+func TestOwnSidecarGetsTheManagedCA(t *testing.T) {
+	c := cfg
+	c.CABundle = func() []byte { return []byte("ca") }
+	own := func(args ...string) *corev1.Pod {
+		return labeledPod(func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "wsnap", Image: "agent:1", Args: args,
+				RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+				StartupProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"ready"}}}}}}
+		})
+	}
+	p := own("sidecar")
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	if env := p.Spec.InitContainers[0].Env; len(env) != 1 || env[0].Value != "ca" {
+		t.Fatalf("own sidecar env = %+v", env)
+	}
+	p = own("sidecar", "--ca-file=/x/ca.crt")
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	if env := p.Spec.InitContainers[0].Env; len(env) != 0 {
+		t.Fatalf("a sidecar with its own CA got another: %+v", env)
+	}
+}
