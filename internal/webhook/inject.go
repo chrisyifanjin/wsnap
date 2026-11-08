@@ -246,18 +246,19 @@ func mutateWorkerPod(pod *corev1.Pod, cfg Config) error {
 	if findContainer(pod.Spec.Containers, gateName) != nil {
 		return fmt.Errorf("container name %q is reserved for the worker readiness gate", gateName)
 	}
-	if findContainer(pod.Spec.InitContainers, gateName) == nil {
-		gate := corev1.Container{
-			Name:  gateName,
-			Image: cfg.AgentImage,
-			Args:  []string{"wait-worker", "--dir=" + dataPath, "--pod-uid=$(WSNAP_POD_UID)"},
-			Env: []corev1.EnvVar{{Name: "WSNAP_POD_UID", ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}}},
-			VolumeMounts:    []corev1.VolumeMount{{Name: volName, MountPath: dataPath, ReadOnly: true}},
-			SecurityContext: AgentSecurityContext(),
-		}
-		pod.Spec.InitContainers = append([]corev1.Container{gate}, pod.Spec.InitContainers...)
+	// Always wsnap's own gate, first: a gate the Pod brings could let the
+	// workload start before the worker restored the volume.
+	pod.Spec.InitContainers = slices.DeleteFunc(pod.Spec.InitContainers, func(c corev1.Container) bool { return c.Name == gateName })
+	gate := corev1.Container{
+		Name:  gateName,
+		Image: cfg.AgentImage,
+		Args:  []string{"wait-worker", "--dir=" + dataPath, "--pod-uid=$(WSNAP_POD_UID)"},
+		Env: []corev1.EnvVar{{Name: "WSNAP_POD_UID", ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}}},
+		VolumeMounts:    []corev1.VolumeMount{{Name: volName, MountPath: dataPath, ReadOnly: true}},
+		SecurityContext: AgentSecurityContext(),
 	}
+	pod.Spec.InitContainers = append([]corev1.Container{gate}, pod.Spec.InitContainers...)
 	return workspace.CheckWorkerIsolation(pod, cfg.Audience, cfg.AllowAPIToken)
 }
 
