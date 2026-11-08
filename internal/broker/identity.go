@@ -24,7 +24,7 @@ import (
 type caller struct {
 	pod *corev1.Pod
 	id  workspace.Identity
-	// job is "" for workload Pods, or the Job kind: "mover" or "maintenance".
+	// job is "" for workload Pods, or the Job kind (wsnapv1.JobMover, ...).
 	job    string
 	jobObj *batchv1.Job
 	// workloadPod is the Pod a separate worker Job serves. It is nil after
@@ -186,11 +186,11 @@ func (s *Server) resolveJob(ctx context.Context, c *caller, job string) (*caller
 			return nil, fail(http.StatusForbidden, "job %s no longer matches its registered volume identity", j.Name)
 		}
 		switch job {
-		case "mover", "restorer":
+		case wsnapv1.JobMover, wsnapv1.JobRestorer:
 			if err := s.checkJobVolume(ctx, c, ref); err != nil {
 				return nil, err
 			}
-		case "worker":
+		case wsnapv1.JobWorker:
 			if err := s.resolveWorkerTarget(ctx, c, ref); err != nil {
 				return nil, err
 			}
@@ -386,20 +386,20 @@ func workloadStarted(pod *corev1.Pod) bool {
 
 func (c *caller) allowed(role protocol.Role) error {
 	switch c.job {
-	case "mover":
+	case wsnapv1.JobMover:
 		if role == protocol.RoleMover {
 			return nil
 		}
-	case "maintenance":
+	case wsnapv1.JobMaintenance:
 		if role == protocol.RoleMaintenance {
 			return nil
 		}
-	case "restorer":
+	case wsnapv1.JobRestorer:
 		// Reads the snapshot, then snapshots the restored volume.
 		if role == protocol.RoleRestore || role == protocol.RoleMover {
 			return nil
 		}
-	case "worker":
+	case wsnapv1.JobWorker:
 		if role == protocol.RoleSnapshot {
 			return nil
 		}

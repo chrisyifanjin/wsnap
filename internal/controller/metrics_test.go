@@ -25,7 +25,7 @@ func TestStateCollector(t *testing.T) {
 		return &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: name,
 			Labels: map[string]string{wsnapv1.LabelProtected: "true"}, Annotations: map[string]string{wsnapv1.AnnotationRescue: phase}}}
 	}
-	_, c := newPVReconciler(t, failing, ok, failedRescue, pv("a", RescueFailed), pv("b", RescueRunning), pv("c", RescueDone))
+	_, c := newPVReconciler(t, failing, ok, failedRescue, pv("a", wsnapv1.RescueFailed), pv("b", wsnapv1.RescueRunning), pv("c", wsnapv1.RescueDone))
 	want := `
 # HELP wsnap_rescue_requests_failed Failed snapshot requests for a stopped writer's volume (wsnap-unsaved-*): its data may be in no snapshot. Stays until the request is deleted.
 # TYPE wsnap_rescue_requests_failed gauge
