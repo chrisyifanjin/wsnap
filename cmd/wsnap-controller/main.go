@@ -114,6 +114,12 @@ func main() {
 		HealthProbeBindAddress: *probeAddr,
 		LeaderElection:         *leaderElect,
 		LeaderElectionID:       "wsnap-controller.wsnap.dev",
+		// Hand the lease over on shutdown instead of letting it expire: a
+		// rollout that changes flags (such as the broker URL) must not
+		// leave the old leader creating Jobs with the old configuration
+		// while the new Pods wait. The process exits when the manager
+		// stops, so no leader work runs after the release.
+		LeaderElectionReleaseOnCancel: true,
 		// Cache only what wsnap owns or labels. Secrets are never cached;
 		// the broker reads them live.
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{

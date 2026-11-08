@@ -628,6 +628,16 @@ broker_tls() { # on|off
 				"volumeMounts":[{"mountPath":"/tls","$patch":"delete"}]}]}}}}' >/dev/null
 	fi
 	kubectl -n wsnap-system rollout status deploy/wsnap-controller --timeout=180s >/dev/null
+	# An old leader can still hold the lease after the rollout and create
+	# Jobs with the old broker URL. Wait for a leader with the new flags.
+	local url=http://; [[ $1 == on ]] && url=https://
+	wait_for 120 "leader with broker URL $url" leader_uses "--broker-url=$url"
+}
+
+leader_uses() {
+	local leader; leader=$(leader_pod)
+	[[ -n $leader ]] && kubectl -n wsnap-system get pod "$leader" -o jsonpath='{.metadata.deletionTimestamp} {.spec.containers[0].args}' |
+		grep -q "^ .*$1"
 }
 
 scenario_tls() {
