@@ -99,8 +99,10 @@ multi-node scenario: `kind create cluster --name wsnap --config test/e2e/kind-mu
 | `tls` | The broker over HTTPS: sidecars and Jobs verify its CA; an untrusted CA and plain HTTP are refused. |
 | `multinode` | Restore on another node, a mover that follows a node-local PV, a drain that takes a final snapshot. |
 | `worker` | Worker mode: the workload Pod gets only a gate; a worker on its node serves a live request, takes the final snapshot with the last write after the workload stops, and restores a new workload on a new PVC. A `ReadWriteOncePod` claim is refused. |
+| `runtimes` | Installs a pinned, checksum-verified gVisor release on every node and a `gvisor` RuntimeClass. Sidecar mode with the workload and the sidecar inside one gVisor sandbox: request snapshot, final snapshot, cold restore. Worker mode with a gVisor workload and a default-runtime worker sharing the PVC: live snapshot, final snapshot with the last write, restore. Each Pod's kernel is checked to be gVisor. |
+| `kata` | Installs Kata Containers 4.2.0 (Rust runtime, QEMU; checksum verified) on one node with a `kata` RuntimeClass, and runs the same checks as `runtimes`: sidecar mode inside the microVM, and a default-runtime worker beside a Kata workload sharing the PVC over virtio-fs. Each Pod is checked to run its own guest kernel. Needs KVM; CI loads `vhost_vsock` before creating the cluster and enlarges the Kata node's `/dev/shm` (Kata keeps guest RAM there; Docker's default is 64 MiB). |
 
-The scenarios form four groups that share no state:
+The scenarios form six groups that share no state:
 
 | Group | Scenarios |
 |---|---|
@@ -108,8 +110,10 @@ The scenarios form four groups that share no state:
 | `volumes` | `pvc`, `ephemeral`, `sandbox`, `emptydir`, `singlewriter`, `requests` |
 | `failures` | `chaos` |
 | `worker` | `worker` |
+| `runtimes` | `runtimes` |
+| `kata` | `kata` |
 
-`test/e2e/run.sh` with no arguments runs `setup` and then all four groups
+`test/e2e/run.sh` with no arguments runs `setup` and then all six groups
 on one cluster. `test/e2e/run.sh setup volumes` runs one group. CI runs
 each group on its own cluster at the same time. When a run fails, the
 script prints the Pods, volumes, wsnap objects, events and logs, and CI

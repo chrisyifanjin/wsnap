@@ -16,6 +16,8 @@
 #   webhook    sidecar injection into bare Pods and Sandboxes; unsafe Pods refused; fail closed while down
 #   gateway    REST gateway API gated by RBAC; data-plane request through the agent-sandbox router and sandboxd
 #   worker     worker mode: live snapshots from a separate Pod on the same node and PVC; RWOP claims refused
+#   runtimes   gVisor (runsc) workload Pods: sidecar mode inside the sandbox, worker mode beside it
+#   kata       Kata Containers workload Pods (needs /dev/kvm; skipped without it): the same checks as runtimes
 #
 # The harness writes files through "kubectl exec" only to play the agent;
 # wsnap itself never uses exec.
@@ -109,11 +111,19 @@ crash_sidecar() {
 	node=$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.nodeName}')
 	docker exec "$node" crictl stop --timeout 0 "${id#containerd://}" >/dev/null
 }
+# crash_pod kills a Pod the way a node failure would: no graceful stop,
+# no final snapshot. The kubelet is stopped meanwhile, so it can neither
+# recreate the sandbox (it once did, and the restarted sidecar took a
+# normal final snapshot) nor start a graceful stop that races the kill.
 crash_pod() {
-	local node
+	local node sandbox
 	node=$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.nodeName}')
-	docker exec "$node" sh -c "crictl stopp \$(crictl pods --name '^$1\$' --namespace $NS -q)" >/dev/null
-	kubectl -n "$NS" delete pod "$1" --wait=true >/dev/null
+	sandbox=$(docker exec "$node" crictl pods --name "^$1\$" --namespace "$NS" -q)
+	docker exec "$node" systemctl stop kubelet
+	docker exec "$node" crictl stopp "$sandbox" >/dev/null
+	kubectl -n "$NS" delete pod "$1" --grace-period=0 --force >/dev/null 2>&1
+	docker exec "$node" systemctl start kubelet
+	wait_for 120 "$1 gone after the crash" pod_gone "$1"
 }
 pod_gone() { not_found -n "$NS" pod "$1"; }
 result_has() { kubectl -n "$NS" exec "$1" -c agent -- grep -q "$3" "/workspace/.wsnap/results/$2.json" 2>/dev/null; }
@@ -213,6 +223,9 @@ EOF
 		pod_spec "$3" "$4" "$5" | sed 's/^  //'
 		if [[ -n ${NODE_SELECTOR:-} ]]; then
 			printf '  nodeSelector: {kubernetes.io/hostname: %s}\n' "$NODE_SELECTOR"
+		fi
+		if [[ -n ${RUNTIME_CLASS:-} ]]; then
+			printf '  runtimeClassName: %s\n' "$RUNTIME_CLASS"
 		fi
 	} | kubectl apply -f -
 }
@@ -971,6 +984,8 @@ group() {
 	volumes) echo pvc ephemeral sandbox emptydir singlewriter requests ;;
 	failures) echo chaos ;;
 	worker) echo worker ;;
+	runtimes) echo runtimes ;;
+	kata) echo kata ;;
 	esac
 }
 
@@ -995,6 +1010,12 @@ diagnose() {
 		echo "--- $p (wsnap)"
 		kubectl -n "$NS" logs "$p" -c wsnap --tail=30 2>/dev/null
 	done
+	local kn
+	for kn in $(kubectl get nodes -l wsnap-e2e/kata=true -o name 2>/dev/null); do
+		echo "--- Kata journal on ${kn#node/}"
+		docker exec "${kn#node/}" journalctl -u containerd --no-pager 2>/dev/null |
+			grep -iE 'kata|qemu|vsock|virtiofs|guest|vmm|panic|error' | tail -150
+	done
 }
 
 worker_pod() { # name workspace claim
@@ -1006,6 +1027,7 @@ metadata:
   namespace: $NS
   labels: {wsnap.dev/workspace: $2, wsnap.dev/repository: restic-s3}
 spec:
+  ${RUNTIME_CLASS:+runtimeClassName: $RUNTIME_CLASS}
   containers:
   - name: agent
     image: alpine:3.22
@@ -1072,9 +1094,229 @@ EOF
 	kubectl -n "$NS" delete pvc wk-a wk-b wk-rwop --wait=false >/dev/null
 }
 
+# gVisor: a pinned release, checked against its published SHA-512.
+GVISOR_RELEASE=${GVISOR_RELEASE:-20261019}
+GVISOR_SHA512_x86_64=7cbc2aeeee809dcccfb40e612504a1b76f2c119790cee59e482f7b35428cccc4f71705e7e322442d07d1f7d29b5d9e72e31319fc3088d6dcbec9fc7c1f0d8881
+
+# install_gvisor adds the runsc runtime to every kind node and registers
+# the RuntimeClass "gvisor". Idempotent.
+install_gvisor() {
+	if kubectl get runtimeclass gvisor >/dev/null 2>&1; then
+		return
+	fi
+	local nodes arch dir want sum
+	nodes=$(kind get nodes --name "$CLUSTER")
+	arch=$(docker exec "$(echo "$nodes" | head -1)" uname -m)
+	[[ $arch == x86_64 ]] || die "the gVisor checksum is pinned for x86_64 only, not $arch"
+	dir=$(mktemp -d)
+	curl -fsSLo "$dir/gvisor.tar.bz2" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_RELEASE/$arch/gvisor.tar.bz2"
+	want=$GVISOR_SHA512_x86_64
+	sum=$( (sha512sum "$dir/gvisor.tar.bz2" 2>/dev/null || shasum -a 512 "$dir/gvisor.tar.bz2") | cut -d' ' -f1)
+	[[ $sum == "$want" ]] || die "gVisor $GVISOR_RELEASE checksum mismatch"
+	tar -xjf "$dir/gvisor.tar.bz2" -C "$dir"
+	for node in $nodes; do
+		docker cp "$dir/runsc" "$node:/usr/local/bin/runsc"
+		docker cp "$dir/containerd-shim-runsc-v1" "$node:/usr/local/bin/containerd-shim-runsc-v1"
+		docker cp "$dir/gvisor-bin" "$node:/usr/local/bin/"
+		# containerd 2 (config version 3) and 1.x name the CRI plugin differently.
+		docker exec "$node" sh -c '
+			set -e
+			if grep -q "^version = 3" /etc/containerd/config.toml; then
+				plugin="plugins.\"io.containerd.cri.v1.runtime\""
+			else
+				plugin="plugins.\"io.containerd.grpc.v1.cri\""
+			fi
+			printf "\n[%s.containerd.runtimes.runsc]\n  runtime_type = \"io.containerd.runsc.v1\"\n" "$plugin" >> /etc/containerd/config.toml
+			systemctl restart containerd'
+	done
+	rm -rf "$dir"
+	kubectl apply -f - >/dev/null <<EOF
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: gvisor}
+handler: runsc
+EOF
+	kubectl wait --for=condition=Ready nodes --all --timeout=180s >/dev/null
+}
+
+# in_gvisor checks, from inside a Pod's container, that its kernel is the
+# gVisor Sentry, so a test cannot pass on runc by accident.
+in_gvisor() { kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>/dev/null | grep -q gVisor; }
+
+# in_kata checks that a Pod runs its own kernel (the Kata guest), not the
+# node's: under runc or gVisor uname -r would match the node, or say gVisor.
+in_kata() {
+	local node pod_kernel node_kernel
+	node=$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.nodeName}') || return 1
+	pod_kernel=$(kubectl -n "$NS" exec "$1" -c agent -- uname -r 2>/dev/null) || return 1
+	node_kernel=$(docker exec "$node" uname -r) || return 1
+	[[ -n $pod_kernel && $pod_kernel != "$node_kernel" ]] && ! in_gvisor "$1"
+}
+
+runtime_evidence() {
+	printf 'runtimeClassName=%q; uname -r: %s; dmesg: %s' "$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.spec.runtimeClassName}')" \
+		"$(kubectl -n "$NS" exec "$1" -c agent -- uname -r 2>&1)" \
+		"$(kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>&1 | head -3 | tr '\n' '|')"
+}
+
+# check_runtime_modes runs wsnap in both execution modes with workload Pods
+# of one RuntimeClass. The sidecar shares the workload's sandbox; the
+# worker uses the node's default runtime and shares the PVC through the
+# host mount. check is a function that proves a Pod runs in that runtime.
+check_runtime_modes() { # runtimeClass name-prefix label check
+	local rc=$1 p=$2 label=$3 check=$4 job
+	kubectl -n "$NS" delete pod "$p-1" "$p-2" "${p}w-1" "${p}w-2" --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc "$p-a" "$p-b" "${p}w-a" "${p}w-b" --ignore-not-found --wait=true >/dev/null
+
+	fresh_workspace "ws-$p"
+	apply_pvc "$p-a" >/dev/null
+	RUNTIME_CLASS=$rc apply_pod "$p-1" "ws-$p" kopia-s3 "pvc:$p-a" yes >/dev/null
+	wait_for 300 "$p-1 ready" pod_ready "$p-1"
+	for _ in 1 2 3 4 5; do "$check" "$p-1" && break; sleep 2; done
+	"$check" "$p-1" || die "$p-1 does not run in $label: $(runtime_evidence "$p-1")"
+	write_file "$p-1" /workspace/kernel.txt "written-in-$rc"
+	kubectl -n "$NS" exec "$p-1" -c agent -- touch "/workspace/.wsnap/requests/in-$rc"
+	wait_for 90 "snapshot inside $label" result_has "$p-1" "in-$rc" snapshotID
+	kubectl -n "$NS" delete pod "$p-1" --wait=true >/dev/null
+	[[ $(ws_field "ws-$p" .status.lastSnapshot.final) == true ]] || die "no final snapshot from the sidecar in $label"
+	apply_pvc "$p-b" >/dev/null
+	RUNTIME_CLASS=$rc apply_pod "$p-2" "ws-$p" kopia-s3 "pvc:$p-b" yes >/dev/null
+	wait_for 300 "$p-2 ready" pod_ready "$p-2"
+	[[ $(read_file "$p-2" /workspace/kernel.txt) == "written-in-$rc" ]] || die "restore into a $label Pod lost data"
+	pass "sidecar mode in $label: snapshot on request, final snapshot, cold restore into a new $label Pod"
+	kubectl -n "$NS" delete pod "$p-2" --wait=true >/dev/null
+
+	fresh_workspace "ws-${p}w"
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: Workspace\nmetadata: {name: ws-%sw, namespace: %s}\nspec: {repositoryName: restic-s3, execution: {mode: worker}}\n' "$p" "$NS" | kubectl apply -f - >/dev/null
+	apply_pvc "${p}w-a" >/dev/null
+	RUNTIME_CLASS=$rc worker_pod "${p}w-1" "ws-${p}w" "${p}w-a" >/dev/null
+	wait_for 300 "${p}w-1 ready" pod_ready "${p}w-1"
+	for _ in 1 2 3 4 5; do "$check" "${p}w-1" && break; sleep 2; done
+	"$check" "${p}w-1" || die "${p}w-1 does not run in $label: $(runtime_evidence "${p}w-1")"
+	write_file "${p}w-1" /workspace/kernel.txt "written-in-$rc-worker-mode"
+	apply_request wssnap "${p}w-live" "ws-${p}w" >/dev/null
+	wait_for 120 "worker snapshot of a $label workload" req_is wssnap "${p}w-live" Succeeded
+	[[ $(req_field wssnap "${p}w-live" .status.executor) == worker ]] || die "live request not served by the worker"
+	write_file "${p}w-1" /workspace/kernel.txt "last-write-in-$rc"
+	job=$(worker_job_of "ws-${p}w")
+	kubectl -n "$NS" delete pod "${p}w-1" --wait=true >/dev/null
+	wait_for 180 "worker Job finished" job_succeeded_or_gone "$job"
+	[[ $(ws_field "ws-${p}w" .status.lastSnapshot.final) == true ]] || die "no final snapshot by the worker"
+	apply_pvc "${p}w-b" >/dev/null
+	RUNTIME_CLASS=$rc worker_pod "${p}w-2" "ws-${p}w" "${p}w-b" >/dev/null
+	wait_for 300 "${p}w-2 ready" pod_ready "${p}w-2"
+	[[ $(read_file "${p}w-2" /workspace/kernel.txt) == "last-write-in-$rc" ]] ||
+		die "worker restore into a $label Pod returned $(read_file "${p}w-2" /workspace/kernel.txt)"
+	pass "worker mode beside $label: live snapshot, final snapshot with the last write, restore into a new $label Pod"
+	kubectl -n "$NS" delete pod "${p}w-2" --wait=true >/dev/null
+	kubectl -n "$NS" delete pvc "$p-a" "$p-b" "${p}w-a" "${p}w-b" --wait=false >/dev/null
+}
+
+scenario_runtimes() {
+	log "runtimes: gVisor workload Pods"
+	install_gvisor
+	pass "gVisor $GVISOR_RELEASE installed on every node (RuntimeClass gvisor, handler runsc)"
+	check_runtime_modes gvisor gv gVisor in_gvisor
+}
+
+# Kata Containers: a pinned release, checked against the SHA-256 that
+# GitHub publishes for the asset.
+KATA_VERSION=${KATA_VERSION:-4.2.0}
+KATA_SHA256=b828904fa3f1e49ddd7dc799c72cb1503cd1e772d354c3987c8d4189b2a623a8
+
+# install_kata puts Kata on one worker node (the release is about 1 GB)
+# and registers the RuntimeClass "kata", which schedules Pods to that
+# node. It needs /dev/kvm in the node; without it the scenario is skipped
+# unless E2E_REQUIRE_KATA=1. KATA_DEBUG=1 turns on Kata's debug logs; the
+# diagnostics print the Kata node's containerd journal. Idempotent.
+install_kata() {
+	if kubectl get runtimeclass kata >/dev/null 2>&1; then
+		return 0
+	fi
+	local node dir sum cfg
+	node=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[0].metadata.name}')
+	if ! docker exec "$node" test -c /dev/kvm; then
+		[[ -n ${E2E_REQUIRE_KATA:-} ]] && die "Kata needs /dev/kvm in node $node"
+		return 1
+	fi
+	dir=$(mktemp -d)
+	curl -fsSLo "$dir/kata.tar.zst" "https://github.com/kata-containers/kata-containers/releases/download/$KATA_VERSION/kata-static-$KATA_VERSION-amd64.tar.zst"
+	sum=$( (sha256sum "$dir/kata.tar.zst" 2>/dev/null || shasum -a 256 "$dir/kata.tar.zst") | cut -d' ' -f1)
+	[[ $sum == "$KATA_SHA256" ]] || die "Kata $KATA_VERSION checksum mismatch"
+	tar --zstd -xf "$dir/kata.tar.zst" -C "$dir"
+	rm -f "$dir/kata.tar.zst"
+	tar -C "$dir" -cf - opt/kata | docker exec -i "$node" tar -C / -xf -
+	rm -rf "$dir"
+	# Kata 4 ships the Rust runtime (runtime-rs) in this tarball; 3.x
+	# shipped the Go runtime under /opt/kata/bin.
+	local shim=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2
+	cfg=/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml
+	if ! docker exec "$node" test -x "$shim"; then
+		shim=/opt/kata/bin/containerd-shim-kata-v2
+		cfg=/opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+	fi
+	docker exec "$node" test -x "$shim" || die "no Kata shim in the $KATA_VERSION release"
+	docker exec "$node" test -f "$cfg" || die "no Kata QEMU configuration in the $KATA_VERSION release"
+	# The VM boots under nested virtualization on CI machines, slower than
+	# the 3 s the shim waits for the guest agent by default.
+	docker exec "$node" sed -i 's/^reconnect_timeout_ms = .*/reconnect_timeout_ms = 60000/' "$cfg"
+	docker exec "$node" grep -q '^reconnect_timeout_ms = 60000' "$cfg" || die "could not raise the Kata agent timeout in $cfg"
+	# Kata backs guest RAM with a shared file in /dev/shm (virtio-fs needs
+	# shared memory), 2 GiB by default. A kind node's /dev/shm is Docker's
+	# 64 MiB, so the guest crashed during boot ("kvm run failed Bad
+	# address"). Give the Kata node room for two VMs.
+	docker exec "$node" mount -o remount,size=5g /dev/shm
+	if [[ -n ${KATA_DEBUG:-} ]]; then
+		# Hypervisor, agent and runtime debug logs, the guest agent at debug
+		# level; the logs go to the containerd journal of the node.
+		docker exec "$node" sed -i -e 's/^enable_debug = false/enable_debug = true/' \
+			-e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.log=debug"/' "$cfg"
+	fi
+	# With the systemd cgroup driver (kind's default), Kata's Rust runtime
+	# creates the sandbox's cgroup through systemd over D-Bus, which a
+	# kind node does not run.
+	docker exec "$node" sh -c '
+		set -e
+		if ! command -v dbus-daemon >/dev/null; then
+			apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dbus >/dev/null
+		fi
+		systemctl start dbus.socket dbus.service
+		test -S /run/dbus/system_bus_socket'
+	docker exec "$node" sh -c '
+		set -e
+		ln -sf "$2" /usr/local/bin/containerd-shim-kata-v2
+		if grep -q "^version = 3" /etc/containerd/config.toml; then
+			plugin="plugins.\"io.containerd.cri.v1.runtime\""
+		else
+			plugin="plugins.\"io.containerd.grpc.v1.cri\""
+		fi
+		printf "\n[%s.containerd.runtimes.kata]\n  runtime_type = \"io.containerd.kata.v2\"\n  privileged_without_host_devices = true\n[%s.containerd.runtimes.kata.options]\n  ConfigPath = \"%s\"\n" "$plugin" "$plugin" "$1" >> /etc/containerd/config.toml
+		systemctl restart containerd' sh "$cfg" "$shim"
+	kubectl label node "$node" wsnap-e2e/kata=true --overwrite >/dev/null
+	kubectl apply -f - >/dev/null <<EOF
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: kata}
+handler: kata
+scheduling:
+  nodeSelector: {wsnap-e2e/kata: "true"}
+EOF
+	kubectl wait --for=condition=Ready nodes --all --timeout=180s >/dev/null
+}
+
+scenario_kata() {
+	log "kata: Kata Containers workload Pods (a microVM per Pod, volumes over virtio-fs)"
+	if ! install_kata; then
+		echo "   skipping kata: no /dev/kvm in the nodes (load kvm, vhost_vsock and vhost_net before creating the cluster)"
+		return
+	fi
+	pass "Kata $KATA_VERSION installed (RuntimeClass kata)"
+	check_runtime_modes kata kt "Kata Containers" in_kata
+}
+
 main() {
 	local steps=() s g
-	(($#)) || set -- setup controlplane volumes failures worker
+	(($#)) || set -- setup controlplane volumes failures worker runtimes kata
 	for s in "$@"; do
 		if [[ -n $(group "$s") ]]; then
 			read -ra g <<<"$(group "$s")"
