@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -84,7 +84,7 @@ func newPVReconciler(t *testing.T, objs ...client.Object) (*PVReconciler, client
 	repo := &wsnapv1.SnapshotRepository{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "repo"}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objs, repo)...).
 		WithStatusSubresource(&wsnapv1.Workspace{}, &corev1.PersistentVolume{}, &batchv1.Job{}).Build()
-	return &PVReconciler{Client: uidPVCClient{c}, Reader: c, Recorder: record.NewFakeRecorder(10),
+	return &PVReconciler{Client: uidPVCClient{c}, Reader: c, Recorder: events.NewFakeRecorder(10),
 		Jobs: JobConfig{AgentImage: "agent:test", BrokerURL: "http://broker", Audience: "wsnap"}}, c
 }
 
@@ -203,7 +203,7 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 	}))
 	reconcilePV(t, r)
 	pv := getPV(t, c)
-	if pv.Annotations[wsnapv1.AnnotationRescue] != RescueRunning {
+	if pv.Annotations[wsnapv1.AnnotationRescue] != wsnapv1.RescueRunning {
 		t.Fatalf("rescue annotation = %q", pv.Annotations[wsnapv1.AnnotationRescue])
 	}
 	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
@@ -241,7 +241,7 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueDone {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueDone {
 		t.Errorf("rescue = %q after job completion", a)
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: rescueClaimName("pv-1")}, &claim); err == nil {
@@ -290,7 +290,7 @@ func TestOlderEpochVolumeIsRescued(t *testing.T) {
 	r, c := newPVReconciler(t, newer, ws, releasedPV(map[string]string{
 		workspace.AnnotationWriterPod: "u2", workspace.AnnotationWriterEpoch: "1"}))
 	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueRunning {
 		t.Fatalf("rescue = %q, want running", a)
 	}
 	var job batchv1.Job
@@ -311,7 +311,7 @@ func TestRescueRunsWhenNewerWriterPodIsGone(t *testing.T) {
 	})
 	r, c := newPVReconciler(t, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
 	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueRunning {
 		t.Errorf("rescue = %q, want running", a)
 	}
 }
@@ -335,7 +335,7 @@ func TestStaleCacheDoesNotUndoRescue(t *testing.T) {
 	reconcilePV(t, r) // starts the rescue
 	r.Client = staleJobCache{c}
 	reconcilePV(t, r) // the cache misses the Job; the live Reader has it
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueRunning {
 		t.Fatalf("rescue = %q after a stale cache read; it must stay running", a)
 	}
 	var job batchv1.Job
@@ -344,13 +344,13 @@ func TestStaleCacheDoesNotUndoRescue(t *testing.T) {
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	_ = c.Status().Update(context.Background(), &job)
 	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueDone {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueDone {
 		t.Fatalf("rescue = %q after the job completed", a)
 	}
 }
 
 func TestMissingMoverJobIsRecreated(t *testing.T) {
-	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: RescueRunning})
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: wsnapv1.RescueRunning})
 	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName("pv-1"), UID: "rescue-claim-uid"}
 	pv.Status.Phase = corev1.VolumeBound
 	r, c := newPVReconciler(t, testWorkspace(), pv, rescueClaimFixture(pv, "rescue-claim-uid"))
@@ -360,7 +360,7 @@ func TestMissingMoverJobIsRecreated(t *testing.T) {
 		t.Fatalf("mover job not recreated: %v", err)
 	}
 	got := getPV(t, c)
-	if got.Annotations[wsnapv1.AnnotationRescue] != RescueRunning || got.Spec.ClaimRef.UID != "rescue-claim-uid" {
+	if got.Annotations[wsnapv1.AnnotationRescue] != wsnapv1.RescueRunning || got.Spec.ClaimRef.UID != "rescue-claim-uid" {
 		t.Errorf("rescue %q, claimRef %+v; want running with the bound claim untouched", got.Annotations[wsnapv1.AnnotationRescue], got.Spec.ClaimRef)
 	}
 }
@@ -375,7 +375,7 @@ func TestLostAnnotationHeals(t *testing.T) {
 		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}}}
 	r, c := newPVReconciler(t, testWorkspace(), pv, done)
 	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueDone {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueDone {
 		t.Fatalf("stranded PV not healed: rescue = %q", a)
 	}
 }
@@ -438,12 +438,12 @@ func TestJobsTrustTheBrokerCA(t *testing.T) {
 // removes it, the PV is still bound to the rescue claim; it must stay
 // failed for an operator.
 func TestFailedRescueIsNotRestarted(t *testing.T) {
-	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: RescueFailed})
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: wsnapv1.RescueFailed})
 	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName("pv-1"), UID: "c"}
 	pv.Status.Phase = corev1.VolumeBound
 	r, c := newPVReconciler(t, testWorkspace(), pv)
 	reconcilePV(t, r)
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueFailed {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueFailed {
 		t.Fatalf("rescue = %q; a failed rescue restarted on its own", a)
 	}
 	var job batchv1.Job
@@ -495,7 +495,7 @@ func TestCompleteJobWithoutRecordedSnapshotKeepsTheVolume(t *testing.T) {
 	_ = c.Status().Update(context.Background(), &job)
 	reconcilePV(t, r)
 	pv := getPV(t, c)
-	if a := pv.Annotations[wsnapv1.AnnotationRescue]; a != RescueFailed || pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+	if a := pv.Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueFailed || pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
 		t.Fatalf("rescue %q, policy %s; an unrecorded rescue must keep the volume", a, pv.Spec.PersistentVolumeReclaimPolicy)
 	}
 }
@@ -511,7 +511,7 @@ func TestRemovingFailedAnnotationRetriesTheRescue(t *testing.T) {
 	r, c := newPVReconciler(t, testWorkspace(), pv, rescueClaimFixture(pv, "c"), failed)
 	reconcilePV(t, r) // deletes the failed Job
 	reconcilePV(t, r) // creates a new one
-	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {
+	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != wsnapv1.RescueRunning {
 		t.Fatalf("rescue = %q after the retry, want running", a)
 	}
 	var job batchv1.Job
