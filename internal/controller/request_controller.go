@@ -64,9 +64,9 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	case wsnapv1.SnapshotSucceeded, wsnapv1.SnapshotFailed:
 		return r.cleanupFinishedJob(ctx, sr)
 	}
-	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" &&
+	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && (st.Executor == "sidecar" || st.Executor == "worker") &&
 		time.Since(sr.GetCreationTimestamp().Time) > RunningTimeout {
-		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("the sidecar did not finish within %s", RunningTimeout))
+		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("the live executor did not finish within %s", RunningTimeout))
 	}
 	// Only a request that still waits for an executor times out here: a
 	// running Job is bounded by its activeDeadlineSeconds, and cutting off
@@ -100,10 +100,8 @@ func (r *RequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// A specific volume (a stopped writer's): only a Job can reach it.
 		return r.startJob(ctx, sr, &ws, recheck)
 	}
-	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" {
-		// A terminating sidecar still finishes what it claimed (queued
-		// snapshot requests are answered by its final snapshot). Wait for
-		// its report while its Pod exists.
+	if st := sr.Status(); st.Phase == wsnapv1.SnapshotRunning && (st.Executor == "sidecar" || st.Executor == "worker") {
+		// A terminating live executor still finishes what it claimed.
 		alive, err := r.claimantAlive(ctx, sr.GetNamespace(), ws.Name, st.ClaimedBy)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -143,13 +141,16 @@ func (r *RequestReconciler) claimantAlive(ctx context.Context, namespace, wsName
 	if uid == "" {
 		return false, nil
 	}
-	var pods corev1.PodList
-	if err := r.Reader.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: wsName}); err != nil {
-		return false, err
-	}
-	for _, p := range pods.Items {
-		if string(p.UID) == uid {
-			return p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed, nil
+	// The claimant is a workspace Pod (sidecar) or a worker Job's Pod.
+	for _, sel := range []client.MatchingLabels{{wsnapv1.LabelWorkspace: wsName}, {wsnapv1.LabelJob: "worker", wsnapv1.LabelJobWorkspace: wsName}} {
+		var pods corev1.PodList
+		if err := r.Reader.List(ctx, &pods, client.InNamespace(namespace), sel); err != nil {
+			return false, err
+		}
+		for _, p := range pods.Items {
+			if string(p.UID) == uid {
+				return p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed, nil
+			}
 		}
 	}
 	return false, nil

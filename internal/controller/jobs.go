@@ -148,7 +148,7 @@ func createJob(ctx context.Context, c client.Client, r client.Reader, job *batch
 			return err
 		}
 		if slices.ContainsFunc(ws.Status.Jobs, func(j wsnapv1.JobRef) bool {
-			return j == workspace.JobRef(&existing) && j.ClaimName == workspace.JobRef(job).ClaimName &&
+			return workspace.JobRefMatches(j, &existing) && j.ClaimName == workspace.JobRef(job).ClaimName &&
 				j.ClaimUID == job.Annotations[workspace.AnnotationClaimUID] &&
 				j.VolumeName == job.Annotations[wsnapv1.AnnotationVolumeName] &&
 				j.VolumeUID == job.Annotations[workspace.AnnotationPVUID]

@@ -47,6 +47,9 @@ const (
 	// WorkspaceSnapshot it targets that PV instead of the writer's volume
 	// (the broker uses it to save a stopped writer's volume).
 	AnnotationVolumeName = "wsnap.dev/volume-name"
+	// Worker Jobs identify the workload Pod whose PVC they share.
+	AnnotationTargetPodName = "wsnap.dev/target-pod-name"
+	AnnotationTargetPodUID  = "wsnap.dev/target-pod-uid"
 	// AnnotationRequest on a mover Job names the WorkspaceSnapshot it
 	// serves.
 	AnnotationRequest = "wsnap.dev/request"
@@ -301,14 +304,44 @@ type RestoreSource struct {
 }
 
 // WorkspaceSpec is the durable identity of a workspace.
+// A running Pod cannot change its executor placement, so mode is immutable.
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.execution) ? (has(self.execution) && self.execution.mode == oldSelf.execution.mode) : (!has(self.execution) || self.execution.mode == 'sidecar')",message="execution mode is immutable"
 type WorkspaceSpec struct {
 	// repositoryName is the SnapshotRepository holding this workspace.
 	RepositoryName string `json:"repositoryName"`
+	// execution selects where live snapshots run. The default is sidecar.
+	// Worker requires a PVC that a second Pod can mount and a Workspace
+	// created before its first workload Pod.
+	// +optional
+	Execution WorkspaceExecutionSpec `json:"execution,omitempty"`
 	// restoreFrom applies to the next restore after it is set or changed,
 	// and only once: status.restoreFromGeneration records that it was used.
 	// Create a Workspace with restoreFrom before its first Pod to fork.
 	// +optional
 	RestoreFrom *RestoreSource `json:"restoreFrom,omitempty"`
+}
+
+// WorkspaceExecutionSpec chooses the live snapshot agent placement.
+type WorkspaceExecutionSpec struct {
+	// mode is sidecar (the default) or worker (a separate Pod sharing the PVC).
+	// +kubebuilder:validation:Enum=sidecar;worker
+	// +kubebuilder:default=sidecar
+	// +optional
+	Mode string `json:"mode,omitempty"`
+}
+
+const (
+	ExecutionSidecar = "sidecar"
+	ExecutionWorker  = "worker"
+)
+
+// ExecutionMode returns the effective mode, including older objects that
+// predate this field.
+func (s WorkspaceSpec) ExecutionMode() string {
+	if s.Execution.Mode == "" {
+		return ExecutionSidecar
+	}
+	return s.Execution.Mode
 }
 
 // VolumeRef is the volume currently holding a workspace's data.
@@ -344,6 +377,16 @@ type JobRef struct {
 	VolumeName string `json:"volumeName,omitempty"`
 	// +optional
 	VolumeUID string `json:"volumeUID,omitempty"`
+	// The workload Pod a worker Job serves. The Job's annotations can be
+	// edited; this record cannot.
+	// +optional
+	TargetPodUID string `json:"targetPodUID,omitempty"`
+	// +optional
+	TargetPodName string `json:"targetPodName,omitempty"`
+	// writerEpoch is the epoch a worker Job claimed for its workload Pod.
+	// The broker sets it; it orders a late report against a newer writer.
+	// +optional
+	WriterEpoch int64 `json:"writerEpoch,omitempty"`
 }
 
 // PodRef identifies one Pod incarnation.

@@ -157,7 +157,8 @@ func ValidateBinding(ctx context.Context, r client.Reader, namespace string, ref
 func JobRef(job *batchv1.Job) wsnapv1.JobRef {
 	ref := wsnapv1.JobRef{Name: job.Name, UID: string(job.UID), Kind: job.Labels[wsnapv1.LabelJob],
 		ClaimUID: job.Annotations[AnnotationClaimUID], VolumeName: job.Annotations[wsnapv1.AnnotationVolumeName],
-		VolumeUID: job.Annotations[AnnotationPVUID]}
+		VolumeUID:    job.Annotations[AnnotationPVUID],
+		TargetPodUID: job.Annotations[wsnapv1.AnnotationTargetPodUID], TargetPodName: job.Annotations[wsnapv1.AnnotationTargetPodName]}
 	for _, v := range job.Spec.Template.Spec.Volumes {
 		if v.Name == "workspace" && v.PersistentVolumeClaim != nil {
 			ref.ClaimName = v.PersistentVolumeClaim.ClaimName
@@ -165,6 +166,13 @@ func JobRef(job *batchv1.Job) wsnapv1.JobRef {
 		}
 	}
 	return ref
+}
+
+// JobRefMatches reports whether job still matches its registration. The
+// writer epoch is recorded later by the broker and is not part of the Job.
+func JobRefMatches(recorded wsnapv1.JobRef, job *batchv1.Job) bool {
+	recorded.WriterEpoch = 0
+	return recorded == JobRef(job)
 }
 
 // Protect switches the PV behind ref to the Retain reclaim policy, so its

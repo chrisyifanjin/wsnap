@@ -1433,3 +1433,121 @@ func TestUnsetOperationTimeoutIsNotSent(t *testing.T) {
 		t.Fatalf("broker sent operationTimeout %s for a repository that sets none", r.OperationTimeout.Duration)
 	}
 }
+
+// workerEnv has a worker-mode workspace, its workload Pod on node-a, and a
+// registered worker Job whose Pod shares the workload's claim.
+func workerEnv(t *testing.T) (*env, *corev1.Pod) {
+	t.Helper()
+	app := workloadPod("app", "app-uid", "ws1", func(p *corev1.Pod) {
+		p.Spec.NodeName = "node-a"
+		p.Spec.InitContainers = []corev1.Container{{Name: "wsnap-gate",
+			VolumeMounts: []corev1.VolumeMount{{Name: "workspace", MountPath: "/workspace", ReadOnly: true}}}}
+		p.Spec.Volumes = p.Spec.Volumes[:1] // no wsnap token in a worker-mode workload
+	})
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-app", UID: "claim-uid"},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-app"}}
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-app", UID: "pv-uid"},
+		Spec: corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: ns, Name: "data-app", UID: "claim-uid"}}}
+	vols := []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-app"}}}}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-worker-x", UID: "worker-job-uid",
+			Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue, wsnapv1.LabelJob: "worker",
+				wsnapv1.LabelJobWorkspace: "ws1", wsnapv1.LabelRepository: "repo"},
+			Annotations: map[string]string{wsnapv1.AnnotationTargetPodName: "app", wsnapv1.AnnotationTargetPodUID: "app-uid",
+				wsnapv1.AnnotationVolumeName: "pv-app", workspace.AnnotationClaimUID: "claim-uid", workspace.AnnotationPVUID: "pv-uid"}},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: vols}}},
+	}
+	worker := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "worker-pod", UID: "wp",
+		Labels:          map[string]string{wsnapv1.LabelJob: "worker"},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: job.Name, UID: job.UID, Controller: ptr.To(true)}}},
+		Spec: corev1.PodSpec{NodeName: "node-a", Volumes: vols}}
+	ws := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"},
+		Spec:   wsnapv1.WorkspaceSpec{RepositoryName: "repo", Execution: wsnapv1.WorkspaceExecutionSpec{Mode: wsnapv1.ExecutionWorker}},
+		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{workspace.JobRef(job)}}}
+	return newEnv(t, app, claim, pv, job, worker, ws), app
+}
+
+func workerStop(t *testing.T, e *env) bool {
+	t.Helper()
+	rec, _ := e.call(t, "/v1/worker-state", "token-worker-pod", struct{}{})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("worker-state: %d %s", rec.Code, rec.Body.String())
+	}
+	var st struct{ Stop bool }
+	_ = json.Unmarshal(rec.Body.Bytes(), &st)
+	return st.Stop
+}
+
+func TestWorkerServesItsWorkload(t *testing.T) {
+	e, _ := workerEnv(t)
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
+		t.Fatalf("worker restore before the workload started: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("worker snapshot: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-app", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != http.StatusForbidden {
+		t.Errorf("a worker-mode workload Pod got a credential: %d", rec.Code)
+	}
+	var ws wsnapv1.Workspace
+	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &ws)
+	if ws.Status.WriterPod == nil || ws.Status.WriterPod.UID != "app-uid" || ws.Status.Jobs[0].WriterEpoch != ws.Status.WriterEpoch {
+		t.Fatalf("writer %+v, job epoch %d, workspace epoch %d", ws.Status.WriterPod, ws.Status.Jobs[0].WriterEpoch, ws.Status.WriterEpoch)
+	}
+	rec, _ := e.call(t, "/v1/report", "token-worker-pod", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot,
+		SnapshotID: "s1", EndTime: time.Now()})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("worker report: %d %s", rec.Code, rec.Body.String())
+	}
+	_ = e.client.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "ws1"}, &ws)
+	if l := ws.Status.LastSnapshot; l == nil || l.Executor != "worker" || l.Epoch != ws.Status.WriterEpoch || l.Pod.UID != "app-uid" {
+		t.Fatalf("lastSnapshot = %+v", ws.Status.LastSnapshot)
+	}
+}
+
+// A worker outlives its workload to take the final snapshot. A missing
+// workload, or a new Pod that reuses its name, means the workload stopped;
+// refusing the worker would leave it, and the volume, stuck.
+func TestWorkerSeesItsWorkloadStop(t *testing.T) {
+	ctx := context.Background()
+	e, app := workerEnv(t)
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("worker snapshot: %d %s", rec.Code, rec.Body.String())
+	}
+	if workerStop(t, e) {
+		t.Fatal("stop while the workload runs")
+	}
+	if err := e.client.Delete(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	replacement := app.DeepCopy()
+	replacement.ResourceVersion, replacement.UID = "", "app-uid-2"
+	if err := e.client.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if !workerStop(t, e) {
+		t.Fatal("a same-name replacement Pod kept the old worker running")
+	}
+	rec, _ := e.call(t, "/v1/report", "token-worker-pod", protocol.Report{Role: protocol.RoleSnapshot, Operation: protocol.OpSnapshot,
+		SnapshotID: "final", Final: true, EndTime: time.Now()})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("final report after the workload stopped: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerMustShareItsWorkloadsVolume(t *testing.T) {
+	ctx := context.Background()
+	e, _ := workerEnv(t)
+	var claim corev1.PersistentVolumeClaim
+	if err := e.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: "data-app"}, &claim); err != nil {
+		t.Fatal(err)
+	}
+	claim.UID = "replacement-claim"
+	if err := e.client.Update(ctx, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-worker-pod", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code < 400 || rec.Code >= 500 {
+		t.Fatalf("worker got a credential for a replaced claim: %d %s", rec.Code, rec.Body.String())
+	}
+}

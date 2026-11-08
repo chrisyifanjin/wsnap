@@ -95,3 +95,46 @@ func CheckIsolation(pod *corev1.Pod, audience string, allowAPIToken bool) error 
 	}
 	return nil
 }
+
+// CheckWorkerIsolation applies to a workload Pod whose snapshot agent runs
+// in a separate Job. No container in this Pod may receive a wsnap token:
+// only the controller-created worker Job may authenticate as an agent.
+func CheckWorkerIsolation(pod *corev1.Pod, audience string, allowAPIToken bool) error {
+	if ptr.Deref(pod.Spec.ShareProcessNamespace, false) || pod.Spec.HostPID {
+		return fmt.Errorf("shareProcessNamespace and hostPID are not allowed in worker mode")
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+		for _, src := range v.Projected.Sources {
+			if token := src.ServiceAccountToken; token != nil && token.Audience == audience {
+				return fmt.Errorf("workload Pod may not project a wsnap token in worker mode")
+			}
+			if token := src.ServiceAccountToken; token != nil && token.Audience == "" && !allowAPIToken {
+				for _, c := range pod.Spec.InitContainers {
+					for _, m := range c.VolumeMounts {
+						if m.Name == v.Name {
+							return fmt.Errorf("init container %q mounts an API server token", c.Name)
+						}
+					}
+				}
+				for _, c := range pod.Spec.Containers {
+					for _, m := range c.VolumeMounts {
+						if m.Name == v.Name {
+							return fmt.Errorf("container %q mounts an API server token", c.Name)
+						}
+					}
+				}
+				for _, c := range pod.Spec.EphemeralContainers {
+					for _, m := range c.VolumeMounts {
+						if m.Name == v.Name {
+							return fmt.Errorf("ephemeral container %q mounts an API server token", c.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}

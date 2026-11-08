@@ -133,12 +133,14 @@ func main() {
 	must(err)
 
 	jobs := controller.JobConfig{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA}
+	reader := mgr.GetAPIReader()
 	mgr.GetWebhookServer().Register("/mutate-pods", &admission.Webhook{Handler: &webhook.Handler{
 		Config:  webhook.Config{AgentImage: *agentImage, BrokerURL: *brokerURL, Audience: *audience, CAConfigMap: *agentCA, AllowAPIToken: *allowAPITok},
+		Reader:  reader,
 		Decoder: admission.NewDecoder(scheme),
 	}})
-	reader := mgr.GetAPIReader()
 	must((&controller.PodReconciler{Client: mgr.GetClient(), Reader: reader}).SetupWithManager(mgr))
+	must((&controller.WorkerReconciler{Client: mgr.GetClient(), Reader: reader, Jobs: jobs}).SetupWithManager(mgr))
 	must((&controller.PVReconciler{Client: mgr.GetClient(), Reader: reader, Jobs: jobs,
 		Recorder: mgr.GetEventRecorderFor("wsnap")}).SetupWithManager(mgr))
 	must((&controller.WorkspaceReconciler{Client: mgr.GetClient(), Reader: reader, Jobs: jobs}).SetupWithManager(mgr))

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chrisyifanjin/wsnap/internal/engine"
@@ -33,6 +34,9 @@ type Config struct {
 	Dir string
 	// StateDir is private scratch space for engine config and caches.
 	StateDir string
+	// WorkerPodUID is the workload Pod gated by this separate worker.
+	WorkerPodUID      string
+	workerMayFinalize atomic.Bool
 	// FinalTimeout bounds everything after SIGTERM: finishing an in-flight
 	// snapshot plus the final one. Keep it below the Pod's
 	// terminationGracePeriodSeconds.
@@ -106,6 +110,36 @@ func startupReadyPath(stateDir string) string { return filepath.Join(stateDir, "
 func StartupReady(stateDir string) error {
 	_, err := os.Stat(startupReadyPath(stateDir))
 	return err
+}
+
+func workerReadyPath(dir, podUID string) (string, error) {
+	if podUID == "" || podUID == "." || filepath.Base(podUID) != podUID {
+		return "", fmt.Errorf("invalid workload Pod UID %q", podUID)
+	}
+	return filepath.Join(dir, engine.StateDirName, "worker-ready", podUID), nil
+}
+
+// WaitWorker blocks a workload's first init container until its separate
+// worker has restored the PVC and claimed this Pod as writer.
+func WaitWorker(ctx context.Context, dir, podUID string) error {
+	path, err := workerReadyPath(dir, podUID)
+	if err != nil {
+		return err
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 type brokerError struct {
@@ -677,6 +711,64 @@ func isEmpty(v *volume, dir string) (bool, error) {
 	return true, nil
 }
 
+// workerPoll is how often a worker asks whether its workload Pod stopped.
+var workerPoll = 3 * time.Second
+
+// RunWorker runs the sidecar's snapshot loop in a separate Pod. The broker
+// tells it when its workload Pod has stopped; only then may it mark a
+// snapshot final. A drain evicts both Pods at once, so on SIGTERM the
+// worker first waits up to half its final timeout for the workload to
+// stop, then takes the last snapshot. If the workload still runs, that
+// snapshot is not final, and the volume stays protected for the next Pod
+// or a rescue.
+func (c *Config) RunWorker(ctx context.Context) error {
+	if _, err := workerReadyPath(c.Dir, c.WorkerPodUID); err != nil {
+		return err
+	}
+	wctx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	defer stop()
+	go c.watchWorkload(ctx, wctx, stop)
+	return c.RunSidecar(wctx)
+}
+
+// watchWorkload calls stop when the workload Pod has stopped, or when
+// term is cancelled and the workload does not stop in time.
+func (c *Config) watchWorkload(term, run context.Context, stop context.CancelFunc) {
+	ticker := time.NewTicker(workerPoll)
+	defer ticker.Stop()
+	terminated := term.Done()
+	var giveUp <-chan time.Time
+	for {
+		var state struct {
+			Stop bool `json:"stop"`
+		}
+		pctx, cancel := context.WithTimeout(run, 10*time.Second)
+		err := c.post(pctx, "/v1/worker-state", struct{}{}, &state)
+		cancel()
+		switch {
+		case err == nil && state.Stop:
+			c.workerMayFinalize.Store(true)
+			stop()
+			return
+		case err != nil && run.Err() == nil:
+			c.Log.Warn("cannot read workload state", "error", err)
+		}
+		select {
+		case <-run.Done():
+			return
+		case <-terminated:
+			terminated = nil
+			giveUp = time.After(c.FinalTimeout / 2)
+			c.Log.Info("termination requested; waiting for the workload Pod to stop", "limit", c.FinalTimeout/2)
+		case <-giveUp:
+			c.Log.Warn("the workload Pod still runs; the last snapshot is not final")
+			stop()
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // RunSidecar initializes the volume, then serves three kinds of snapshot
 // one at a time: periodic ones, requests (WorkspaceSnapshot objects through
 // the broker, and files in .wsnap/requests), and on SIGTERM a final one
@@ -697,6 +789,18 @@ func (c *Config) RunSidecar(ctx context.Context) error {
 	}
 	if err := os.WriteFile(readyPath, []byte("ready\n"), 0o600); err != nil {
 		return fmt.Errorf("mark startup ready: %w", err)
+	}
+	if c.WorkerPodUID != "" {
+		path, err := workerReadyPath(c.Dir, c.WorkerPodUID)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("create worker readiness directory: %w", err)
+		}
+		if err := os.WriteFile(path, []byte("ready\n"), 0o600); err != nil {
+			return fmt.Errorf("mark worker ready: %w", err)
+		}
 	}
 	interval := c.IntervalOverride
 	if interval == 0 {
@@ -817,7 +921,8 @@ func (c *Config) RunSidecar(ctx context.Context) error {
 			}
 			fctx, cancel := context.WithDeadline(pbase, deadline)
 			defer cancel()
-			_, id, err := c.takeSnapshot(fctx, protocol.RoleSnapshot, snapOpts{final: true}, st)
+			final := c.WorkerPodUID == "" || c.workerMayFinalize.Load()
+			_, id, err := c.takeSnapshot(fctx, protocol.RoleSnapshot, snapOpts{final: final}, st)
 			// Queued snapshot requests are answered by the final snapshot;
 			// queued restores fail, as the Pod is going away.
 			for _, t := range queue {

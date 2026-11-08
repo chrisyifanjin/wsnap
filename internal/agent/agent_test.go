@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -40,6 +42,7 @@ type fakeBroker struct {
 	restoreRepo              string
 	waitQueue                chan string
 	failReports              atomic.Bool // answer reports with 503
+	workloadStopped          atomic.Bool // worker-state answer
 }
 
 func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +92,10 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(protocol.WaitResponse{Requests: names})
+	case "/v1/worker-state":
+		_ = json.NewEncoder(w).Encode(struct {
+			Stop bool `json:"stop"`
+		}{b.workloadStopped.Load()})
 	case "/v1/report":
 		if b.failReports.Load() {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
@@ -1268,5 +1275,87 @@ func TestNoClearBeforeAdmission(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(c.Dir, "moved.txt")); string(got) != "the writer's restored file" {
 		t.Fatalf("a refused sidecar cleared the volume: %q", got)
+	}
+}
+
+func runWorker(t *testing.T, c *Config, ctx context.Context) <-chan error {
+	t.Helper()
+	old := workerPoll
+	workerPoll = 50 * time.Millisecond
+	t.Cleanup(func() { workerPoll = old })
+	c.WorkerPodUID = "pod-uid-1"
+	errc := make(chan error, 1)
+	go func() { errc <- c.RunWorker(ctx) }()
+	ready := filepath.Join(c.Dir, ".wsnap", "worker-ready", c.WorkerPodUID)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			return errc
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker never marked the workload ready")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitErr(t *testing.T, errc <-chan error, within time.Duration) {
+	t.Helper()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("RunWorker: %v", err)
+		}
+	case <-time.After(within):
+		t.Fatal("RunWorker did not return")
+	}
+}
+
+func TestWorkerFinalSnapshotAfterWorkloadStops(t *testing.T) {
+	c, b := setup(t)
+	errc := runWorker(t, c, context.Background())
+	write(t, filepath.Join(c.Dir, "f.txt"), "last write")
+	b.workloadStopped.Store(true)
+	waitErr(t, errc, 10*time.Second)
+	reps := b.snapshotReports()
+	if len(reps) == 0 || !reps[len(reps)-1].Final || reps[len(reps)-1].Error != "" {
+		t.Fatalf("want a final snapshot after the workload stopped, got %+v", reps)
+	}
+}
+
+// A drain sends SIGTERM to the worker while the workload may still write.
+// The final snapshot must wait for the workload and include its last write.
+func TestWorkerTerminationWaitsForWorkload(t *testing.T) {
+	c, b := setup(t)
+	ctx, terminate := context.WithCancel(context.Background())
+	errc := runWorker(t, c, ctx)
+	terminate()
+	time.Sleep(300 * time.Millisecond)
+	write(t, filepath.Join(c.Dir, "f.txt"), "written after the worker's SIGTERM")
+	b.workloadStopped.Store(true)
+	waitErr(t, errc, 10*time.Second)
+	reps := b.snapshotReports()
+	last := reps[len(reps)-1]
+	if !last.Final || last.Error != "" || last.Reused {
+		t.Fatalf("want a new final snapshot with the late write, got %+v", reps)
+	}
+	got, err := exec.Command("tar", "-xzOf", filepath.Join(b.repo, "snapshots", last.SnapshotID+".tar.gz"), "./f.txt").Output()
+	if err != nil || strings.TrimSpace(string(got)) != "written after the worker's SIGTERM" {
+		t.Fatalf("final snapshot holds %q (%v); want the write made after SIGTERM", got, err)
+	}
+}
+
+func TestWorkerTerminationWithoutWorkloadStopIsNotFinal(t *testing.T) {
+	c, b := setup(t)
+	c.FinalTimeout = 2 * time.Second
+	ctx, terminate := context.WithCancel(context.Background())
+	errc := runWorker(t, c, ctx)
+	write(t, filepath.Join(c.Dir, "f.txt"), "v1")
+	terminate()
+	waitErr(t, errc, 10*time.Second)
+	for _, r := range b.snapshotReports() {
+		if r.Final {
+			t.Fatalf("snapshot marked final while the workload still runs: %+v", r)
+		}
 	}
 }

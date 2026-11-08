@@ -38,6 +38,9 @@ type Config struct {
 	AgentImage string
 	BrokerURL  string
 	Audience   string
+	// ExecutionMode comes from Workspace.spec.execution.mode. A missing
+	// Workspace uses the legacy sidecar mode.
+	ExecutionMode string
 	// CAConfigMap names the ConfigMap with the broker's CA; empty for HTTP.
 	CAConfigMap string
 	// AllowAPIToken admits workload containers that mount an API server
@@ -64,6 +67,9 @@ const (
 func Mutate(pod *corev1.Pod, cfg Config) error {
 	if _, err := workspace.FromPod(pod); err != nil {
 		return err
+	}
+	if cfg.ExecutionMode == wsnapv1.ExecutionWorker {
+		return mutateWorkerPod(pod, cfg)
 	}
 	volName := pod.Annotations[wsnapv1.AnnotationVolume]
 	if volName == "" {
@@ -164,6 +170,60 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 	// might write to the workspace) starts.
 	pod.Spec.InitContainers = append([]corev1.Container{sidecar}, pod.Spec.InitContainers...)
 	return validate(pod, sidecarName, cfg.Audience, cfg.AllowAPIToken)
+}
+
+// mutateWorkerPod gates the workload on a separate worker's restore. The
+// gate has no credential or API token; it only reads a per-Pod readiness
+// marker after the worker has claimed the workspace writer epoch.
+func mutateWorkerPod(pod *corev1.Pod, cfg Config) error {
+	volName := pod.Annotations[wsnapv1.AnnotationVolume]
+	if volName == "" {
+		volName = wsnapv1.DefaultVolumeName
+	}
+	var vol *corev1.Volume
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == volName {
+			vol = &pod.Spec.Volumes[i]
+			break
+		}
+	}
+	if vol == nil || (vol.PersistentVolumeClaim == nil && vol.Ephemeral == nil) {
+		return fmt.Errorf("worker mode requires volume %q to be a persistentVolumeClaim or generic ephemeral PVC", volName)
+	}
+	if vol.Ephemeral != nil && vol.Ephemeral.VolumeClaimTemplate != nil {
+		for _, mode := range vol.Ephemeral.VolumeClaimTemplate.Spec.AccessModes {
+			if mode == corev1.ReadWriteOncePod {
+				return fmt.Errorf("worker mode cannot share a ReadWriteOncePod claim between Pods")
+			}
+		}
+	}
+	if ptr.Deref(pod.Spec.ShareProcessNamespace, false) || pod.Spec.HostPID {
+		return fmt.Errorf("worker mode does not allow shareProcessNamespace or hostPID")
+	}
+	if a := pod.Spec.AutomountServiceAccountToken; a != nil && *a {
+		return fmt.Errorf("automountServiceAccountToken is true: untrusted containers would hold an API token")
+	}
+	pod.Spec.AutomountServiceAccountToken = ptr.To(false)
+	if !cfg.AllowAPIToken {
+		removeAPITokens(pod)
+	}
+	const gateName = "wsnap-gate"
+	if findContainer(pod.Spec.Containers, gateName) != nil {
+		return fmt.Errorf("container name %q is reserved for the worker readiness gate", gateName)
+	}
+	if findContainer(pod.Spec.InitContainers, gateName) == nil {
+		gate := corev1.Container{
+			Name:  gateName,
+			Image: cfg.AgentImage,
+			Args:  []string{"wait-worker", "--dir=" + dataPath, "--pod-uid=$(WSNAP_POD_UID)"},
+			Env: []corev1.EnvVar{{Name: "WSNAP_POD_UID", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}}},
+			VolumeMounts:    []corev1.VolumeMount{{Name: volName, MountPath: dataPath, ReadOnly: true}},
+			SecurityContext: AgentSecurityContext(),
+		}
+		pod.Spec.InitContainers = append([]corev1.Container{gate}, pod.Spec.InitContainers...)
+	}
+	return workspace.CheckWorkerIsolation(pod, cfg.Audience, cfg.AllowAPIToken)
 }
 
 // AgentSecurityContext hardens the agent container. Its root filesystem

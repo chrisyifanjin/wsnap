@@ -23,7 +23,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|mover|restorer|maintain|ready|version [flags]")
+		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|worker|wait-worker|mover|restorer|maintain|ready|version [flags]")
 		os.Exit(2)
 	}
 	mode := os.Args[1]
@@ -37,6 +37,7 @@ func main() {
 	fs.StringVar(&cfg.TokenFile, "token-file", envOr("WSNAP_TOKEN_FILE", "/var/run/secrets/wsnap/token"), "projected service account token")
 	fs.StringVar(&cfg.Dir, "dir", envOr("WSNAP_DIR", "/workspace"), "workspace directory")
 	fs.StringVar(&cfg.StateDir, "state-dir", envOr("WSNAP_STATE_DIR", "/var/lib/wsnap"), "private state directory")
+	fs.StringVar(&cfg.WorkerPodUID, "pod-uid", "", "workload Pod UID for worker readiness")
 	fs.DurationVar(&cfg.FinalTimeout, "final-timeout", 25*time.Second, "time limit for the final snapshot after SIGTERM")
 	fs.DurationVar(&cfg.IntervalOverride, "interval", 0, "override the repository's snapshot interval")
 	caFile := fs.String("ca-file", os.Getenv("WSNAP_CA_FILE"), "CA bundle that signs the broker's TLS certificate")
@@ -49,7 +50,7 @@ func main() {
 	cfg.HTTP = &http.Client{Timeout: 60 * time.Second}
 	// The agent's root filesystem may be read-only; the engines write
 	// temporary files, so give them the private state directory.
-	if os.Getenv("TMPDIR") == "" && mode != "ready" {
+	if os.Getenv("TMPDIR") == "" && mode != "ready" && mode != "wait-worker" {
 		tmp := filepath.Join(cfg.StateDir, "tmp")
 		if err := os.MkdirAll(tmp, 0o700); err == nil {
 			_ = os.Setenv("TMPDIR", tmp)
@@ -76,6 +77,10 @@ func main() {
 	switch mode {
 	case "sidecar":
 		err = cfg.RunSidecar(ctx)
+	case "worker":
+		err = cfg.RunWorker(ctx)
+	case "wait-worker":
+		err = agent.WaitWorker(ctx, cfg.Dir, cfg.WorkerPodUID)
 	case "mover":
 		err = cfg.RunMover(ctx)
 	case "restorer":
