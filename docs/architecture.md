@@ -36,7 +36,7 @@ can delay a snapshot. Monitor `status.lastError` and failed rescues.
 flowchart LR
   subgraph cluster[Kubernetes cluster]
     subgraph ctrl[wsnap-controller Deployment, 2 replicas]
-      B[Broker<br/>HTTP :8080]
+      B[Broker<br/>HTTPS :8443]
       W[Admission webhook<br/>:9443]
       R[Reconcilers<br/>leader only]
     end
@@ -272,12 +272,23 @@ volume uses:
 The broker applies `restoreFrom` once per change of the spec. It records the
 generation in `status.restoreFromGeneration`.
 
+### 7. Worker mode
+
+With `spec.execution.mode: worker`, the agent runs in a worker Job
+instead of a sidecar. The workload Pod gets a credential-free gate init
+container. The controller pins the worker to the workload's node and
+mounts the same PVC. The broker treats the workload Pod as the writer
+(single writer and epochs apply as usual), serves the worker only while
+the live PVC/PV binding matches the worker's registration, and refuses
+credentials to the workload Pod itself. The worker may mark a snapshot
+final only after the broker reports that the workload Pod stopped.
+
 ## Roles and credentials
 
 | Role | Who can get it | What it allows |
 |---|---|---|
 | `restore` | a workspace Pod before its workload starts, or a Pod that claimed a `WorkspaceRestore` | read this workspace |
-| `snapshot` | the workspace's writer Pod | write this workspace; delete only engine scratch objects |
+| `snapshot` | the workspace's writer Pod, or in worker mode its worker Job's Pod | write this workspace; delete only engine scratch objects |
 | `mover` | Pods of wsnap mover and restorer Jobs | same as `snapshot` |
 | `maintenance` | Pods of wsnap maintenance Jobs | read, write and delete this workspace |
 

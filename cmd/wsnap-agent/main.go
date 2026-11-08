@@ -23,7 +23,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|mover|restorer|maintain|ready|version [flags]")
+		fmt.Fprintln(os.Stderr, "usage: wsnap-agent sidecar|worker|wait-worker|mover|restorer|maintain|ready|version [flags]")
 		os.Exit(2)
 	}
 	mode := os.Args[1]
@@ -33,10 +33,12 @@ func main() {
 	}
 	fs := flag.NewFlagSet(mode, flag.ExitOnError)
 	cfg := agent.Config{}
-	fs.StringVar(&cfg.BrokerURL, "broker-url", envOr("WSNAP_BROKER_URL", "http://wsnap-broker.wsnap-system.svc:8080"), "broker URL")
+	fs.StringVar(&cfg.BrokerURL, "broker-url", envOr("WSNAP_BROKER_URL", "https://wsnap-broker.wsnap-system.svc:8443"), "broker URL")
 	fs.StringVar(&cfg.TokenFile, "token-file", envOr("WSNAP_TOKEN_FILE", "/var/run/secrets/wsnap/token"), "projected service account token")
 	fs.StringVar(&cfg.Dir, "dir", envOr("WSNAP_DIR", "/workspace"), "workspace directory")
 	fs.StringVar(&cfg.StateDir, "state-dir", envOr("WSNAP_STATE_DIR", "/var/lib/wsnap"), "private state directory")
+	fs.StringVar(&cfg.WorkerPodUID, "pod-uid", "", "workload Pod UID for worker readiness")
+	fs.DurationVar(&cfg.WorkloadGrace, "workload-grace", 30*time.Second, "worker: how long the workload's containers may run after its Pod is deleted")
 	fs.DurationVar(&cfg.FinalTimeout, "final-timeout", 25*time.Second, "time limit for the final snapshot after SIGTERM")
 	fs.DurationVar(&cfg.IntervalOverride, "interval", 0, "override the repository's snapshot interval")
 	caFile := fs.String("ca-file", os.Getenv("WSNAP_CA_FILE"), "CA bundle that signs the broker's TLS certificate")
@@ -49,21 +51,28 @@ func main() {
 	cfg.HTTP = &http.Client{Timeout: 60 * time.Second}
 	// The agent's root filesystem may be read-only; the engines write
 	// temporary files, so give them the private state directory.
-	if os.Getenv("TMPDIR") == "" && mode != "ready" {
+	if os.Getenv("TMPDIR") == "" && mode != "ready" && mode != "wait-worker" {
 		tmp := filepath.Join(cfg.StateDir, "tmp")
 		if err := os.MkdirAll(tmp, 0o700); err == nil {
 			_ = os.Setenv("TMPDIR", tmp)
 		}
 	}
+	// The broker's CA comes from a file (a mounted ConfigMap) or inline
+	// from WSNAP_CA_PEM, which the webhook and the controller set when the
+	// broker manages its own certificate.
+	caPEM, caSource := []byte(os.Getenv("WSNAP_CA_PEM")), "WSNAP_CA_PEM"
 	if *caFile != "" {
-		pem, err := os.ReadFile(*caFile)
-		if err != nil {
+		var err error
+		if caPEM, err = os.ReadFile(*caFile); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		caSource = *caFile
+	}
+	if len(caPEM) > 0 {
 		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			fmt.Fprintln(os.Stderr, "no certificates in", *caFile)
+		if !pool.AppendCertsFromPEM(caPEM) {
+			fmt.Fprintln(os.Stderr, "no certificates in", caSource)
 			os.Exit(1)
 		}
 		cfg.HTTP.Transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}
@@ -76,6 +85,10 @@ func main() {
 	switch mode {
 	case "sidecar":
 		err = cfg.RunSidecar(ctx)
+	case "worker":
+		err = cfg.RunWorker(ctx)
+	case "wait-worker":
+		err = agent.WaitWorker(ctx, cfg.Dir, cfg.WorkerPodUID)
 	case "mover":
 		err = cfg.RunMover(ctx)
 	case "restorer":

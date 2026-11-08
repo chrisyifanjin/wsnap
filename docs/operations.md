@@ -37,6 +37,23 @@ to the release instead; it pins both image tags.
 The sample volume needs a StorageClass. Check yours with
 `kubectl get storageclass` before creating a Pod.
 
+### Limit which Secrets wsnap can read
+
+By default the controller may `get` Secrets in every namespace, because
+each SnapshotRepository's Secret lives in its own namespace. To allow only
+the namespaces you choose, install `config/namespaced-secrets` instead of
+`config/default`, and bind the reader role in each namespace that has
+repositories:
+
+```sh
+kubectl apply -k config/namespaced-secrets
+kubectl -n agents apply -f config/samples/secret-access.yaml
+```
+
+A repository in a namespace without the binding reports `Ready=False` with
+reason `SecretForbidden`, and wsnap checks again every minute. wsnap never
+lists or watches Secrets.
+
 ### Safe PVC provisioning
 
 Pick a StorageClass whose CSI driver, encryption, topology, and reclaim
@@ -85,9 +102,12 @@ The controller flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--agent-image` | `ghcr.io/chrisyifanjin/wsnap-agent:dev` | Image of the sidecar and the Jobs. |
-| `--broker-url` | `http://wsnap-broker.wsnap-system.svc:8080` | URL that agents use. Use `https://` with TLS. |
-| `--tls-cert-file`, `--tls-key-file` | empty | Serve the broker over TLS. Reloaded when the files change. |
-| `--agent-ca-configmap` | empty | ConfigMap (key `ca.crt`) that Jobs mount to trust the broker. |
+| `--broker-addr` | `:8443` | Broker listen address. |
+| `--broker-url` | `https://wsnap-broker.wsnap-system.svc:8443` | URL that agents use. |
+| `--broker-manage-certs` | `true` | Without `--tls-cert-file`, generate the broker's certificate into the Secret `wsnap-broker-cert` and give agents its CA in `WSNAP_CA_PEM`. Set `false` (and an `http://` URL) only to serve plain HTTP. |
+| `--broker-plain-addr` | empty | Also serve plain HTTP here (`:8080`) for agents started before an upgrade to TLS. |
+| `--tls-cert-file`, `--tls-key-file` | empty | Serve the broker with your own certificate (cert-manager). Reloaded when the files change. |
+| `--agent-ca-configmap` | empty | With your own certificate: ConfigMap (key `ca.crt`) in workload namespaces that sidecars and Jobs mount to trust the broker. |
 | `--allow-automounted-tokens` | `false` | Accept Pods that mount the default API token. Do not use this with untrusted code. |
 | `--pod-rate`, `--pod-burst` | `1`, `20` | Broker requests per second per Pod. |
 | `--webhook-manage-certs` | `true` | Generate the webhook certificate. Set `false` to use cert-manager. |
@@ -238,6 +258,7 @@ The webhook adds the sidecar. Optional annotations:
 | `wsnap.dev/quiesce-timeout` | Ask the agent to pause before each snapshot (see below). |
 | `wsnap.dev/final-timeout` | Time limit for the final snapshot. Default `50s`. |
 | `wsnap.dev/workload-grace` | Time the workload takes to exit after SIGTERM. Default `30s`. The webhook sets the grace period to this plus the final timeout plus 10 s. |
+| `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 **The workload must exit on SIGTERM.** Kubernetes stops the sidecar only
 after the workload containers exit. A workload that ignores SIGTERM (for
@@ -246,7 +267,6 @@ for) uses up the whole grace period, and the sidecar gets 2 seconds for its
 final snapshot. A PVC-backed workspace is then rescued later; an emptyDir
 workspace loses the changes since its last snapshot. Run the workload
 under an init that forwards signals (`tini`, `dumb-init`) or trap TERM.
-| `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 For agent-sandbox, put the labels in `Sandbox.spec.podTemplate.metadata`
 and the volume in `volumeClaimTemplates`, as in
@@ -260,6 +280,55 @@ snapshot. With `emptyDir`, wsnap can take a final
 snapshot during a normal stop, but it cannot rescue data after the Pod
 disappears. If the underlying disk is lost, any volume type can restore
 only the last completed snapshot.
+
+### Worker mode: snapshots from a separate Pod
+
+By default the agent runs as a sidecar in the workload Pod. In worker
+mode, it runs in a separate Pod instead, so the workload Pod holds no
+wsnap container and no wsnap token. Create the Workspace before the
+first workload Pod:
+
+```yaml
+apiVersion: wsnap.dev/v1alpha1
+kind: Workspace
+metadata: {name: user-42-project-x, namespace: agents}
+spec:
+  repositoryName: default
+  execution: {mode: worker}
+```
+
+Then label the workload Pod as usual. What happens:
+
+1. The webhook adds a gate init container (`wsnap-gate`) to the workload
+   Pod, replacing any container of that name. It has no credentials; it
+   waits for a fresh marker file on the volume.
+2. When the Pod is scheduled, the controller creates a worker Job that
+   mounts the same PVC. The scheduler places it on the same node (node
+   affinity) with the workload's tolerations and priority class, and it
+   requests 50m CPU and 64Mi memory.
+3. The worker restores the workspace and refreshes the marker every 5 s;
+   the gate lets the workload start. After a node reboot the old marker is
+   stale, so the workload waits for its worker again.
+4. The worker snapshots while the workload runs and serves requests. If
+   the worker Pod dies, the Job replaces it and requests it had claimed go
+   to the new Pod.
+5. When the workload's containers have stopped, the worker takes the
+   final snapshot and finishes; the Job is deleted at once, so the claim
+   is free. If the Pod object disappears without being seen stopped (a
+   forced deletion), the worker first waits the workload's
+   `terminationGracePeriodSeconds`, since its containers may still run.
+   If the worker gets SIGTERM first (a drain), it waits up to that grace
+   for the workload to stop; otherwise its last snapshot is not final.
+
+Limits:
+
+- The workspace volume must be a PVC or a generic ephemeral PVC that
+  two Pods on one node can mount (`ReadWriteOnce` or `ReadWriteMany`). The
+  webhook refuses `emptyDir` and `ReadWriteOncePod`.
+- The mode cannot change after the Workspace exists. A Workspace that the
+  controller created for a Pod uses sidecar mode.
+- The workload starts only after its worker is scheduled and has
+  restored. If the controller is down, the workload waits at the gate.
 
 ### Quiesce handshake
 
@@ -350,6 +419,12 @@ snapshot records count as epoch 0. PVs that an earlier version marked
 `wsnap.dev/rescue=skipped-newer-writer` stay as they are; remove the
 annotation to rescue them (their data is kept without replacing newer
 history).
+
+Upgrading from a plain-HTTP broker (`http://...:8080`) to the TLS default:
+running sidecars keep the old URL until their Pods restart. Add
+`--broker-plain-addr=:8080` to the controller for the upgrade, so they can
+still take their final snapshots. Remove it when every Pod started before
+the upgrade is gone.
 
 ## Troubleshoot
 

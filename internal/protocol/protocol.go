@@ -240,3 +240,12 @@ func (d *Duration) UnmarshalText(b []byte) error {
 	d.Duration = v
 	return nil
 }
+
+// WorkerState answers POST /v1/worker-state. Stop: the workload Pod's
+// containers have stopped, or its Pod is gone. Gone: the Pod object no
+// longer exists (or a new Pod reuses its name); after a forced deletion
+// its containers may still run for up to their grace period.
+type WorkerState struct {
+	Stop bool `json:"stop"`
+	Gone bool `json:"gone,omitempty"`
+}

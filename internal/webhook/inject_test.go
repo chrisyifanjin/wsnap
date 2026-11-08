@@ -1,10 +1,12 @@
 package webhook
 
 import (
-	"github.com/chrisyifanjin/wsnap/internal/workspace"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chrisyifanjin/wsnap/internal/agentpod"
+	"github.com/chrisyifanjin/wsnap/internal/workspace"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,7 +75,7 @@ func TestTLSInjection(t *testing.T) {
 	if err := Mutate(p, c); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(p.Spec.InitContainers[0].Args, " "), "--ca-file=/var/run/wsnap-ca/ca.crt") || !hasVolume(p, caVolume) {
+	if !strings.Contains(strings.Join(p.Spec.InitContainers[0].Args, " "), "--ca-file=/var/run/wsnap-ca/ca.crt") || !hasVolume(p, agentpod.CAVolume) {
 		t.Error("CA not wired into the sidecar")
 	}
 }
@@ -151,7 +153,7 @@ func TestEphemeralContainersCannotReachTheSidecar(t *testing.T) {
 	if err := ValidateEphemeral(debug("wsnap"), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may share the sidecar's process namespace")
 	}
-	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: tokenVolume, MountPath: "/t"}), "wsnap", false); err == nil {
+	if err := ValidateEphemeral(debug("agent", corev1.VolumeMount{Name: agentpod.TokenVolume, MountPath: "/t"}), "wsnap", false); err == nil {
 		t.Error("an ephemeral container may mount the wsnap token")
 	}
 }
@@ -206,7 +208,7 @@ func TestWorkloadCannotReachAgentSecretsOrTheAPI(t *testing.T) {
 	if err := Mutate(p, cfg); err != nil {
 		t.Fatal(err)
 	}
-	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: stateVolume, MountPath: "/steal"})
+	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: agentpod.StateVolume, MountPath: "/steal"})
 	p.Annotations = map[string]string{AnnotationInject: "false"}
 	if err := Mutate(p, cfg); err == nil {
 		t.Fatal("a workload container that mounts the sidecar's state volume was admitted")
@@ -247,5 +249,53 @@ func TestAdmissionPluginTokenIsRemoved(t *testing.T) {
 	q.Spec.Containers[0].VolumeMounts = append(q.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: apiToken.Name, MountPath: "/t"})
 	if err := workspace.CheckIsolation(q, "wsnap", false); err == nil {
 		t.Fatal("the isolation check accepted a workload that mounts an API token")
+	}
+}
+
+func TestManagedBrokerCAIsInjected(t *testing.T) {
+	ca := func() []byte { return []byte("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n") }
+	c := cfg
+	c.CABundle = ca
+	p := labeledPod()
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	env := p.Spec.InitContainers[0].Env
+	if len(env) != 1 || env[0].Name != "WSNAP_CA_PEM" || env[0].Value != string(ca()) {
+		t.Fatalf("sidecar env = %+v; want the broker CA in WSNAP_CA_PEM", env)
+	}
+	c.CAConfigMap = "wsnap-ca" // an operator-provided CA wins
+	p = labeledPod()
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	if env := p.Spec.InitContainers[0].Env; len(env) != 0 {
+		t.Fatalf("both a ConfigMap CA and an inline CA: %+v", env)
+	}
+}
+
+func TestOwnSidecarGetsTheManagedCA(t *testing.T) {
+	c := cfg
+	c.CABundle = func() []byte { return []byte("ca") }
+	own := func(args ...string) *corev1.Pod {
+		return labeledPod(func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "wsnap", Image: "agent:1", Args: args,
+				RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+				StartupProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"ready"}}}}}}
+		})
+	}
+	p := own("sidecar")
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	if env := p.Spec.InitContainers[0].Env; len(env) != 1 || env[0].Value != "ca" {
+		t.Fatalf("own sidecar env = %+v", env)
+	}
+	p = own("sidecar", "--ca-file=/x/ca.crt")
+	if err := Mutate(p, c); err != nil {
+		t.Fatal(err)
+	}
+	if env := p.Spec.InitContainers[0].Env; len(env) != 0 {
+		t.Fatalf("a sidecar with its own CA got another: %+v", env)
 	}
 }

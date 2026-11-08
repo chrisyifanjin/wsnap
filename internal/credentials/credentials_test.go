@@ -225,3 +225,18 @@ func TestS3ListScopeExcludesSiblings(t *testing.T) {
 		}
 	}
 }
+
+// An external_account file names a token source (a file, URL or command)
+// that the broker would read or run. A tenant writes the Secret, so the
+// broker accepts only service account keys.
+func TestGCSDownscopedRefusesExternalAccounts(t *testing.T) {
+	ext := `{"type": "external_account", "audience": "//iam.googleapis.com/x",
+		"subject_token_type": "urn:ietf:params:oauth:token-type:jwt", "token_url": "https://sts.googleapis.com/v1/token",
+		"credential_source": {"file": "/var/run/secrets/kubernetes.io/serviceaccount/token"}}`
+	_, err := GCSDownscoped{}.Issue(context.Background(), Request{Role: protocol.RoleSnapshot,
+		Backend: protocol.Backend{GCS: &protocol.GCSBackend{Bucket: "b", Prefix: "p"}},
+		Secret:  map[string][]byte{KeyGoogleCredentials: []byte(ext)}})
+	if err == nil || !strings.Contains(err.Error(), "parse "+KeyGoogleCredentials) {
+		t.Fatalf("an external_account credential was accepted: %v", err)
+	}
+}

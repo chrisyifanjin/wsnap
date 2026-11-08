@@ -55,8 +55,25 @@ spec:
           metadata:
             type: object
           spec:
-            description: WorkspaceSpec is the durable identity of a workspace.
+            description: |-
+              WorkspaceSpec is the durable identity of a workspace.
+              A running Pod cannot change its executor placement, so mode is immutable.
             properties:
+              execution:
+                description: |-
+                  execution selects where live snapshots run. The default is sidecar.
+                  Worker requires a PVC that a second Pod can mount and a Workspace
+                  created before its first workload Pod.
+                properties:
+                  mode:
+                    default: sidecar
+                    description: mode is sidecar (the default) or worker (a separate
+                      Pod sharing the PVC).
+                    enum:
+                    - sidecar
+                    - worker
+                    type: string
+                type: object
               repositoryName:
                 description: repositoryName is the SnapshotRepository holding this
                   workspace.
@@ -80,6 +97,11 @@ spec:
             required:
             - repositoryName
             type: object
+            x-kubernetes-validations:
+            - message: execution mode is immutable
+              rule: 'has(oldSelf.execution) ? (has(self.execution) && self.execution.mode
+                == oldSelf.execution.mode) : (!has(self.execution) || self.execution.mode
+                == ''sidecar'')'
           status:
             description: WorkspaceStatus is what wsnap knows about a workspace.
             properties:
@@ -151,6 +173,9 @@ spec:
                   description: JobRef identifies a Job the controller created.
                   properties:
                     claimName:
+                      description: |-
+                        The volume identity a mover or restorer was created to use. Empty for
+                        maintenance Jobs, which do not mount a workspace PVC.
                       type: string
                     claimUID:
                       type: string
@@ -158,12 +183,25 @@ spec:
                       type: string
                     name:
                       type: string
+                    targetPodName:
+                      type: string
+                    targetPodUID:
+                      description: |-
+                        The workload Pod a worker Job serves. The Job's annotations can be
+                        edited; this record cannot.
+                      type: string
                     uid:
                       type: string
                     volumeName:
                       type: string
                     volumeUID:
                       type: string
+                    writerEpoch:
+                      description: |-
+                        writerEpoch is the epoch a worker Job claimed for its workload Pod.
+                        The broker sets it; it orders a late report against a newer writer.
+                      format: int64
+                      type: integer
                   required:
                   - kind
                   - name
@@ -313,7 +351,8 @@ spec:
                     description: claimName is empty for emptyDir workspaces.
                     type: string
                   claimUID:
-                    description: claimUID is the identity of the bound claim.
+                    description: claimUID prevents a deleted claim's replacement from
+                      inheriting its identity.
                     type: string
                   kind:
                     description: kind is persistentVolumeClaim, ephemeral or emptyDir.
@@ -322,7 +361,8 @@ spec:
                     description: volumeName is the bound PersistentVolume.
                     type: string
                   volumeUID:
-                    description: volumeUID is the identity of the bound PersistentVolume.
+                    description: volumeUID prevents a replacement PV with the same
+                      name from being trusted.
                     type: string
                 required:
                 - kind
