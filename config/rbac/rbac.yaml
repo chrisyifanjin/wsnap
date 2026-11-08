@@ -22,11 +22,6 @@ rules:
 - apiGroups: [""]
   resources: [persistentvolumes]
   verbs: [get, list, watch, patch, update]
-# The broker reads SnapshotRepository credential Secrets. Narrow this with a
-# Role per tenant namespace if the controller must not read every Secret.
-- apiGroups: [""]
-  resources: [secrets]
-  verbs: [get]
 - apiGroups: ["", events.k8s.io]
   resources: [events]
   verbs: [create, patch]
@@ -74,7 +69,7 @@ subjects:
   name: wsnap-controller
   namespace: wsnap-system
 ---
-# The webhook certificate Secret lives in wsnap-system only.
+# The webhook and broker certificate Secrets live in wsnap-system only.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -83,7 +78,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: [secrets]
-  verbs: [create, update]
+  verbs: [get, create, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -94,6 +89,33 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: wsnap-webhook-cert
+subjects:
+- kind: ServiceAccount
+  name: wsnap-controller
+  namespace: wsnap-system
+---
+# The broker reads each SnapshotRepository's credential Secret (get only;
+# Secrets are never listed or cached). By default this applies to every
+# namespace. The config/namespaced-secrets overlay removes the
+# ClusterRoleBinding; then bind this ClusterRole with a RoleBinding in each
+# namespace that has repositories (config/samples/secret-access.yaml).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wsnap-secret-reader
+rules:
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wsnap-secret-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wsnap-secret-reader
 subjects:
 - kind: ServiceAccount
   name: wsnap-controller

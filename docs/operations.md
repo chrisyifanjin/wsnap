@@ -37,6 +37,23 @@ to the release instead; it pins both image tags.
 The sample volume needs a StorageClass. Check yours with
 `kubectl get storageclass` before creating a Pod.
 
+### Limit which Secrets wsnap can read
+
+By default the controller may `get` Secrets in every namespace, because
+each SnapshotRepository's Secret lives in its own namespace. To allow only
+the namespaces you choose, install `config/namespaced-secrets` instead of
+`config/default`, and bind the reader role in each namespace that has
+repositories:
+
+```sh
+kubectl apply -k config/namespaced-secrets
+kubectl -n agents apply -f config/samples/secret-access.yaml
+```
+
+A repository in a namespace without the binding reports `Ready=False` with
+reason `SecretForbidden`, and wsnap checks again every minute. wsnap never
+lists or watches Secrets.
+
 ### Safe PVC provisioning
 
 Pick a StorageClass whose CSI driver, encryption, topology, and reclaim
