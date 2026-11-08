@@ -261,12 +261,46 @@ func (s *Server) resolveJob(ctx context.Context, c *caller, job string) (*caller
 	}
 	for _, ref := range ws.Status.Jobs {
 		if ref.UID == string(j.UID) && ref.Kind == job {
+			if ref != workspace.JobRef(&j) {
+				return nil, fail(http.StatusForbidden, "job %s no longer matches its registered volume identity", j.Name)
+			}
+			if job == "mover" || job == "restorer" {
+				if err := s.checkJobVolume(ctx, c, ref); err != nil {
+					return nil, err
+				}
+			}
 			return c, nil
 		}
 	}
 	// 503, not 403: the controller records a Job just after creating it,
 	// and the agent retries 5xx. A forged Job is never recorded.
 	return nil, fail(http.StatusServiceUnavailable, "job %s is not registered by wsnap (yet)", j.Name)
+}
+
+// checkJobVolume closes the gap between a controller's binding check and
+// the Job Pod's later credential request. Pod volumes name PVCs, so the
+// same name could refer to a replacement claim by then.
+func (s *Server) checkJobVolume(ctx context.Context, c *caller, registered wsnapv1.JobRef) error {
+	j := c.jobObj
+	ref := wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: registered.ClaimName,
+		ClaimUID: registered.ClaimUID, VolumeName: registered.VolumeName, VolumeUID: registered.VolumeUID}
+	if ref.ClaimName == "" || ref.ClaimUID == "" || ref.VolumeName == "" || ref.VolumeUID == "" {
+		return fail(http.StatusForbidden, "job %s lacks a complete PVC and PV identity", j.Name)
+	}
+	if err := workspace.ValidateBinding(ctx, s.Reader, c.id.Namespace, ref); err != nil {
+		if errors.Is(err, workspace.ErrBadVolume) {
+			return fail(http.StatusForbidden, "job %s volume binding changed: %v", j.Name, err)
+		}
+		return upstream(err, "check job %s volume", j.Name)
+	}
+	var pv corev1.PersistentVolume
+	if err := s.Reader.Get(ctx, client.ObjectKey{Name: ref.VolumeName}, &pv); err != nil {
+		return upstream(err, "check job %s volume owner", j.Name)
+	}
+	if pv.Annotations[wsnapv1.AnnotationWorkspaceRef] != c.id.Namespace+"/"+c.id.Name {
+		return fail(http.StatusForbidden, "job %s volume %s belongs to another workspace", j.Name, pv.Name)
+	}
+	return nil
 }
 
 // sameAgentSpec checks that a Pod runs its Job's template where it
@@ -808,6 +842,9 @@ func (s *Server) trackVolume(ctx context.Context, c *caller, consumeRestoreFrom 
 	ref, err := workspace.ResolveVolume(ctx, s.Reader, c.pod)
 	if err != nil {
 		return volumeError(err)
+	}
+	if ref.Kind != workspace.KindEmptyDir && ref.VolumeName == "" {
+		return fail(http.StatusConflict, "workspace claim %s is not bound to a volume yet", ref.ClaimName)
 	}
 	if err := s.checkNoActiveJob(ctx, c.id.Namespace, ref.VolumeName); err != nil {
 		return err

@@ -230,7 +230,8 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 		if pv.Annotations[wsnapv1.AnnotationWorkspaceRef] != ws.Namespace+"/"+ws.Name || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Namespace != ws.Namespace {
 			return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("volume %s is not bound to a claim of workspace %s", pvName, ws.Name))
 		}
-		vol = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: pv.Spec.ClaimRef.Name, VolumeName: pvName}
+		vol = &wsnapv1.VolumeRef{Kind: workspace.KindPVC, ClaimName: pv.Spec.ClaimRef.Name,
+			ClaimUID: string(pv.Spec.ClaimRef.UID), VolumeName: pvName, VolumeUID: string(pv.UID)}
 	}
 	if vol == nil || vol.ClaimName == "" || vol.Kind == workspace.KindEmptyDir {
 		return ctrl.Result{}, r.finish(ctx, sr, "no pod is running and the workspace has no persistent volume")
@@ -244,6 +245,9 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 	}
 	if claim.DeletionTimestamp != nil {
 		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("volume claim %s is being deleted", vol.ClaimName))
+	}
+	if err := workspace.ValidateBinding(ctx, r.Reader, ws.Namespace, *vol); err != nil {
+		return ctrl.Result{}, r.finish(ctx, sr, fmt.Sprintf("volume claim %s changed identity or binding: %v", vol.ClaimName, err))
 	}
 	// The snapshot and restore reconcilers run at the same time in the
 	// leader. Without this lock both could pass otherJobOnVolume and start
@@ -312,6 +316,7 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 		[]corev1.VolumeMount{{Name: "workspace", MountPath: dataMountPath}})
 	// The writer recorded now is the one whose data the Job captures.
 	job.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: claim.Spec.VolumeName, wsnapv1.AnnotationRequest: sr.GetName(),
+		workspace.AnnotationClaimUID: vol.ClaimUID, workspace.AnnotationPVUID: vol.VolumeUID,
 		workspace.AnnotationWriterPod:   pv.Annotations[workspace.AnnotationWriterPod],
 		workspace.AnnotationWriterEpoch: pv.Annotations[workspace.AnnotationWriterEpoch]}
 	// Mark the request Running before the Job exists: the broker lets a

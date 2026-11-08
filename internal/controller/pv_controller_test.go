@@ -34,7 +34,7 @@ func releasedPV(annotations map[string]string) *corev1.PersistentVolume {
 		a[k] = v
 	}
 	return &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: "pv-1", Labels: map[string]string{wsnapv1.LabelProtected: "true"}, Annotations: a},
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-1", UID: "uid-pv-1", Labels: map[string]string{wsnapv1.LabelProtected: "true"}, Annotations: a},
 		Spec: corev1.PersistentVolumeSpec{
 			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
 			StorageClassName:              "standard",
@@ -43,6 +43,25 @@ func releasedPV(annotations map[string]string) *corev1.PersistentVolume {
 			ClaimRef:                      &corev1.ObjectReference{Namespace: testNS, Name: "old-claim", UID: "old-uid"},
 		},
 		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeReleased},
+	}
+}
+
+func rescueClaimFixture(pv *corev1.PersistentVolume, uid types.UID) *corev1.PersistentVolumeClaim {
+	class := pv.Spec.StorageClassName
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: rescueClaimName(pv.Name), UID: uid,
+			Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue}},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: pv.Name, StorageClassName: &class,
+			AccessModes: pv.Spec.AccessModes, VolumeMode: pv.Spec.VolumeMode,
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: pv.Spec.Capacity[corev1.ResourceStorage]}}},
+	}
+}
+
+func TestRescueVolumeModeUsesKubernetesDefault(t *testing.T) {
+	filesystem := corev1.PersistentVolumeFilesystem
+	block := corev1.PersistentVolumeBlock
+	if !sameVolumeMode(nil, &filesystem) || sameVolumeMode(nil, &block) {
+		t.Fatal("nil volume mode must mean Filesystem, not Block")
 	}
 }
 
@@ -65,8 +84,18 @@ func newPVReconciler(t *testing.T, objs ...client.Object) (*PVReconciler, client
 	repo := &wsnapv1.SnapshotRepository{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "repo"}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objs, repo)...).
 		WithStatusSubresource(&wsnapv1.Workspace{}, &corev1.PersistentVolume{}, &batchv1.Job{}).Build()
-	return &PVReconciler{Client: c, Reader: c, Recorder: record.NewFakeRecorder(10),
+	return &PVReconciler{Client: uidPVCClient{c}, Reader: c, Recorder: record.NewFakeRecorder(10),
 		Jobs: JobConfig{AgentImage: "agent:test", BrokerURL: "http://broker", Audience: "wsnap"}}, c
+}
+
+// The fake client does not assign UIDs; the API server does so on Create.
+type uidPVCClient struct{ client.Client }
+
+func (c uidPVCClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if pvc, ok := obj.(*corev1.PersistentVolumeClaim); ok && pvc.UID == "" {
+		pvc.UID = types.UID("uid-" + pvc.Name)
+	}
+	return c.Client.Create(ctx, obj, opts...)
 }
 
 func reconcilePV(t *testing.T, r *PVReconciler) {
@@ -110,6 +139,9 @@ func TestOriginallyRetainedVolumeStaysRetained(t *testing.T) {
 	if p := getPV(t, c).Spec.PersistentVolumeReclaimPolicy; p != corev1.PersistentVolumeReclaimRetain {
 		t.Errorf("policy %s, want the original Retain", p)
 	}
+	if got := getPV(t, c); got.Annotations[wsnapv1.AnnotationWorkspaceRef] != "" || got.Annotations[workspace.AnnotationWriterPod] != "" {
+		t.Errorf("reusable Retain PV kept old workspace identity: %v", got.Annotations)
+	}
 }
 
 func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
@@ -126,8 +158,8 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 		t.Error("PV lost its Retain policy during the rescue")
 	}
 	ref := pv.Spec.ClaimRef
-	if ref == nil || ref.Name != rescueClaimName("pv-1") || ref.UID != "" {
-		t.Errorf("claimRef = %+v, want a UID-less pre-bind to the rescue claim", ref)
+	if ref == nil || ref.Name != rescueClaimName("pv-1") || ref.UID != types.UID("uid-"+rescueClaimName("pv-1")) {
+		t.Errorf("claimRef = %+v, want the rescue claim's UID", ref)
 	}
 	var claim corev1.PersistentVolumeClaim
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: rescueClaimName("pv-1")}, &claim); err != nil {
@@ -168,6 +200,26 @@ func TestReleasedWithoutFinalSnapshotIsRescued(t *testing.T) {
 	reconcilePV(t, r)
 	if p := getPV(t, c).Spec.PersistentVolumeReclaimPolicy; p != corev1.PersistentVolumeReclaimDelete {
 		t.Errorf("policy %s after rescue, want Delete", p)
+	}
+}
+
+func TestRescueRefusesPreexistingSameNameClaim(t *testing.T) {
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"})
+	// A namespace user made the exact claim wsnap would make. Matching
+	// labels and spec are insufficient; the PV never reserved its UID.
+	claim := rescueClaimFixture(pv, "attacker-uid")
+	r, c := newPVReconciler(t, testWorkspace(), pv, claim)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: pv.Name}})
+	if err == nil || !strings.Contains(err.Error(), "without matching PV claim UID") {
+		t.Fatalf("reconcile error = %v, want claim collision refusal", err)
+	}
+	got := getPV(t, c)
+	if got.Spec.ClaimRef.UID != "old-uid" || got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		t.Fatalf("collision changed protected PV: %+v", got.Spec)
+	}
+	var jobs batchv1.JobList
+	if err := c.List(context.Background(), &jobs); err != nil || len(jobs.Items) != 0 {
+		t.Fatalf("collision started rescue Job: %v, %d Jobs", err, len(jobs.Items))
 	}
 }
 
@@ -249,7 +301,7 @@ func TestMissingMoverJobIsRecreated(t *testing.T) {
 	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: RescueRunning})
 	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName("pv-1"), UID: "rescue-claim-uid"}
 	pv.Status.Phase = corev1.VolumeBound
-	r, c := newPVReconciler(t, testWorkspace(), pv)
+	r, c := newPVReconciler(t, testWorkspace(), pv, rescueClaimFixture(pv, "rescue-claim-uid"))
 	reconcilePV(t, r)
 	var job batchv1.Job
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job); err != nil {
@@ -362,7 +414,7 @@ func (s staleWorkspaceCache) Get(ctx context.Context, key client.ObjectKey, obj 
 // TestStaleWorkspaceCacheDoesNotReclaim (suspicion S2).
 func TestStaleWorkspaceCacheDoesNotReclaim(t *testing.T) {
 	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
-	r.Client = staleWorkspaceCache{c}
+	r.Client = uidPVCClient{staleWorkspaceCache{c}}
 	reconcilePV(t, r)
 	if p := getPV(t, c).Spec.PersistentVolumeReclaimPolicy; p != corev1.PersistentVolumeReclaimRetain {
 		t.Fatalf("PV reclaim policy %s after a stale cache read; the data would be deleted", p)
@@ -404,7 +456,7 @@ func TestRemovingFailedAnnotationRetriesTheRescue(t *testing.T) {
 	pv.Status.Phase = corev1.VolumeBound
 	failed := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: moverJobName("pv-1"), UID: "old-job"},
 		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}}}}
-	r, c := newPVReconciler(t, testWorkspace(), pv, failed)
+	r, c := newPVReconciler(t, testWorkspace(), pv, rescueClaimFixture(pv, "c"), failed)
 	reconcilePV(t, r) // deletes the failed Job
 	reconcilePV(t, r) // creates a new one
 	if a := getPV(t, c).Annotations[wsnapv1.AnnotationRescue]; a != RescueRunning {

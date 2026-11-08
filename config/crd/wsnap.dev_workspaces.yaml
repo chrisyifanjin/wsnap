@@ -150,11 +150,19 @@ spec:
                 items:
                   description: JobRef identifies a Job the controller created.
                   properties:
+                    claimName:
+                      type: string
+                    claimUID:
+                      type: string
                     kind:
                       type: string
                     name:
                       type: string
                     uid:
+                      type: string
+                    volumeName:
+                      type: string
+                    volumeUID:
                       type: string
                   required:
                   - kind
@@ -304,11 +312,17 @@ spec:
                   claimName:
                     description: claimName is empty for emptyDir workspaces.
                     type: string
+                  claimUID:
+                    description: claimUID is the identity of the bound claim.
+                    type: string
                   kind:
                     description: kind is persistentVolumeClaim, ephemeral or emptyDir.
                     type: string
                   volumeName:
                     description: volumeName is the bound PersistentVolume.
+                    type: string
+                  volumeUID:
+                    description: volumeUID is the identity of the bound PersistentVolume.
                     type: string
                 required:
                 - kind

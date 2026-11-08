@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -131,22 +132,50 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 			Resources:  corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: pv.Spec.Capacity[corev1.ResourceStorage]}},
 		},
 	}
-	if err := r.Create(ctx, claim); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create rescue claim: %w", err)
+	createErr := r.Create(ctx, claim)
+	if createErr != nil && !apierrors.IsAlreadyExists(createErr) {
+		return fmt.Errorf("create rescue claim: %w", createErr)
 	}
-	// A Released PV keeps a claimRef to the deleted claim. Pointing it at
-	// the rescue claim without a UID pre-binds it, and the PV controller
-	// binds the two.
+	// Read the claim live. A same-name PVC might have been created by a
+	// namespace user; never mount it or let it provision another PV. On a
+	// retry, the PV must already record this precise claim UID.
+	var actual corev1.PersistentVolumeClaim
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: ws.Namespace, Name: claimName}, &actual); err != nil {
+		return fmt.Errorf("read rescue claim: %w", err)
+	}
+	claimSize := actual.Spec.Resources.Requests[corev1.ResourceStorage]
+	volumeSize := pv.Spec.Capacity[corev1.ResourceStorage]
+	if actual.UID == "" || actual.DeletionTimestamp != nil || actual.Labels[wsnapv1.LabelManagedBy] != wsnapv1.ManagedByValue ||
+		actual.Spec.VolumeName != pv.Name || actual.Spec.StorageClassName == nil || *actual.Spec.StorageClassName != storageClass ||
+		!slices.Equal(actual.Spec.AccessModes, claim.Spec.AccessModes) ||
+		!sameVolumeMode(actual.Spec.VolumeMode, claim.Spec.VolumeMode) ||
+		claimSize.Cmp(volumeSize) != 0 {
+		return fmt.Errorf("rescue claim %s/%s does not match volume %s; keeping the volume", ws.Namespace, claimName, pv.Name)
+	}
+	if apierrors.IsAlreadyExists(createErr) && (pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Namespace != ws.Namespace ||
+		pv.Spec.ClaimRef.Name != claimName || pv.Spec.ClaimRef.UID != actual.UID) {
+		return fmt.Errorf("rescue claim %s/%s already exists without matching PV claim UID; keeping the volume", ws.Namespace, claimName)
+	}
+	// A Released PV keeps a claimRef to the deleted claim. Pre-bind it to
+	// the rescue claim's UID so a replacement under that name cannot inherit
+	// this PV after a controller restart.
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cur corev1.PersistentVolume
 		if err := r.Get(ctx, types.NamespacedName{Name: pv.Name}, &cur); err != nil {
 			return err
 		}
 		changed := false
-		// Keep an existing pre-bind to the rescue claim untouched: once
-		// bound, it carries the claim's UID.
+		if cur.UID != pv.UID || cur.Annotations[wsnapv1.AnnotationWorkspaceRef] != ws.Namespace+"/"+ws.Name {
+			return fmt.Errorf("volume %s changed identity or workspace during rescue", pv.Name)
+		}
+		if ref := cur.Spec.ClaimRef; ref != nil && ref.Name == claimName && ref.Namespace == ws.Namespace && ref.UID != actual.UID {
+			return fmt.Errorf("volume %s is pre-bound to a different rescue claim UID", pv.Name)
+		}
 		if ref := cur.Spec.ClaimRef; ref == nil || ref.Name != claimName || ref.Namespace != ws.Namespace {
-			cur.Spec.ClaimRef = &corev1.ObjectReference{Kind: "PersistentVolumeClaim", APIVersion: "v1", Namespace: ws.Namespace, Name: claimName}
+			if cur.Status.Phase != corev1.VolumeReleased {
+				return fmt.Errorf("volume %s is no longer released; refusing rescue pre-bind", pv.Name)
+			}
+			cur.Spec.ClaimRef = &corev1.ObjectReference{Kind: "PersistentVolumeClaim", APIVersion: "v1", Namespace: ws.Namespace, Name: claimName, UID: actual.UID}
 			changed = true
 		}
 		if cur.Annotations[wsnapv1.AnnotationRescue] != RescueRunning {
@@ -166,6 +195,7 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName}}}},
 		[]corev1.VolumeMount{{Name: "workspace", MountPath: dataMountPath}})
 	job.Annotations = map[string]string{wsnapv1.AnnotationVolumeName: pv.Name,
+		workspace.AnnotationClaimUID: string(actual.UID), workspace.AnnotationPVUID: string(pv.UID),
 		workspace.AnnotationWriterPod:   pv.Annotations[workspace.AnnotationWriterPod],
 		workspace.AnnotationWriterEpoch: pv.Annotations[workspace.AnnotationWriterEpoch]}
 	if err := createJob(ctx, r.Client, r.Reader, job, ws.Name); err != nil {
@@ -173,6 +203,16 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 	}
 	r.Recorder.Eventf(pv, corev1.EventTypeNormal, "RescueStarted", "mover job %s/%s snapshots this volume", ws.Namespace, job.Name)
 	return nil
+}
+
+func sameVolumeMode(a, b *corev1.PersistentVolumeMode) bool {
+	mode := func(p *corev1.PersistentVolumeMode) corev1.PersistentVolumeMode {
+		if p == nil {
+			return corev1.PersistentVolumeFilesystem // Kubernetes' default
+		}
+		return *p
+	}
+	return mode(a) == mode(b)
 }
 
 func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVolume, ns, name string, retry bool) (ctrl.Result, error) {
@@ -262,6 +302,12 @@ func (r *PVReconciler) reclaim(ctx context.Context, pv *corev1.PersistentVolume)
 	}
 	patch := client.MergeFrom(pv.DeepCopy())
 	delete(pv.Labels, wsnapv1.LabelProtected)
+	// A Retain PV can later be cleaned and bound to another workspace.
+	// Its old ownership and writer marks must not follow the asset.
+	for _, key := range []string{wsnapv1.AnnotationWorkspaceRef, wsnapv1.AnnotationOriginalReclaimPolicy,
+		wsnapv1.AnnotationRescue, workspace.AnnotationWriterPod, workspace.AnnotationWriterEpoch, workspace.AnnotationFinalPod} {
+		delete(pv.Annotations, key)
+	}
 	pv.Spec.PersistentVolumeReclaimPolicy = original
 	return r.Patch(ctx, pv, patch)
 }
