@@ -1,0 +1,100 @@
+name: Cloud conformance
+
+# Runs the engine round trip (snapshot, restore, maintenance) and the
+# cross-workspace isolation test against real AWS S3, Google Cloud Storage
+# and Azure Blob, each with the scoped provider wsnap ships for it. Each
+# cloud runs only when its repository variables are set; the login uses
+# GitHub OIDC, so no cloud key is stored in GitHub. docs/verification.md
+# describes the cloud-side setup.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  aws:
+    if: vars.WSNAP_AWS_CI_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install the engine CLIs
+        run: |
+          hack/install-engines.sh "$RUNNER_TEMP/engines"
+          echo "$RUNNER_TEMP/engines" >> "$GITHUB_PATH"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.WSNAP_AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.WSNAP_AWS_REGION }}
+      - name: Round trip and isolation (s3-sts)
+        env:
+          WSNAP_TEST_AWS_BUCKET: ${{ vars.WSNAP_AWS_BUCKET }}
+          WSNAP_TEST_AWS_REGION: ${{ vars.WSNAP_AWS_REGION }}
+          WSNAP_TEST_AWS_ROLE_ARN: ${{ vars.WSNAP_AWS_WORKSPACE_ROLE_ARN }}
+        run: go test ./internal/engine -count=1 -v -run 'TestRoundTrip/.*/s3-sts-aws|TestScopedIsolation/s3-sts-aws'
+
+  gcp:
+    if: vars.WSNAP_GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install the engine CLIs
+        run: |
+          hack/install-engines.sh "$RUNNER_TEMP/engines"
+          echo "$RUNNER_TEMP/engines" >> "$GITHUB_PATH"
+      # Writes an external_account credential file and sets
+      # GOOGLE_APPLICATION_CREDENTIALS; the tests use it as the broker's
+      # GOOGLE_CREDENTIALS_JSON.
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WSNAP_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.WSNAP_GCP_SERVICE_ACCOUNT }}
+      - name: Round trip and isolation (gcs-downscoped)
+        env:
+          WSNAP_TEST_GCP_BUCKET: ${{ vars.WSNAP_GCP_BUCKET }}
+        run: go test ./internal/engine -count=1 -v -run 'TestRoundTrip/.*/gcs-downscoped-gcp|TestScopedIsolation/gcs-downscoped-gcp'
+
+  azure:
+    if: vars.WSNAP_AZURE_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install the engine CLIs
+        run: |
+          hack/install-engines.sh "$RUNNER_TEMP/engines"
+          echo "$RUNNER_TEMP/engines" >> "$GITHUB_PATH"
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.WSNAP_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.WSNAP_AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.WSNAP_AZURE_SUBSCRIPTION_ID }}
+      # azure-sas signs service SAS tokens with the account key, as the
+      # broker does with AZURE_ACCOUNT_KEY.
+      - name: Read the storage account key
+        run: |
+          key=$(az storage account keys list --account-name "${{ vars.WSNAP_AZURE_ACCOUNT }}" --query '[0].value' -o tsv)
+          echo "::add-mask::$key"
+          echo "WSNAP_TEST_AZURE_ACCOUNT_KEY=$key" >> "$GITHUB_ENV"
+      - name: Round trip and isolation (azure-sas)
+        env:
+          WSNAP_TEST_AZURE_ACCOUNT: ${{ vars.WSNAP_AZURE_ACCOUNT }}
+        run: go test ./internal/engine -count=1 -v -run 'TestRoundTrip/.*/azure-sas-cloud|TestScopedIsolation/azure-sas-cloud'
