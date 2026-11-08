@@ -57,6 +57,18 @@ variables are set. The login uses GitHub OIDC, so GitHub stores no cloud
 key. Use a dedicated bucket or account, with a lifecycle rule that deletes
 `conformance/` objects after one day.
 
+**Set it up** with the scripts in `hack/cloud-conformance/`. Run each one in
+that cloud's browser shell (AWS CloudShell, Google Cloud Shell, Azure Cloud
+Shell); it creates the resources below with least privilege and prints the
+`gh variable set` commands. Then start a run:
+`gh workflow run cloud-conformance.yml --repo <owner>/wsnap`.
+
+```sh
+REPO=<owner>/wsnap REGION=us-east-1 bash hack/cloud-conformance/aws.sh
+REPO=<owner>/wsnap PROJECT=<project> bash hack/cloud-conformance/gcp.sh
+REPO=<owner>/wsnap LOCATION=eastus bash hack/cloud-conformance/azure.sh
+```
+
 **Status:** the workflow has not run against a real cloud yet. Until it
 does, the tables above are the evidence: S3 with STS against MinIO, GCS
 against an emulator, and Azure against Azurite.
