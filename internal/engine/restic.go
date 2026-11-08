@@ -171,7 +171,7 @@ func (r *Restic) Snapshot(ctx context.Context, t Target, dir string) (Snapshot, 
 			SnapshotID  string `json:"snapshot_id"`
 		}
 		if json.Unmarshal(sc.Bytes(), &m) == nil && m.MessageType == "summary" && m.SnapshotID != "" {
-			return Snapshot{ID: m.SnapshotID, Time: time.Now().UTC()}, nil
+			return Snapshot{ID: m.SnapshotID, Time: time.Now().UTC(), Partial: exitCode(err) == resticExitIncomplete}, nil
 		}
 	}
 	return Snapshot{}, fmt.Errorf("restic backup: no summary in output %q", tail(string(out), 500))

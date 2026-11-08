@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -52,6 +53,10 @@ type Server struct {
 	AllowAutomountedTokens bool
 	// Limiter bounds requests per Pod. Nil disables limiting.
 	Limiter *PodLimiter
+	// ReviewsPerIP bounds TokenReviews (for tokens not in the cache) per
+	// client IP. Nil: the default.
+	ReviewsPerIP *PodLimiter
+	reviewsOnce  sync.Once
 	// Hub wakes long polls when requests appear. Nil falls back to
 	// periodic checks only.
 	Hub *Hub
@@ -124,12 +129,9 @@ func (s *Server) resolve(r *http.Request) (*caller, error) {
 	if !ok || token == "" {
 		return nil, fail(http.StatusUnauthorized, "missing bearer token")
 	}
-	ident, err := s.Auth.Authenticate(ctx, token)
-	if errors.Is(err, ErrAuthUnavailable) {
-		return nil, fail(http.StatusServiceUnavailable, "%v", err)
-	}
+	ident, err := s.authenticate(r, token)
 	if err != nil {
-		return nil, fail(http.StatusUnauthorized, "%v", err)
+		return nil, err
 	}
 	var pod corev1.Pod
 	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: ident.Namespace, Name: ident.PodName}, &pod); apierrors.IsNotFound(err) {
@@ -157,6 +159,42 @@ func (s *Server) resolve(r *http.Request) (*caller, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// authenticate validates an agent token. A token the broker validated
+// recently is answered from its cache; any other token costs a TokenReview,
+// which is limited per client IP (429).
+func (s *Server) authenticate(r *http.Request, token string) (Identity, error) {
+	var (
+		ident Identity
+		err   error
+		known bool
+	)
+	if ca, ok := s.Auth.(*CachingAuthenticator); ok {
+		ident, err, known = ca.Known(token)
+	}
+	if !known {
+		if ip := clientIP(r); !s.reviews().Allow(ip) {
+			return Identity{}, fail(http.StatusTooManyRequests, "too many token reviews from %s", ip)
+		}
+		ident, err = s.Auth.Authenticate(r.Context(), token)
+	}
+	if errors.Is(err, ErrAuthUnavailable) {
+		return ident, fail(http.StatusServiceUnavailable, "%v", err)
+	}
+	if err != nil {
+		return ident, fail(http.StatusUnauthorized, "%v", err)
+	}
+	return ident, nil
+}
+
+func (s *Server) reviews() *PodLimiter {
+	s.reviewsOnce.Do(func() {
+		if s.ReviewsPerIP == nil {
+			s.ReviewsPerIP = newReviewLimiter()
+		}
+	})
+	return s.ReviewsPerIP
 }
 
 // checkNoAPIToken refuses workload Pods that mount the default API token.
@@ -237,8 +275,9 @@ func (s *Server) resolveJob(ctx context.Context, c *caller, job string) (*caller
 // security context), and every volume the template defines is unchanged.
 // The API server defaults a Job template and its Pods the same way, so
 // these fields match exactly for a Pod the Job controller created. Other
-// containers and volumes are allowed: admission webhooks (a service mesh,
-// for example) add them to real Job Pods.
+// containers and volumes are allowed, as long as the added containers
+// mount no template volume but ConfigMaps: admission webhooks (a service
+// mesh, for example) add them to real Job Pods.
 func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 	if ptr.Deref(pod.ShareProcessNamespace, false) || pod.HostPID {
 		return fmt.Errorf("shares a process namespace")
@@ -267,19 +306,41 @@ func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 	for _, c := range tmpl.Containers {
 		tmplContainers[c.Name] = c
 	}
+	// Everything that decides what runs inside the container, including
+	// lifecycle hooks and probes: an exec hook or probe runs in the agent
+	// container and can read its token and state (reviewer #6).
 	same := func(p corev1.Container) bool {
 		t, ok := tmplContainers[p.Name]
 		return ok && p.Image == t.Image && equality.Semantic.DeepEqual(p.Command, t.Command) &&
 			equality.Semantic.DeepEqual(p.Args, t.Args) && equality.Semantic.DeepEqual(p.Env, t.Env) &&
 			equality.Semantic.DeepEqual(p.EnvFrom, t.EnvFrom) && equality.Semantic.DeepEqual(p.VolumeMounts, t.VolumeMounts) &&
-			equality.Semantic.DeepEqual(p.SecurityContext, t.SecurityContext)
+			equality.Semantic.DeepEqual(p.SecurityContext, t.SecurityContext) &&
+			equality.Semantic.DeepEqual(p.Lifecycle, t.Lifecycle) &&
+			equality.Semantic.DeepEqual(p.LivenessProbe, t.LivenessProbe) &&
+			equality.Semantic.DeepEqual(p.ReadinessProbe, t.ReadinessProbe) &&
+			equality.Semantic.DeepEqual(p.StartupProbe, t.StartupProbe) &&
+			equality.Semantic.DeepEqual(p.VolumeDevices, t.VolumeDevices) &&
+			p.WorkingDir == t.WorkingDir && p.Stdin == t.Stdin && p.StdinOnce == t.StdinOnce && p.TTY == t.TTY
+	}
+	// Every template volume is private to the template's containers except
+	// ConfigMaps: besides the token, the state volume holds the engine's
+	// storage credentials (Kopia's repository.config), and the workspace
+	// and backend volumes hold data.
+	private := map[string]bool{}
+	for _, v := range tmpl.Volumes {
+		if v.ConfigMap == nil {
+			private[v.Name] = true
+		}
+	}
+	for name := range tokenVolumes {
+		private[name] = true
 	}
 	readsToken := func(mounts []corev1.VolumeMount) bool {
-		return slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return tokenVolumes[m.Name] })
+		return slices.ContainsFunc(mounts, func(m corev1.VolumeMount) bool { return private[m.Name] })
 	}
 	for _, c := range pod.InitContainers {
 		if readsToken(c.VolumeMounts) {
-			return fmt.Errorf("init container %q mounts the wsnap token", c.Name)
+			return fmt.Errorf("init container %q mounts a volume of the agent", c.Name)
 		}
 	}
 	for _, c := range pod.EphemeralContainers {
@@ -295,7 +356,7 @@ func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 			}
 			found++
 		} else if readsToken(c.VolumeMounts) {
-			return fmt.Errorf("container %q mounts the wsnap token", c.Name)
+			return fmt.Errorf("container %q mounts a volume of the agent", c.Name)
 		}
 	}
 	if found != len(tmpl.Containers) {
@@ -509,10 +570,13 @@ func (s *Server) credentials(r *http.Request) (*protocol.CredentialsResponse, er
 	return &protocol.CredentialsResponse{
 		Namespace: c.id.Namespace, Workspace: c.id.Name, Role: req.Role,
 		Engine: eng, Backend: backend, Credentials: creds, RepositoryPassword: password,
-		Interval:   protocol.Duration{Duration: workspace.Interval(&repo)},
-		KeepLast:   workspace.KeepLast(&repo),
-		KeepDaily:  workspace.KeepDaily(&repo),
-		SnapshotID: snapshotID, SourceWorkspace: source, RestoreFromGeneration: restoreGen,
+		Interval:  protocol.Duration{Duration: workspace.Interval(&repo)},
+		KeepLast:  workspace.KeepLast(&repo),
+		KeepDaily: workspace.KeepDaily(&repo),
+		// Only an explicit setting: an unset field must not override the
+		// agent's own --operation-timeout with the default.
+		OperationTimeout: protocol.Duration{Duration: repo.Spec.OperationTimeout.Duration},
+		SnapshotID:       snapshotID, SourceWorkspace: source, RestoreFromGeneration: restoreGen,
 		LatestSnapshotID: latestID, KeepIDs: keep,
 	}, nil
 }
@@ -676,8 +740,9 @@ func (s *Server) checkNoPendingRescue(ctx context.Context, c *caller) error {
 // eviction gives no grace period) keeps its ephemeral claim until it is
 // deleted. Its data is newer than lastSnapshot. The broker asks for a
 // snapshot of exactly that volume and makes restores wait for it. A
-// failed rescue does not block forever: as with a Released PV whose rescue
-// failed, the operator is alerted (status.lastError) and restores go on.
+// failed rescue does not block forever: the failed request stays, the
+// WsnapRescueRequestFailed alert fires (wsnap_rescue_requests_failed), and
+// restores go on.
 func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Identity, pv *corev1.PersistentVolume) error {
 	writer := pv.Annotations[workspace.AnnotationWriterPod]
 	if writer == "" {
@@ -687,10 +752,21 @@ func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Iden
 	if err := s.Reader.List(ctx, &pods, client.InNamespace(id.Namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: id.Name}); err != nil {
 		return upstream(err, "list workspace pods")
 	}
-	for _, p := range pods.Items {
-		if string(p.UID) == writer && p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+	stuck := false
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if string(p.UID) != writer {
+			continue
+		}
+		if stillWriting(p, time.Now()) {
 			return nil // still running: the single-writer rule applies
 		}
+		// Terminating far past its deadline (a lost node): its volume is
+		// probably unreachable, so waiting for the rescue could take hours.
+		// Ask for it anyway, but let the restore go on. When the node
+		// comes back, the rescue lands in status.supersededSnapshots
+		// (pinned), and the WsnapSupersededSnapshots alert fires.
+		stuck = p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed
 	}
 	h := sha256.Sum256([]byte(pv.Name + "\x00" + writer))
 	name := "wsnap-unsaved-" + hex.EncodeToString(h[:])[:10]
@@ -706,7 +782,15 @@ func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Iden
 		if err := s.Client.Create(ctx, &req); err != nil && !apierrors.IsAlreadyExists(err) {
 			return upstream(err, "create rescue request")
 		}
+		if stuck {
+			s.Log.Info("restoring while a lost writer's volume holds unsaved data; its rescue will be kept as superseded",
+				"workspace", id.Name, "pv", pv.Name, "request", name)
+			return nil
+		}
 		return fail(http.StatusConflict, "volume %s of stopped pod holds unsaved data; saving it first (request %s)", pv.Name, name)
+	}
+	if stuck {
+		return nil
 	}
 	if err != nil {
 		return upstream(err, "rescue request %s", name)
@@ -1205,6 +1289,11 @@ func (s *Server) claimRequests(ctx context.Context, c *caller) (protocol.WaitRes
 	}
 	byWorkspace := []client.ListOption{client.InNamespace(c.id.Namespace), client.MatchingFields{workspace.IndexWorkspaceName: c.id.Name}}
 	claim := func(obj client.Object, st *wsnapv1.WorkspaceSnapshotStatus) (bool, error) {
+		if obj.GetAnnotations()[wsnapv1.AnnotationVolumeName] != "" {
+			// Targets a specific (stopped writer's) volume: only a Job can
+			// reach it; a sidecar would snapshot its own volume instead.
+			return false, nil
+		}
 		if st.Phase == wsnapv1.SnapshotRunning && st.Executor == "sidecar" && st.ClaimedBy == string(c.pod.UID) {
 			// Claimed by this Pod but maybe never delivered: the answer to
 			// an earlier poll can be lost, or the sidecar restarted. Deliver

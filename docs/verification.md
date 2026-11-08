@@ -171,8 +171,8 @@ first shown by the reviewer's own probe tests.
   `lastSnapshot`. Every released volume is rescued, and restores use the
   broker's `lastSnapshot`, not the engine's newest snapshot
   (`TestWriterEpochs`, `TestOlderEpochNeverReplacesLatest`,
-  `TestOlderEpochVolumeIsRescued`). This also fences a deposed writer: its
-  late uploads are never restored.
+  `TestOlderEpochVolumeIsRescued`). This also fences a deposed writer: while
+  the broker has a record, its late uploads are not restored.
 - **The forged-Job fix was bypassable.** A bare Pod with an
   `ownerReference` to a registered Job got the Job's role, even after the
   Job finished. A Job pre-created under wsnap's predictable name was
@@ -287,6 +287,63 @@ Found by follow-up Kopia probes, and fixed:
   policy left later snapshots capturing `.wsnap` state. A writer now
   finishes policy and maintenance-owner setup when it reconnects to an
   existing repository (`TestKopiaRepairsInterruptedInitialization`).
+
+Found by the fifth independent review, and fixed:
+
+- **A copied Job Pod could read the delete credential** from the state
+  volume (Kopia's `repository.config`). An added container in a Job Pod
+  may now mount no template volume but ConfigMaps
+  (`TestJobPodMustRunTheJobTemplate`).
+- **Garbage tokens caused unlimited TokenReviews.** Failed logins are now
+  limited per client IP (429), and cache-miss TokenReviews have a global
+  cap (`TestGarbageTokensDoNotFloodTheAPIServer`).
+- **Kopia's own retention deleted pre-upgrade snapshots** that had no pin.
+  The global policy now turns Kopia's retention off; wsnap's maintenance
+  decides (`TestKopiaKeepsSnapshotsFromBeforePins`: 10 of 18 snapshots
+  survived without the fix).
+- **`--operation-timeout` could not be set.** `spec.operationTimeout` on
+  the repository now reaches the sidecar and Jobs, Job deadlines grow with
+  it, and validation refuses a credential TTL that would expire mid
+  operation.
+- **A partial mover snapshot counted as final.** Snapshots that skipped
+  unreadable files (Kopia's ignored errors, restic exit 3, exec
+  `"partial": true`) are recorded but never final, and a mover fails, so
+  the PV is kept (`TestPartialMoverSnapshotKeepsTheVolume`).
+- A targeted rescue request is never claimed by a sidecar, and the Pod
+  controller reads the Pod live before it marks a PV's writer.
+
+Found by the sixth independent review, and fixed:
+
+- **The forged-Job fix could be bypassed with an exec hook or probe** on
+  the agent container, which runs inside it and can read the token. Job
+  Pods must now match the template's hooks, probes, working directory and
+  TTY settings too (`TestJobPodMustRunTheJobTemplate`).
+- **A writer on a lost node: the rescue was never asked for.** The broker
+  now asks for it, without blocking the replacement; when it lands it is
+  kept as superseded (`TestLostWriterVolumeIsRescuedWithoutBlocking`).
+- **Rescue failures were silent.** The alert read `status.lastError`,
+  which the next success clears. New gauges count failed rescue requests
+  and workspaces with superseded snapshots until an operator acts
+  (`WsnapRescueRequestFailed`, `WsnapSupersededSnapshots`).
+- **A restore whose report was lost ran twice**, rolling back work done
+  after it. The sidecar now records completed restores on its private
+  volume and resends the saved report (`TestRestoreRequestRunsOnce`).
+- **A sidecar not yet admitted could clear a volume** another Pod was
+  restoring into. It is now admitted first.
+- **A partial safety snapshot was followed by the swap**, deleting files
+  in no snapshot. It now stops the restore
+  (`TestPartialSafetySnapshotKeepsLiveData`).
+- **"Remove the annotation to retry" did not retry** a failed rescue. It
+  now starts a new mover (`TestRemovingFailedAnnotationRetriesTheRescue`).
+- **The workload could lock its sidecar out** with bad tokens (the per-IP
+  limit added after review 5). Only TokenReviews of unknown tokens are
+  limited now; a known valid token always passes
+  (`TestGarbageTokensDoNotFloodTheAPIServer`).
+- **CI skipped the real-engine tests.** CI and releases now install Kopia
+  and restic at the Dockerfile's versions.
+- Documented: TLS is required with untrusted workloads (`CAP_NET_RAW`),
+  and the workload must exit on SIGTERM. The second was found by the
+  end-to-end suite, whose test workload ignored SIGTERM.
 
 ## Known limits
 

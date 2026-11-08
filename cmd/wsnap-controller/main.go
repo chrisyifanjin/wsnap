@@ -148,12 +148,14 @@ func main() {
 		Auth: &broker.CachingAuthenticator{
 			Next: broker.TokenReviewAuthenticator{Client: clientset, Audience: *audience},
 			TTL:  time.Minute,
+			// A flood of new tokens must not overload the API server.
+			Reviews: rate.NewLimiter(50, 100),
 		},
 		Log:                    ctrl.Log.WithName("broker"),
 		AllowAutomountedTokens: *allowAPITok,
 		Limiter:                &broker.PodLimiter{Rate: rate.Limit(*podRate), Burst: *podBurst},
 		Hub:                    &broker.Hub{},
-		Gateway:                broker.KubeGatewayAuth{Client: clientset},
+		Gateway:                broker.KubeGatewayAuth{Client: clientset, Reviews: rate.NewLimiter(20, 50)},
 	}
 	// Wake long polls from informer events: a new request, or a Workspace
 	// whose writer changed. Every replica serves polls, so this runs

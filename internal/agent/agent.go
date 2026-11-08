@@ -58,8 +58,9 @@ type Config struct {
 	HTTP             *http.Client
 	Log              *slog.Logger
 
-	mu    sync.Mutex
-	cache map[protocol.Role]cachedCredentials
+	mu            sync.Mutex
+	cache         map[protocol.Role]cachedCredentials
+	repoOpTimeout time.Duration
 }
 
 type cachedCredentials struct {
@@ -189,6 +190,7 @@ func (c *Config) credentials(ctx context.Context, role protocol.Role) (*protocol
 	if err := c.post(ctx, "/v1/credentials", protocol.CredentialsRequest{Role: role}, &resp); err != nil {
 		return nil, err
 	}
+	c.adopt(&resp)
 	if cacheable {
 		until := time.Now().Add(unexpiringReuse)
 		if exp := resp.Credentials.ExpiresAt; !exp.IsZero() {
@@ -196,10 +198,10 @@ func (c *Config) credentials(ctx context.Context, role protocol.Role) (*protocol
 			// OperationTimeout; it must not expire halfway. With the
 			// defaults (1h credential, 30m operations) one credential
 			// serves 25 minutes of snapshots.
-			until = exp.Add(-max(credentialMargin, c.OperationTimeout+credentialMargin))
-			if time.Until(exp) < c.OperationTimeout {
+			until = exp.Add(-max(credentialMargin, c.operationTimeout()+credentialMargin))
+			if time.Until(exp) < c.operationTimeout() {
 				c.Log.Warn("credentials expire before an operation's time limit; raise credentials.ttl or lower --operation-timeout",
-					"expiresIn", time.Until(exp).Round(time.Second), "operationTimeout", c.OperationTimeout)
+					"expiresIn", time.Until(exp).Round(time.Second), "operationTimeout", c.operationTimeout())
 			}
 		}
 		c.mu.Lock()
@@ -218,6 +220,7 @@ func (c *Config) credentialsFor(ctx context.Context, req protocol.CredentialsReq
 	if err := c.post(ctx, "/v1/credentials", req, &resp); err != nil {
 		return nil, err
 	}
+	c.adopt(&resp)
 	return &resp, nil
 }
 
@@ -282,10 +285,30 @@ func (c *Config) open(ctx context.Context, role protocol.Role) (*protocol.Creden
 }
 
 func (c *Config) withOperationTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.OperationTimeout <= 0 {
+	d := c.operationTimeout()
+	if d <= 0 {
 		return context.WithCancel(ctx)
 	}
-	return context.WithTimeout(ctx, c.OperationTimeout)
+	return context.WithTimeout(ctx, d)
+}
+
+// operationTimeout is the repository's spec.operationTimeout once the
+// broker has sent it, else the --operation-timeout flag.
+func (c *Config) operationTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.repoOpTimeout > 0 {
+		return c.repoOpTimeout
+	}
+	return c.OperationTimeout
+}
+
+func (c *Config) adopt(resp *protocol.CredentialsResponse) {
+	if d := resp.OperationTimeout.Duration; d > 0 {
+		c.mu.Lock()
+		c.repoOpTimeout = d
+		c.mu.Unlock()
+	}
 }
 
 // state is what the sidecar knows about the newest snapshot of the volume.
@@ -303,6 +326,9 @@ type snapOpts struct {
 	request string
 	// noQuiesce skips the handshake when the caller already froze the agent.
 	noQuiesce bool
+	// complete makes a partial snapshot an error: the caller is about to
+	// delete the live data (the safety snapshot before a restore).
+	complete bool
 }
 
 // takeSnapshot snapshots the volume unless nothing changed since st. An
@@ -352,8 +378,20 @@ func (c *Config) takeSnapshot(ctx context.Context, role protocol.Role, o snapOpt
 		return st, "", err
 	}
 	rep.SnapshotID = snap.ID
+	if snap.Partial && rep.Final {
+		// Some files are in no snapshot: record what was saved, but do not
+		// mark the volume final, so wsnap never deletes it.
+		c.Log.Warn("snapshot is partial: some files could not be read; not marking it final", "id", snap.ID)
+		rep.Final = false
+	}
 	if err := c.report(context.WithoutCancel(ctx), rep); err != nil {
 		return st, "", err
+	}
+	if snap.Partial && o.complete {
+		return st, snap.ID, fmt.Errorf("snapshot %s is partial: some files could not be read, so the live data is kept", snap.ID)
+	}
+	if snap.Partial && o.final && role == protocol.RoleMover {
+		return st, snap.ID, fmt.Errorf("snapshot %s is partial: some files could not be read; keeping the volume", snap.ID)
 	}
 	c.Log.Info("snapshot taken", "id", snap.ID, "final", o.final, "request", o.request, "seconds", rep.EndTime.Sub(start).Seconds())
 	return state{id: snap.ID, fp: fp, valid: fpErr == nil}, snap.ID, nil
@@ -429,6 +467,11 @@ func (c *Config) initialize(ctx context.Context) (state, error) {
 		return state{}, c.prepareTriggerDirs()
 	}
 	if _, err := v.Lstat(restoring); err == nil {
+		// Get admitted before deleting anything: another Pod on this volume
+		// (RWX, or RWO on the same node) may be the writer mid-restore.
+		if _, err := c.credentialsFor(ctx, protocol.CredentialsRequest{Role: protocol.RoleRestore}); err != nil {
+			return state{}, err
+		}
 		c.Log.Warn("a previous restore was interrupted; clearing the partial data")
 		if err := clearWorkspace(v, c.Dir); err != nil {
 			return state{}, err
@@ -1089,12 +1132,22 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 		thaw := c.quiesce(ctx)
 		defer thaw()
 	}
+	// A restore that already ran (its report was lost, so the broker
+	// delivers it again) must not run twice: that would roll back work done
+	// since. Send the saved report again instead.
+	if done, ok := c.loadDone(request); ok {
+		c.Log.Info("restore already done; reporting it again", "request", request, "id", done.SnapshotID)
+		c.report(context.WithoutCancel(ctx), done)
+		return state{}, done.SnapshotID, nil
+	}
 	start := time.Now().UTC()
 	rep := protocol.Report{Role: protocol.RoleRestore, Operation: protocol.OpRestore, Request: request, StartTime: start}
 	finish := func(st state, id string, err error) (state, string, error) {
 		rep.EndTime, rep.SnapshotID = time.Now().UTC(), id
 		if err != nil {
 			rep.Error = err.Error()
+		} else {
+			c.saveDone(request, rep)
 		}
 		c.report(context.WithoutCancel(ctx), rep)
 		return st, id, err
@@ -1106,7 +1159,7 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 	rep.SourceWorkspace = creds.SourceWorkspace
 	id, err := c.restoreAndSwap(ctx, creds, func() error {
 		var err error
-		if cur, _, err = c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true}, cur); err != nil {
+		if cur, _, err = c.takeSnapshot(ctx, protocol.RoleSnapshot, snapOpts{noQuiesce: true, complete: true}, cur); err != nil {
 			return fmt.Errorf("could not save the live data before the restore: %w", err)
 		}
 		return nil
@@ -1122,6 +1175,25 @@ func (c *Config) restoreInPlace(ctx context.Context, request string, cur state) 
 		return finish(state{}, id, fmt.Errorf("restored %s but could not snapshot the result: %w", id, err))
 	}
 	return finish(st, id, nil)
+}
+
+// doneDir holds one file per restore request this Pod completed, on the
+// sidecar's private volume, which survives container restarts.
+func (c *Config) doneFile(request string) string {
+	return filepath.Join(c.StateDir, "done", request+".json")
+}
+
+func (c *Config) saveDone(request string, rep protocol.Report) {
+	b, _ := json.Marshal(rep)
+	if err := os.MkdirAll(filepath.Dir(c.doneFile(request)), 0o700); err == nil {
+		err = os.WriteFile(c.doneFile(request), b, 0o600)
+	}
+}
+
+func (c *Config) loadDone(request string) (protocol.Report, bool) {
+	var rep protocol.Report
+	b, err := os.ReadFile(c.doneFile(request))
+	return rep, err == nil && json.Unmarshal(b, &rep) == nil
 }
 
 // restoreAndSwap downloads the snapshot into .wsnap/staging, calls
@@ -1326,7 +1398,7 @@ func (c *Config) RunRestorer(ctx context.Context) error {
 			return fmt.Errorf("check the volume: %w", err)
 		}
 		if reason == "" {
-			if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{}, state{}); err != nil {
+			if _, _, err := c.takeSnapshot(ctx, protocol.RoleMover, snapOpts{complete: true}, state{}); err != nil {
 				return fmt.Errorf("could not save the volume before the restore: %w", err)
 			}
 		}

@@ -113,3 +113,51 @@ func TestKopiaRepairsInterruptedInitialization(t *testing.T) {
 		t.Errorf("maintenance owner was not repaired: %s", pol)
 	}
 }
+
+// TestKopiaKeepsSnapshotsFromBeforePins (reviewer #5 finding 3): snapshots
+// taken before wsnap pinned them must survive Kopia's own retention after
+// an upgrade.
+func TestKopiaKeepsSnapshotsFromBeforePins(t *testing.T) {
+	if _, err := exec.LookPath("kopia"); err != nil {
+		t.Skip(err)
+	}
+	ctx := context.Background()
+	k := &Kopia{Binary: "kopia"}
+	tg := Target{Backend: protocol.Backend{Filesystem: &protocol.FilesystemBackend{Path: filepath.Join(t.TempDir(), "repo")}},
+		Password: "pw", Workspace: "ws", StateDir: t.TempDir()}
+	if err := k.Init(ctx, tg); err != nil {
+		t.Fatal(err)
+	}
+	// An older wsnap: Kopia's default retention, snapshots without pins.
+	if _, err := k.kopia(ctx, tg, "", "policy", "set", "--global", "--keep-latest=10", "--keep-hourly=48", "--keep-daily=7"); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	for i := range 8 {
+		if err := os.WriteFile(filepath.Join(dir, "f"), []byte(fmt.Sprint("old", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := k.kopia(ctx, tg, dir, "snapshot", "create", dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The upgraded agent.
+	for i := range 10 {
+		if err := k.Init(ctx, tg); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "f"), []byte(fmt.Sprint("new", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := k.Snapshot(ctx, tg, dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := k.list(ctx, tg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 18 {
+		t.Fatalf("%d snapshots left of 18; Kopia's retention deleted pre-upgrade snapshots", len(list))
+	}
+}

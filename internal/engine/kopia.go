@@ -179,7 +179,15 @@ func (k *Kopia) ensurePolicy(ctx context.Context, t Target) error {
 	// Unreadable files are recorded in the snapshot manifest instead of
 	// failing it: a partial snapshot beats none for a final snapshot or a
 	// rescue.
-	ignore := []string{"policy", "set", "--global", "--ignore-file-errors=true", "--ignore-dir-errors=true"}
+	ignore := []string{"policy", "set", "--global", "--ignore-file-errors=true", "--ignore-dir-errors=true",
+		// Kopia's own retention (by default the latest 10) would delete
+		// snapshots that wsnap still pins: a rollback target, a fork source,
+		// a superseded rescue. Snapshots taken before --pin=wsnap existed
+		// have no pin, so turn Kopia's retention off; wsnap's maintenance
+		// decides what to delete. Measured with Kopia 0.23.1: with these
+		// values every unpinned snapshot stays, and an unchanged policy
+		// writes no new manifest.
+		"--keep-latest=2147483647", "--keep-hourly=0", "--keep-daily=0", "--keep-weekly=0", "--keep-monthly=0", "--keep-annual=0"}
 	// A leading "/" anchors a rule at the snapshot root; without it Kopia
 	// would also drop nested folders that happen to share the name.
 	for _, n := range excludedNames {
@@ -214,6 +222,12 @@ func kopiaNotInitialized(err error) bool {
 type kopiaSnapshot struct {
 	ID        string    `json:"id"`
 	StartTime time.Time `json:"startTime"`
+	RootEntry struct {
+		Summary struct {
+			NumFailed int               `json:"numFailed"`
+			Errors    []json.RawMessage `json:"errors"`
+		} `json:"summ"`
+	} `json:"rootEntry"`
 }
 
 func (k *Kopia) Snapshot(ctx context.Context, t Target, dir string) (Snapshot, error) {
@@ -228,7 +242,8 @@ func (k *Kopia) Snapshot(ctx context.Context, t Target, dir string) (Snapshot, e
 	if err := json.Unmarshal(out, &s); err != nil || s.ID == "" {
 		return Snapshot{}, fmt.Errorf("kopia snapshot: unexpected output %q", tail(string(out), 500))
 	}
-	return Snapshot{ID: s.ID, Time: s.StartTime}, nil
+	sum := s.RootEntry.Summary
+	return Snapshot{ID: s.ID, Time: s.StartTime, Partial: sum.NumFailed > 0 || len(sum.Errors) > 0}, nil
 }
 
 func (k *Kopia) list(ctx context.Context, t Target) ([]kopiaSnapshot, error) {

@@ -148,7 +148,10 @@ The agent container cannot start before the restore ends and the broker
 accepts this Pod as the workspace writer. The sidecar restores the snapshot
 that the broker recorded as newest (`status.lastSnapshot`), not the
 engine's newest snapshot. A deposed writer can still upload, but the
-broker never records its snapshots, so they are never restored. The startup probe checks a marker
+broker never records its snapshots, so they are not restored while the
+broker has a record. Only when the broker has none (a new Workspace
+object, for example after it was deleted) does the agent fall back to the
+engine's newest snapshot. The startup probe checks a marker
 on the sidecar's private volume, not the reusable workspace volume. A restore
 that stops halfway leaves the `.wsnap/restoring` marker. The next attempt
 deletes the partial data and restores again.

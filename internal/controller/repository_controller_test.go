@@ -3,6 +3,7 @@ package controller
 import (
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +31,12 @@ func TestValidateRepository(t *testing.T) {
 	}{
 		{"valid", repo("kopia", "s3-sts", s3), secret(good), ""},
 		{"missing secret", repo("kopia", "s3-sts", s3), nil, "not found"},
+		// A credential must outlive one operation (reviewer #5 finding 4).
+		{"ttl shorter than an operation", func() *wsnapv1.SnapshotRepository {
+			r := repo("kopia", "s3-sts", s3)
+			r.Spec.OperationTimeout = metav1.Duration{Duration: 2 * time.Hour}
+			return r
+		}(), secret(good), "operationTimeout"},
 		{"short master key", repo("kopia", "s3-sts", s3), secret(map[string][]byte{"WSNAP_MASTER_KEY": []byte("short"), "AWS_ACCESS_KEY_ID": []byte("a"), "AWS_SECRET_ACCESS_KEY": []byte("b")}), "at least 16"},
 		{"missing backend key", repo("restic", "static", s3), secret(map[string][]byte{"WSNAP_MASTER_KEY": []byte("0123456789abcdef")}), "AWS_ACCESS_KEY_ID"},
 		{"sts on gcs", repo("restic", "s3-sts", gcs), secret(good), "needs an s3 backend"},

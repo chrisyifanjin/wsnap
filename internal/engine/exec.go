@@ -31,6 +31,7 @@ import (
 //
 // plus AWS_*, GOOGLE_ACCESS_TOKEN and AZURE_* variables for the backend.
 // snapshot and latest print {"id": "...", "time": "<RFC 3339>"} on stdout;
+// snapshot adds "partial": true when it skipped files it could not read;
 // latest prints nothing when the repository is empty. init exits with
 // status 3 when WSNAP_READ_ONLY is true and the repository does not exist.
 // Any other nonzero exit status fails the operation.
@@ -95,8 +96,9 @@ func (e *Exec) call(ctx context.Context, t Target, verb, dir, id string, keepLas
 }
 
 type execSnapshot struct {
-	ID   string    `json:"id"`
-	Time time.Time `json:"time"`
+	ID      string    `json:"id"`
+	Time    time.Time `json:"time"`
+	Partial bool      `json:"partial"`
 }
 
 func parseExecSnapshot(out []byte) (*Snapshot, error) {
@@ -108,7 +110,7 @@ func parseExecSnapshot(out []byte) (*Snapshot, error) {
 	if err := json.Unmarshal([]byte(s), &v); err != nil || v.ID == "" {
 		return nil, fmt.Errorf("exec engine: want {\"id\":...,\"time\":...}, got %q", tail(s, 300))
 	}
-	return &Snapshot{ID: v.ID, Time: v.Time}, nil
+	return &Snapshot{ID: v.ID, Time: v.Time, Partial: v.Partial}, nil
 }
 
 // execExitNotFound is the exec contract's "repository does not exist".

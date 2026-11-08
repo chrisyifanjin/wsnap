@@ -201,6 +201,14 @@ The webhook adds the sidecar. Optional annotations:
 | `wsnap.dev/quiesce-timeout` | Ask the agent to pause before each snapshot (see below). |
 | `wsnap.dev/final-timeout` | Time limit for the final snapshot. Default `50s`. |
 | `wsnap.dev/workload-grace` | Time the workload takes to exit after SIGTERM. Default `30s`. The webhook sets the grace period to this plus the final timeout plus 10 s. |
+
+**The workload must exit on SIGTERM.** Kubernetes stops the sidecar only
+after the workload containers exit. A workload that ignores SIGTERM (for
+example a bare `sleep` as PID 1, which ignores signals it has no handler
+for) uses up the whole grace period, and the sidecar gets 2 seconds for its
+final snapshot. A PVC-backed workspace is then rescued later; an emptyDir
+workspace loses the changes since its last snapshot. Run the workload
+under an init that forwards signals (`tini`, `dumb-init`) or trap TERM.
 | `wsnap.dev/inject: "false"` | The Pod brings its own sidecar. The webhook checks it. |
 
 For agent-sandbox, put the labels in `Sandbox.spec.podTemplate.metadata`

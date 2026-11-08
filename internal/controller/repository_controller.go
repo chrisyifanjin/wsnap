@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"github.com/chrisyifanjin/wsnap/internal/workspace"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -57,6 +59,10 @@ func ValidateRepository(repo *wsnapv1.SnapshotRepository, secret *corev1.Secret)
 	}
 	if spec.Engine.Type == "exec" && len(spec.Engine.Command) == 0 {
 		return fmt.Errorf("engine exec needs a command")
+	}
+	// A credential must outlive one operation, or it expires halfway.
+	if ttl, op := workspace.TTL(repo), workspace.OperationTimeout(repo); provider != credentials.ProviderStatic && ttl < op+5*time.Minute {
+		return fmt.Errorf("credentials.ttl (%s) must be at least operationTimeout (%s) plus 5m", ttl, op)
 	}
 	if secret == nil {
 		return fmt.Errorf("secret %q not found", spec.Credentials.SecretName)

@@ -4,6 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -52,6 +55,24 @@ func (p *PodLimiter) Allow(podUID string) bool {
 	return b.l.Allow()
 }
 
+// newReviewLimiter bounds TokenReviews per client IP. Only tokens the
+// broker has not validated recently count: a known valid token is never
+// limited, so a workload that floods the broker with bad tokens cannot lock
+// out its sidecar's current token, and slows down at most its own Pod's
+// next token renewal (agents retry 429). One review per second is far more
+// than an agent needs: its token changes every few minutes.
+func newReviewLimiter() *PodLimiter {
+	return &PodLimiter{Rate: 1, Burst: 10}
+}
+
+// clientIP is the remote address without its port.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 // CachingAuthenticator remembers successful token reviews for a short
 // time. Each sidecar request would otherwise cost one TokenReview call to
 // the API server. The broker still reads the Pod live and checks its UID,
@@ -59,6 +80,9 @@ func (p *PodLimiter) Allow(podUID string) bool {
 type CachingAuthenticator struct {
 	Next Authenticator
 	TTL  time.Duration
+	// Reviews bounds TokenReview calls (cache misses) for all callers, so
+	// no flood of new tokens can overload the API server. Nil: no bound.
+	Reviews *rate.Limiter
 
 	mu    sync.Mutex
 	cache map[[32]byte]cachedIdentity
@@ -74,6 +98,17 @@ type cachedIdentity struct {
 // TokenReview.
 const failureTTL = 10 * time.Second
 
+// Known returns the cached result for token, if there is one.
+func (c *CachingAuthenticator) Known(token string) (Identity, error, bool) {
+	key := sha256.Sum256([]byte(token))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.cache[key]; ok && time.Now().Before(e.expires) {
+		return e.id, e.err, true
+	}
+	return Identity{}, nil, false
+}
+
 func (c *CachingAuthenticator) Authenticate(ctx context.Context, token string) (Identity, error) {
 	key := sha256.Sum256([]byte(token))
 	now := time.Now()
@@ -83,6 +118,9 @@ func (c *CachingAuthenticator) Authenticate(ctx context.Context, token string) (
 		return e.id, e.err
 	}
 	c.mu.Unlock()
+	if c.Reviews != nil && !c.Reviews.Allow() {
+		return Identity{}, fmt.Errorf("%w: too many token reviews; try again", ErrAuthUnavailable)
+	}
 	id, err := c.Next.Authenticate(ctx, token)
 	if errors.Is(err, ErrAuthUnavailable) {
 		return id, err // an outage, not a verdict on the token

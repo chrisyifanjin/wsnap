@@ -18,8 +18,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Format, vet, and unit tests
-        run: make vet test
+      - name: Install the engine CLIs (the versions the agent image ships)
+        run: |
+          hack/install-engines.sh "$RUNNER_TEMP/engines"
+          echo "$RUNNER_TEMP/engines" >> "$GITHUB_PATH"
+      - name: Format, vet, and unit tests (engine tests run with real Kopia and restic)
+        run: |
+          kopia --version && restic version
+          make vet test
       - name: Race detector
         run: go test -race ./internal/...
       - name: Known vulnerabilities (Go code and dependencies)

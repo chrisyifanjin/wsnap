@@ -36,6 +36,7 @@ type fakeBroker struct {
 	// restore overrides for pinned and fork restores
 	restoreID, restoreSource string
 	latestID                 string // LatestSnapshotID for restores
+	opTimeout                time.Duration
 	restoreRepo              string
 	waitQueue                chan string
 	failReports              atomic.Bool // answer reports with 503
@@ -68,6 +69,7 @@ func (b *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			RepositoryPassword: "pw",
 			Credentials:        protocol.Credentials{Scoped: true, ExpiresAt: time.Now().Add(time.Hour)},
 			Interval:           protocol.Duration{Duration: time.Hour},
+			OperationTimeout:   protocol.Duration{Duration: b.opTimeout},
 		}
 		if req.Role == protocol.RoleRestore {
 			resp.SnapshotID, resp.SourceWorkspace, resp.LatestSnapshotID = b.restoreID, b.restoreSource, b.latestID
@@ -1166,4 +1168,105 @@ func TestRequestFilesAreSpaced(t *testing.T) {
 	}
 	cancel()
 	<-errc
+}
+
+// TestRepositoryOperationTimeoutIsUsed (reviewer #5 finding 4): the
+// repository's operationTimeout, sent by the broker, bounds operations;
+// before, only a flag that nothing set could change it.
+func TestRepositoryOperationTimeoutIsUsed(t *testing.T) {
+	c, b := setup(t)
+	c.OperationTimeout = 30 * time.Minute
+	b.opTimeout = 3 * time.Hour
+	if _, err := c.credentials(context.Background(), protocol.RoleSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.operationTimeout(); got != 3*time.Hour {
+		t.Fatalf("operation timeout %s, want the repository's 3h", got)
+	}
+}
+
+// TestPartialMoverSnapshotKeepsTheVolume (reviewer #5 finding 5): files
+// the mover could not read are in no snapshot, so the snapshot is recorded
+// but not final, and the Job fails: the PV is kept.
+func TestPartialMoverSnapshotKeepsTheVolume(t *testing.T) {
+	wrapper := filepath.Join(t.TempDir(), "engine.sh")
+	script := "#!/bin/sh\nif [ \"$1\" = snapshot ]; then " + tarEngine(t) + " snapshot | sed 's/}$/,\"partial\":true}/'; exit; fi\nexec " + tarEngine(t) + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, b := setup(t, wrapper)
+	write(t, filepath.Join(c.Dir, "work.txt"), "data")
+	if err := c.RunMover(context.Background()); err == nil {
+		t.Fatal("a partial mover snapshot succeeded; the PV would be deleted with the unread files")
+	}
+	reps := b.snapshotReports()
+	if len(reps) != 1 || reps[0].SnapshotID == "" || reps[0].Final {
+		t.Fatalf("want the partial snapshot recorded, not final; got %+v", reps)
+	}
+}
+
+// TestRestoreRequestRunsOnce (reviewer #6 finding 4): the broker delivers
+// a restore again when its report was lost. Running it twice would roll
+// back the work done after the first run.
+func TestRestoreRequestRunsOnce(t *testing.T) {
+	c, b := setup(t)
+	old := seed(t, c, map[string]string{"data.txt": "old"})
+	st, err := c.initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.restoreID = old
+	if _, _, err := c.restoreInPlace(context.Background(), "rollback-1", st); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(c.Dir, "data.txt"), "work after the rollback")
+	if _, _, err := c.restoreInPlace(context.Background(), "rollback-1", state{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(c.Dir, "data.txt")); string(got) != "work after the rollback" {
+		t.Fatalf("the restore ran twice: data.txt = %q", got)
+	}
+	if rr := b.restoreReports(); len(rr) < 2 || rr[len(rr)-1].Request != "rollback-1" || rr[len(rr)-1].Error != "" {
+		t.Fatalf("the saved report was not sent again: %+v", rr)
+	}
+}
+
+// TestPartialSafetySnapshotKeepsLiveData (reviewer #6 finding 6): if the
+// snapshot before a restore skipped files, the swap must not delete them.
+func TestPartialSafetySnapshotKeepsLiveData(t *testing.T) {
+	wrapper := filepath.Join(t.TempDir(), "engine.sh")
+	script := "#!/bin/sh\nif [ \"$1\" = snapshot ] && [ -e \"$WSNAP_DIR/unreadable.txt\" ]; then " + tarEngine(t) + " snapshot | sed 's/}$/,\"partial\":true}/'; exit; fi\nexec " + tarEngine(t) + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c, b := setup(t, wrapper)
+	old := seed(t, c, map[string]string{"a.txt": "old"})
+	st, err := c.initialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(c.Dir, "unreadable.txt"), "only copy")
+	b.restoreID = old
+	if _, _, err := c.restoreInPlace(context.Background(), "rollback-1", st); err == nil {
+		t.Fatal("the restore went on after a partial safety snapshot")
+	}
+	if got, _ := os.ReadFile(filepath.Join(c.Dir, "unreadable.txt")); string(got) != "only copy" {
+		t.Fatalf("a file that is in no snapshot was deleted: %q", got)
+	}
+}
+
+// TestNoClearBeforeAdmission (reviewer #6 finding 5): another Pod may be
+// the writer mid-restore on this volume; a sidecar the broker refuses
+// must not delete anything.
+func TestNoClearBeforeAdmission(t *testing.T) {
+	c, b := setup(t)
+	write(t, markerPath(c.Dir, "restoring"), "id")
+	write(t, filepath.Join(c.Dir, "moved.txt"), "the writer's restored file")
+	b.fail409.Store(1)
+	if _, err := c.initialize(context.Background()); err == nil {
+		t.Fatal("initialize went on although the broker refused")
+	}
+	if got, _ := os.ReadFile(filepath.Join(c.Dir, "moved.txt")); string(got) != "the writer's restored file" {
+		t.Fatalf("a refused sidecar cleared the volume: %q", got)
+	}
 }

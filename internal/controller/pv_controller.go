@@ -71,7 +71,9 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	// says, so a lost annotation update cannot strand it.
 	boundToRescue := pv.Spec.ClaimRef != nil && pv.Spec.ClaimRef.Name == rescueClaimName(pv.Name) && pv.Spec.ClaimRef.Namespace == ns
 	if phase == RescueRunning || (boundToRescue && phase != RescueDone) {
-		return r.checkRescue(ctx, &pv, ns, name)
+		// An empty phase on a PV bound to its rescue claim: an operator
+		// removed "failed" to retry (or an annotation update was lost).
+		return r.checkRescue(ctx, &pv, ns, name, phase == "")
 	}
 	if pv.Status.Phase != corev1.VolumeReleased {
 		return ctrl.Result{}, nil
@@ -173,7 +175,7 @@ func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVol
 	return nil
 }
 
-func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVolume, ns, name string) (ctrl.Result, error) {
+func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVolume, ns, name string, retry bool) (ctrl.Result, error) {
 	var job batchv1.Job
 	// Read live: the cache may not have the Job this reconciler created a
 	// moment ago, and a stale "not found" must never undo the rescue.
@@ -205,6 +207,9 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 				return ctrl.Result{}, err
 			}
 			want := cmp.Or(job.Annotations[workspace.AnnotationWriterPod], "mover")
+			if cur.Annotations[workspace.AnnotationFinalPod] != want && retry {
+				return r.restartRescue(ctx, pv, &job)
+			}
 			if cur.Annotations[workspace.AnnotationFinalPod] != want {
 				r.Recorder.Eventf(pv, corev1.EventTypeWarning, "RescueFailed",
 					"mover job %s/%s completed, but the broker recorded no final snapshot of this volume; keeping it", ns, job.Name)
@@ -223,11 +228,28 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 			claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: rescueClaimName(pv.Name)}}
 			return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, claim))
 		case batchv1.JobFailed:
+			if retry {
+				return r.restartRescue(ctx, pv, &job)
+			}
 			r.Recorder.Eventf(pv, corev1.EventTypeWarning, "RescueFailed", "mover job %s/%s failed; keeping the volume", ns, job.Name)
 			return ctrl.Result{}, r.setRescue(ctx, pv, RescueFailed)
 		}
 	}
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// restartRescue deletes a finished mover Job so the next reconcile creates
+// a new one: the operator's retry after a failed rescue.
+func (r *PVReconciler) restartRescue(ctx context.Context, pv *corev1.PersistentVolume, job *batchv1.Job) (ctrl.Result, error) {
+	r.Recorder.Eventf(pv, corev1.EventTypeNormal, "RescueRetried", "starting a new mover job; the previous one (%s) did not save the volume", job.Name)
+	fg := metav1.DeletePropagationForeground
+	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &fg, Preconditions: &metav1.Preconditions{UID: &job.UID}}); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.setRescue(ctx, pv, RescueRunning); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 // reclaim restores the original reclaim policy. For Delete, the PV

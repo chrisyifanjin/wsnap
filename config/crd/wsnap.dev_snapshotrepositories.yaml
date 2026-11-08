@@ -2543,6 +2543,12 @@ spec:
                       type: object
                     type: array
                 type: object
+              operationTimeout:
+                description: |-
+                  operationTimeout bounds one snapshot or restore operation, in the
+                  sidecar and in Jobs. Default 30m. Raise it for very large
+                  workspaces, and keep credentials.ttl at least 5m longer.
+                type: string
               retention:
                 description: RetentionSpec controls maintenance.
                 properties:
