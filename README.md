@@ -128,8 +128,8 @@ For other backends, TLS, monitoring and uninstall, see
 ¹ restic cannot create a repository with a container SAS; the validator
 refuses that combination.
 
-Container runtimes: runc (containerd) and gVisor (runsc), in both sidecar
-and worker mode. Kata Containers is not tested yet.
+Container runtimes: runc (containerd), gVisor (runsc) and Kata Containers
+(QEMU, virtio-fs), in both sidecar and worker mode.
 
 Kubernetes versions: every scenario runs on 1.37; the volume and worker
 scenarios also run on 1.30, the oldest supported version.

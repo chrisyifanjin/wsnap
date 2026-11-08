@@ -111,7 +111,6 @@ jobs:
         env:
           SKIP_IMAGE_BUILD: "1"
           E2E_REQUIRE_KATA: "1"
-          KATA_DEBUG: "1"
         run: |
           git clone --branch v1.0.10 --depth 1 -c advice.detachedHead=false \
             https://github.com/kubernetes-sigs/agent-sandbox.git "$RUNNER_TEMP/agent-sandbox"

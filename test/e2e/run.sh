@@ -17,7 +17,7 @@
 #   gateway    REST gateway API gated by RBAC; data-plane request through the agent-sandbox router and sandboxd
 #   worker     worker mode: live snapshots from a separate Pod on the same node and PVC; RWOP claims refused
 #   runtimes   gVisor (runsc) workload Pods: sidecar mode inside the sandbox, worker mode beside it
-#   kata       opt-in: Kata Containers workload Pods (needs /dev/kvm); see docs/verification.md for its status
+#   kata       Kata Containers workload Pods (needs /dev/kvm; skipped without it): the same checks as runtimes
 #
 # The harness writes files through "kubectl exec" only to play the agent;
 # wsnap itself never uses exec.
@@ -1227,7 +1227,8 @@ KATA_SHA256=b828904fa3f1e49ddd7dc799c72cb1503cd1e772d354c3987c8d4189b2a623a8
 # install_kata puts Kata on one worker node (the release is about 1 GB)
 # and registers the RuntimeClass "kata", which schedules Pods to that
 # node. It needs /dev/kvm in the node; without it the scenario is skipped
-# unless E2E_REQUIRE_KATA=1. Idempotent.
+# unless E2E_REQUIRE_KATA=1. KATA_DEBUG=1 turns on Kata's debug logs; the
+# diagnostics print the Kata node's containerd journal. Idempotent.
 install_kata() {
 	if kubectl get runtimeclass kata >/dev/null 2>&1; then
 		return 0
@@ -1315,7 +1316,7 @@ scenario_kata() {
 
 main() {
 	local steps=() s g
-	(($#)) || set -- setup controlplane volumes failures worker runtimes
+	(($#)) || set -- setup controlplane volumes failures worker runtimes kata
 	for s in "$@"; do
 		if [[ -n $(group "$s") ]]; then
 			read -ra g <<<"$(group "$s")"

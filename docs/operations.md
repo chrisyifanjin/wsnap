@@ -331,7 +331,7 @@ Limits:
   restored. If the controller is down, the workload waits at the gate.
 - The worker uses the node's default container runtime, not the
   workload's `runtimeClassName`. A sandboxed workload (gVisor, Kata with
-  virtio-fs) works, because both Pods see the same host mount. Do not use
+  virtio-fs; both tested) works, because both Pods see the same host mount. Do not use
   worker mode when the runtime passes the volume's block device into the
   sandbox (Kata direct-assigned volumes): the worker would mount the same
   filesystem a second time. Use sidecar mode there.
