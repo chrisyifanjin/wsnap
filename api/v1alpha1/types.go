@@ -354,6 +354,9 @@ const (
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.execution) ? (has(self.execution) && self.execution.mode == oldSelf.execution.mode) : (!has(self.execution) || self.execution.mode == 'sidecar')",message="execution mode is immutable"
 type WorkspaceSpec struct {
 	// repositoryName is the SnapshotRepository holding this workspace.
+	// It is immutable because status.lastSnapshot refers to this repository;
+	// changing it could restore from the wrong location.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="repositoryName is immutable; create a new Workspace to use another repository"
 	RepositoryName string `json:"repositoryName"`
 	// execution selects where live snapshots run. The default is sidecar.
 	// Worker requires a PVC that a second Pod can mount and a Workspace

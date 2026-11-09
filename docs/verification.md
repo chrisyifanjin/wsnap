@@ -416,6 +416,11 @@ PVC identity and provisioning checks:
   policy were applied to an isolated Kubernetes 1.37 namespace. A claim
   using the reviewed class was admitted; an unreviewed class and a 20Gi
   claim above the 10Gi limit were rejected.
+- The API server rejects changes to `Workspace.spec.repositoryName` while
+  allowing unrelated Workspace updates (`scenario_workspace_identity`).
+  To use another `SnapshotRepository`, create a new Workspace and migrate
+  the data; the original Workspace's `status.lastSnapshot` belongs to its
+  repository.
 
 ## Known limits
 
@@ -424,9 +429,6 @@ PVC identity and provisioning checks:
 - Gateway requests are created by the controller's service account after a
   SubjectAccessReview of the caller, so admission policies that target the
   caller do not apply to them.
-- If a Workspace moves to another `SnapshotRepository`, its
-  `lastSnapshot` names a snapshot in the old repository. Clear
-  `status.lastSnapshot` when you move a workspace.
 - A restore must finish within `--operation-timeout` (default 30 minutes),
   and the repository's `credentials.ttl` must be at least 5 minutes longer.
   Raise both for very large workspaces.
