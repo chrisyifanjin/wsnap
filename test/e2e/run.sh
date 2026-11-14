@@ -1050,12 +1050,31 @@ EOF
 group() {
 	case $1 in
 	controlplane) echo webhook gateway tls multinode ;;
-	volumes) echo workspace_identity pvc ephemeral sandbox emptydir singlewriter requests ;;
+	volumes) echo storage_policy workspace_identity pvc ephemeral sandbox emptydir singlewriter requests ;;
 	failures) echo chaos ;;
 	worker) echo worker ;;
 	runtimes) echo runtimes ;;
 	kata) echo kata ;;
 	esac
+}
+
+# CI executes groups, so a defined scenario omitted from every group would
+# silently stop receiving end-to-end coverage. Check the mapping before any
+# cluster work begins; keep this compatible with macOS's Bash 3.2.
+verify_scenario_coverage() {
+	local g s fn grouped='' seen=''
+	for g in controlplane volumes failures worker runtimes kata; do
+		grouped="${grouped} $(group "$g")"
+	done
+	for s in $grouped; do
+		declare -F "scenario_$s" >/dev/null || die "group refers to undefined scenario $s"
+		[[ " $seen " != *" $s "* ]] || die "scenario $s appears in more than one group"
+		seen="${seen} $s"
+	done
+	for fn in $(compgen -A function scenario_); do
+		s=${fn#scenario_}
+		[[ " $seen " == *" $s "* ]] || die "scenario $s is not in an end-to-end group"
+	done
 }
 
 # diagnose prints the cluster state when a run fails, so a CI log is enough
@@ -1385,6 +1404,7 @@ scenario_kata() {
 
 main() {
 	local steps=() s g
+	verify_scenario_coverage
 	(($#)) || set -- setup controlplane volumes failures worker runtimes kata
 	for s in "$@"; do
 		if [[ -n $(group "$s") ]]; then
@@ -1403,4 +1423,6 @@ main() {
 	done
 	log "all requested scenarios passed"
 }
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+	main "$@"
+fi
