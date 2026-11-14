@@ -75,9 +75,15 @@ spec:
                     type: string
                 type: object
               repositoryName:
-                description: repositoryName is the SnapshotRepository holding this
-                  workspace.
+                description: |-
+                  repositoryName is the SnapshotRepository holding this workspace.
+                  It is immutable because status.lastSnapshot refers to this repository;
+                  changing it could restore from the wrong location.
                 type: string
+                x-kubernetes-validations:
+                - message: repositoryName is immutable; create a new Workspace to
+                    use another repository
+                  rule: self == oldSelf
               restoreFrom:
                 description: |-
                   restoreFrom applies to the next restore after it is set or changed,
