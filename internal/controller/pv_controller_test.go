@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -275,6 +276,124 @@ func TestRescueRefusesPreexistingSameNameClaim(t *testing.T) {
 	}
 }
 
+func TestCompletedRescueKeepsReplacementClaim(t *testing.T) {
+	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
+	reconcilePV(t, r)
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job); err != nil {
+		t.Fatal(err)
+	}
+	markFinal(t, c, "u2")
+	claimKey := types.NamespacedName{Namespace: testNS, Name: rescueClaimName("pv-1")}
+	var oldClaim corev1.PersistentVolumeClaim
+	if err := c.Get(context.Background(), claimKey, &oldClaim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), &oldClaim); err != nil {
+		t.Fatal(err)
+	}
+	replacement := rescueClaimFixture(getPV(t, c), "replacement-uid")
+	if err := c.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	if err := c.Status().Update(context.Background(), &job); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pv-1"}})
+	if err == nil {
+		t.Fatal("completed rescue deleted or accepted a replacement claim")
+	}
+	var got corev1.PersistentVolumeClaim
+	if err := c.Get(context.Background(), claimKey, &got); err != nil || got.UID != replacement.UID {
+		t.Fatalf("replacement claim changed: got UID %q, err %v", got.UID, err)
+	}
+	pv := getPV(t, c)
+	if pv.Annotations[wsnapv1.AnnotationRescue] == wsnapv1.RescueDone || pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		t.Fatalf("rescue phase %q, reclaim policy %s: replacement must keep PV retained", pv.Annotations[wsnapv1.AnnotationRescue], pv.Spec.PersistentVolumeReclaimPolicy)
+	}
+}
+
+// replaceClaimAtDelete simulates a namespace user replacing the claim after
+// the controller's live read but before the API server processes Delete.
+// The controller-runtime fake client does not enforce UID preconditions.
+type replaceClaimAtDelete struct {
+	client.Client
+	replacement *corev1.PersistentVolumeClaim
+}
+
+func (c replaceClaimAtDelete) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*corev1.PersistentVolumeClaim); !ok {
+		return c.Client.Delete(ctx, obj, opts...)
+	}
+	options := (&client.DeleteOptions{}).ApplyOptions(opts)
+	var current corev1.PersistentVolumeClaim
+	if err := c.Client.Get(ctx, client.ObjectKeyFromObject(obj), &current); err != nil {
+		return err
+	}
+	if err := c.Client.Delete(ctx, &current); err != nil {
+		return err
+	}
+	if err := c.Client.Create(ctx, c.replacement); err != nil {
+		return err
+	}
+	if options.Preconditions == nil || options.Preconditions.UID == nil {
+		return c.Client.Delete(ctx, obj, opts...) // missing guard deletes the replacement
+	}
+	if *options.Preconditions.UID != c.replacement.UID {
+		return apierrors.NewConflict(corev1.Resource("persistentvolumeclaims"), obj.GetName(), fmt.Errorf("UID precondition failed"))
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+func TestCompletedRescueUsesClaimUIDDeletePrecondition(t *testing.T) {
+	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
+	reconcilePV(t, r)
+	var job batchv1.Job
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: moverJobName("pv-1")}, &job); err != nil {
+		t.Fatal(err)
+	}
+	markFinal(t, c, "u2")
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	if err := c.Status().Update(context.Background(), &job); err != nil {
+		t.Fatal(err)
+	}
+	replacement := rescueClaimFixture(getPV(t, c), "replacement-uid")
+	r.Client = replaceClaimAtDelete{Client: r.Client, replacement: replacement}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pv-1"}})
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("claim replacement during Delete: %v, want UID conflict", err)
+	}
+	var got corev1.PersistentVolumeClaim
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(replacement), &got); err != nil || got.UID != replacement.UID {
+		t.Fatalf("replacement claim changed: got UID %q, err %v", got.UID, err)
+	}
+	if pv := getPV(t, c); pv.Annotations[wsnapv1.AnnotationRescue] == wsnapv1.RescueDone {
+		t.Fatal("rescue marked done after the claim deletion lost its UID race")
+	}
+}
+
+func TestDoneRescueCleansClaimAfterRestart(t *testing.T) {
+	pv := releasedPV(map[string]string{wsnapv1.AnnotationRescue: wsnapv1.RescueDone})
+	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName(pv.Name), UID: "rescue-uid"}
+	pv.Status.Phase = corev1.VolumeBound
+	r, c := newPVReconciler(t, testWorkspace(), pv, rescueClaimFixture(pv, "rescue-uid"))
+	reconcilePV(t, r)
+	var claim corev1.PersistentVolumeClaim
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: rescueClaimName(pv.Name)}, &claim); !apierrors.IsNotFound(err) {
+		t.Fatalf("rescue claim after a restarted cleanup: %v, want NotFound", err)
+	}
+	current := getPV(t, c)
+	current.Status.Phase = corev1.VolumeReleased
+	if err := c.Status().Update(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePV(t, r)
+	if got := getPV(t, c); got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimDelete {
+		t.Fatalf("reclaim policy after rescue claim deletion = %s, want Delete", got.Spec.PersistentVolumeReclaimPolicy)
+	}
+}
+
 // TestOlderEpochVolumeIsRescued: a newer writer exists, but the older
 // volume's unsaved data is still saved. The mover Job carries the volume's
 // epoch, so the broker keeps the snapshot without making it the newest
@@ -371,7 +490,8 @@ func TestLostAnnotationHeals(t *testing.T) {
 	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2", wsnapv1.AnnotationRescue: "", workspace.AnnotationFinalPod: "mover"})
 	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: rescueClaimName("pv-1"), UID: "c"}
 	pv.Status.Phase = corev1.VolumeBound
-	done := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: moverJobName("pv-1")},
+	done := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: moverJobName("pv-1"),
+		Annotations: map[string]string{workspace.AnnotationClaimUID: "c", workspace.AnnotationPVUID: string(pv.UID)}},
 		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}}}
 	r, c := newPVReconciler(t, testWorkspace(), pv, done)
 	reconcilePV(t, r)

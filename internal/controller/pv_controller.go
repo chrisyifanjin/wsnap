@@ -65,6 +65,21 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 		// removed "failed" to retry (or an annotation update was lost).
 		return r.checkRescue(ctx, &pv, ns, name, phase == "")
 	}
+	if phase == wsnapv1.RescueDone && boundToRescue && pv.Status.Phase != corev1.VolumeReleased {
+		// A previous reconcile may have recorded completion but stopped before
+		// deleting the rescue claim. Retry that cleanup using the claim UID.
+		var cur corev1.PersistentVolume
+		if err := r.Reader.Get(ctx, types.NamespacedName{Name: pv.Name}, &cur); err != nil {
+			return ctrl.Result{}, err
+		}
+		if cur.UID != pv.UID || cur.Annotations[wsnapv1.AnnotationRescue] != wsnapv1.RescueDone {
+			return ctrl.Result{}, fmt.Errorf("volume %s changed before rescue cleanup", pv.Name)
+		}
+		if err := r.deleteRescueClaim(ctx, &cur, ns); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 	if pv.Status.Phase != corev1.VolumeReleased {
 		return ctrl.Result{}, nil
 	}
@@ -96,9 +111,28 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 }
 
 func (r *PVReconciler) setRescue(ctx context.Context, pv *corev1.PersistentVolume, phase string) error {
-	patch := client.MergeFrom(pv.DeepCopy())
+	patch := client.MergeFromWithOptions(pv.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	pv.Annotations[wsnapv1.AnnotationRescue] = phase
 	return r.Patch(ctx, pv, patch)
+}
+
+// deleteRescueClaim uses the PV's pre-bound UID so a namespace user cannot
+// replace the claim under the same name and have the controller delete it.
+func (r *PVReconciler) deleteRescueClaim(ctx context.Context, pv *corev1.PersistentVolume, namespace string) error {
+	ref := pv.Spec.ClaimRef
+	if ref == nil || ref.Namespace != namespace || ref.Name != rescueClaimName(pv.Name) || ref.UID == "" {
+		return fmt.Errorf("volume %s has no complete rescue claim identity; keeping it", pv.Name)
+	}
+	var claim corev1.PersistentVolumeClaim
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, &claim); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if claim.UID != ref.UID {
+		return fmt.Errorf("rescue claim %s/%s changed UID; keeping volume %s", namespace, ref.Name, pv.Name)
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, &claim, &client.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &ref.UID},
+	}))
 }
 
 func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVolume, ws *wsnapv1.Workspace) error {
@@ -234,6 +268,10 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 			if err := r.Reader.Get(ctx, types.NamespacedName{Name: pv.Name}, &cur); err != nil {
 				return ctrl.Result{}, err
 			}
+			if cur.UID != pv.UID || job.Annotations[workspace.AnnotationPVUID] != string(cur.UID) ||
+				cur.Spec.ClaimRef == nil || job.Annotations[workspace.AnnotationClaimUID] != string(cur.Spec.ClaimRef.UID) {
+				return ctrl.Result{}, fmt.Errorf("mover job %s/%s no longer matches volume %s and its rescue claim", ns, job.Name, pv.Name)
+			}
 			want := cmp.Or(job.Annotations[workspace.AnnotationWriterPod], workspace.FinalByMover)
 			if cur.Annotations[workspace.AnnotationFinalPod] != want && retry {
 				return r.restartRescue(ctx, pv, &job)
@@ -244,17 +282,21 @@ func (r *PVReconciler) checkRescue(ctx context.Context, pv *corev1.PersistentVol
 				return ctrl.Result{}, r.setRescue(ctx, &cur, wsnapv1.RescueFailed)
 			}
 			log.FromContext(ctx).Info("rescue finished", "pv", pv.Name, "job", job.Name)
+			// Delete before marking the rescue done. A crash after the mark
+			// could otherwise strand a bound claim with no retry path.
+			if err := r.deleteRescueClaim(ctx, &cur, ns); err != nil {
+				return ctrl.Result{}, err
+			}
 			if err := r.setRescue(ctx, &cur, wsnapv1.RescueDone); err != nil {
 				return ctrl.Result{}, err
 			}
-			// Deleting the rescue claim releases the PV again; the next
+			// The deleted rescue claim releases the PV again; the next
 			// reconcile sees wsnapv1.RescueDone and reclaims it.
 			bg := metav1.DeletePropagationBackground
 			if err := r.Delete(ctx, &job, &client.DeleteOptions{PropagationPolicy: &bg}); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, err
 			}
-			claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: rescueClaimName(pv.Name)}}
-			return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, claim))
+			return ctrl.Result{}, nil
 		case batchv1.JobFailed:
 			if retry {
 				return r.restartRescue(ctx, pv, &job)
