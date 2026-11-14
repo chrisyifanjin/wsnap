@@ -412,6 +412,21 @@ scenario_pvc() {
 	kubectl -n "$NS" delete pvc pvc-b >/dev/null
 }
 
+scenario_workspace_identity() {
+	log "workspace identity: repository cannot change after creation"
+	fresh_workspace ws-repo-identity
+	printf 'apiVersion: wsnap.dev/v1alpha1\nkind: Workspace\nmetadata: {name: ws-repo-identity, namespace: %s}\nspec: {repositoryName: kopia-s3}\n' "$NS" | kubectl apply -f - >/dev/null
+	local rejected
+	if rejected=$(kubectl -n "$NS" patch workspace ws-repo-identity --type merge -p '{"spec":{"repositoryName":"restic-s3"}}' 2>&1); then
+		die "Workspace accepted a repository change"
+	fi
+	[[ $rejected == *'repositoryName is immutable'* ]] || die "repository change failed for an unexpected reason: $rejected"
+	[[ $(ws_field ws-repo-identity .spec.repositoryName) == kopia-s3 ]] || die "rejected update changed repositoryName"
+	kubectl -n "$NS" patch workspace ws-repo-identity --type merge -p '{"spec":{"restoreFrom":{"snapshotID":"example"}}}' >/dev/null
+	kubectl -n "$NS" delete workspace ws-repo-identity --wait=true >/dev/null
+	pass "repositoryName is immutable; unrelated Workspace updates remain allowed"
+}
+
 scenario_ephemeral() {
 	log "ephemeral: generic ephemeral volume, injected sidecar, restic + S3 STS: crash, then rescue by mover"
 	fresh_workspace ws-eph
@@ -1035,7 +1050,7 @@ EOF
 group() {
 	case $1 in
 	controlplane) echo webhook gateway tls multinode ;;
-	volumes) echo storage_policy pvc ephemeral sandbox emptydir singlewriter requests ;;
+	volumes) echo workspace_identity pvc ephemeral sandbox emptydir singlewriter requests ;;
 	failures) echo chaos ;;
 	worker) echo worker ;;
 	runtimes) echo runtimes ;;
