@@ -4,6 +4,7 @@
 # volume:
 #
 #   pvc        Pod + standalone PVC        kopia  + S3 (STS)   warm resume, cold restore, maintenance
+#   storage_policy reviewed StorageClass, per-claim bounds, namespace storage quota
 #   ephemeral  generic ephemeral volume    restic + S3 (STS)   no sidecar: rescue by a mover Job
 #   sandbox    agent-sandbox Sandbox       restic + S3 (STS)   suspend/resume, delete, recreate
 #   emptydir   emptyDir                    exec   + filesystem final snapshot on SIGTERM, reused final
@@ -309,6 +310,59 @@ setup() {
 	wait_for 60 "SecretForbidden without a RoleBinding" repo_reason_is e2e-nobind r SecretForbidden
 	kubectl delete namespace e2e-nobind --wait=false >/dev/null
 	pass "setup (repositories Ready, CredentialsScoped reported; broker on TLS; Secrets readable only where bound)"
+}
+
+storage_policy_pvc_yaml() { # namespace name class size
+	printf 'apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata: {name: %s, namespace: %s}\nspec: {accessModes: [ReadWriteOnce], storageClassName: %s, resources: {requests: {storage: %s}}}\n' "$2" "$1" "$3" "$4"
+}
+
+scenario_storage_policy() {
+	log "storage policy: admit only bounded PVCs on the reviewed StorageClass"
+	local policy_ns=wsnap-storage-e2e rejected
+	kubectl create namespace "$policy_ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	# The sample uses namespace agents; keep this test isolated while applying
+	# the sample's actual LimitRange, ResourceQuota, and admission policy.
+	sed "s/namespace: agents/namespace: $policy_ns/g" "$ROOT/config/samples/storage-policy.yaml" | kubectl apply -f - >/dev/null
+	kubectl label namespace "$policy_ns" wsnap.dev/storage-policy=safe --overwrite >/dev/null
+	# Admission configuration reaches API-server caches asynchronously. Probe
+	# with server-side dry runs so no unreviewed PVC can be provisioned while
+	# waiting for the binding and namespace label to take effect.
+	local end=$((SECONDS + 30))
+	while :; do
+		if rejected=$(storage_policy_pvc_yaml "$policy_ns" policy-probe unreviewed 1Gi | kubectl apply --dry-run=server -f - 2>&1); then
+			:
+		elif [[ $rejected == *'PVCs in this namespace must use the reviewed wsnap-safe StorageClass'* ]]; then
+			break
+		fi
+		((SECONDS < end)) || die "storage admission policy did not activate: $rejected"
+		sleep 2
+	done
+	storage_policy_pvc_yaml "$policy_ns" reviewed wsnap-safe 1Gi | kubectl apply -f - >/dev/null
+	if rejected=$(storage_policy_pvc_yaml "$policy_ns" unreviewed unreviewed 1Gi | kubectl apply -f - 2>&1); then
+		die "storage policy admitted an unreviewed StorageClass"
+	fi
+	[[ $rejected == *'PVCs in this namespace must use the reviewed wsnap-safe StorageClass'* ]] || die "unreviewed class failed for an unexpected reason: $rejected"
+	if rejected=$(storage_policy_pvc_yaml "$policy_ns" oversized wsnap-safe 20Gi | kubectl apply -f - 2>&1); then
+		die "storage policy admitted a PVC above the 10Gi limit"
+	fi
+	local i
+	for ((i = 1; i <= 9; i++)); do
+		storage_policy_pvc_yaml "$policy_ns" "quota-$i" wsnap-safe 10Gi | kubectl apply -f - >/dev/null
+	done
+	if rejected=$(storage_policy_pvc_yaml "$policy_ns" quota-overflow wsnap-safe 10Gi | kubectl apply -f - 2>&1); then
+		die "storage policy admitted a PVC above the 100Gi namespace quota"
+	fi
+	[[ $rejected == *'exceeded quota'* ]] || die "quota overflow failed for an unexpected reason: $rejected"
+	kubectl -n "$policy_ns" get pvc reviewed >/dev/null
+	if kubectl -n "$policy_ns" get pvc unreviewed >/dev/null 2>&1 ||
+		kubectl -n "$policy_ns" get pvc oversized >/dev/null 2>&1 ||
+		kubectl -n "$policy_ns" get pvc quota-overflow >/dev/null 2>&1; then
+		die "a rejected PVC was stored"
+	fi
+	kubectl delete validatingadmissionpolicybinding wsnap-storage-class.wsnap.dev >/dev/null
+	kubectl delete validatingadmissionpolicy wsnap-storage-class.wsnap.dev >/dev/null
+	kubectl delete namespace "$policy_ns" --wait=false >/dev/null
+	pass "reviewed PVC admitted; unreviewed class, 20Gi claim, and namespace quota overflow rejected"
 }
 
 scenario_pvc() {

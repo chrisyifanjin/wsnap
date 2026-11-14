@@ -412,6 +412,12 @@ PVC identity and provisioning checks:
 - A rescue PVC is pinned to its released PV and the PV is pre-bound to
   the new claim UID. A preexisting same-name claim cannot cause a mover
   Job to start (`TestRescueRefusesPreexistingSameNameClaim`).
+- `scenario_storage_policy` applies the sample `LimitRange`, `ResourceQuota`,
+  and StorageClass admission policy in an isolated namespace. It waits for
+  the policy to become active, then checks that a reviewed 1Gi claim is
+  admitted while an unreviewed class, a 20Gi claim above the 10Gi limit,
+  and a claim above the namespace's 100Gi quota are rejected. The volumes
+  CI group runs this on Kubernetes 1.30 and 1.37.
 - The sample `LimitRange`, `ResourceQuota`, and StorageClass admission
   policy were applied to an isolated Kubernetes 1.37 namespace. A claim
   using the reviewed class was admitted; an unreviewed class and a 20Gi
