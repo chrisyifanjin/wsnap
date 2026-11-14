@@ -412,6 +412,12 @@ PVC identity and provisioning checks:
 - A rescue PVC is pinned to its released PV and the PV is pre-bound to
   the new claim UID. A preexisting same-name claim cannot cause a mover
   Job to start (`TestRescueRefusesPreexistingSameNameClaim`).
+- A completed rescue deletes only the claim UID pre-bound to its PV. If a
+  same-name claim replaces it, the PV stays retained; if the controller
+  stops after marking the rescue done, reconciliation retries claim cleanup
+  (`TestCompletedRescueKeepsReplacementClaim`,
+  `TestCompletedRescueUsesClaimUIDDeletePrecondition`,
+  `TestDoneRescueCleansClaimAfterRestart`).
 - `scenario_storage_policy` applies the sample `LimitRange`, `ResourceQuota`,
   and StorageClass admission policy in an isolated namespace. It waits for
   the policy to become active, then checks that a reviewed 1Gi claim is
