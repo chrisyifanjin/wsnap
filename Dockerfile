@@ -13,7 +13,7 @@ RUN LDFLAGS="-s -X github.com/chrisyifanjin/wsnap/internal/version.Version=${VER
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="$LDFLAGS" -o /out/wsnap-agent ./cmd/wsnap-agent
 
 # Engine CLIs, pinned and checked against the published checksums.
-FROM alpine:3.22 AS engines
+FROM alpine:3.24 AS engines
 ARG TARGETARCH
 ARG KOPIA_VERSION=0.23.1
 ARG RESTIC_VERSION=0.19.1
@@ -37,7 +37,7 @@ ENTRYPOINT ["/wsnap-controller"]
 # The agent runs as root: it must read and restore files owned by any user
 # in the workspace. The webhook and the Job template pin uid 0 even when the
 # Pod sets runAsUser, so every agent on a volume trusts the same .wsnap.
-FROM alpine:3.22 AS agent
+FROM alpine:3.24 AS agent
 RUN apk add --no-cache ca-certificates tar gzip
 COPY --from=engines /usr/local/bin/kopia /usr/local/bin/restic /usr/local/bin/
 COPY --from=build /out/wsnap-agent /usr/local/bin/wsnap-agent
