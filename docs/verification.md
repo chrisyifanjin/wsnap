@@ -19,9 +19,10 @@ tests found.
 | End to end | `test/e2e/run.sh` | The whole system on kind, with agent-sandbox, MinIO, and failures injected. |
 
 The release workflow checks that a tag points to a commit on `main` with a
-successful push CI run for that exact commit before it pushes images. A green
-pull-request run does not satisfy this gate; wait for the final `main` run
-after merging.
+successful push CI run for that exact commit before it pushes images. It runs
+this check and unit tests with read-only permissions; a separate job obtains
+publish permissions only after verification passes. A green pull-request run
+does not satisfy this gate; wait for the final `main` run after merging.
 
 ## How to run the store tests
 
