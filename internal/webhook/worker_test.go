@@ -60,6 +60,23 @@ func TestWorkerModeRefusesUnsharableVolumes(t *testing.T) {
 	}
 }
 
+func TestEphemeralBlockClaimDeniedInBothModes(t *testing.T) {
+	block := corev1.PersistentVolumeBlock
+	for _, mode := range []string{"sidecar", wsnapv1.ExecutionWorker} {
+		t.Run(mode, func(t *testing.T) {
+			p := labeledPod(func(p *corev1.Pod) {
+				p.Spec.Volumes[0].VolumeSource = corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{
+					VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{Spec: corev1.PersistentVolumeClaimSpec{VolumeMode: &block}}}}
+			})
+			config := cfg
+			config.ExecutionMode = mode
+			if err := Mutate(p, config); err == nil || !strings.Contains(err.Error(), "filesystem mount") {
+				t.Fatalf("Block template mutation error = %v, want filesystem mount refusal", err)
+			}
+		})
+	}
+}
+
 func handle(t *testing.T, h *Handler, p *corev1.Pod) admission.Response {
 	t.Helper()
 	raw, _ := json.Marshal(p)
@@ -88,6 +105,30 @@ func TestWorkerModeRefusesReadWriteOncePodClaims(t *testing.T) {
 	}
 	if r := handle(t, h, pvcPod("not-created-yet")); !r.Allowed {
 		t.Errorf("a claim created after the Pod was refused: %s", r.Result.Message)
+	}
+}
+
+func TestStandaloneBlockClaimDeniedInBothModes(t *testing.T) {
+	block := corev1.PersistentVolumeBlock
+	for _, mode := range []string{"sidecar", wsnapv1.ExecutionWorker} {
+		t.Run(mode, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := clientgoscheme.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := wsnapv1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "data"},
+				Spec: corev1.PersistentVolumeClaimSpec{VolumeMode: &block}}
+			ws := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ws"},
+				Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo", Execution: wsnapv1.WorkspaceExecutionSpec{Mode: mode}}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(claim, ws).Build()
+			h := &Handler{Config: cfg, Reader: c, Decoder: admission.NewDecoder(scheme)}
+			if r := handle(t, h, pvcPod("data")); r.Allowed || !strings.Contains(r.Result.Message, "filesystem mount") {
+				t.Fatalf("Block claim admission = allowed %v, message %q", r.Allowed, r.Result.Message)
+			}
+		})
 	}
 }
 

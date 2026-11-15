@@ -429,6 +429,34 @@ scenario_workspace_identity() {
 
 scenario_ephemeral() {
 	log "ephemeral: generic ephemeral volume, injected sidecar, restic + S3 STS: crash, then rescue by mover"
+	local rejected
+	if rejected=$(kubectl apply --dry-run=server -f - 2>&1 <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: block-workspace
+  namespace: $NS
+  labels: {wsnap.dev/workspace: block-workspace, wsnap.dev/repository: restic-s3}
+spec:
+  containers:
+  - name: agent
+    image: busybox
+    command: [sleep, "3600"]
+    volumeMounts: [{name: workspace, mountPath: /workspace}]
+  volumes:
+  - name: workspace
+    ephemeral:
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          volumeMode: Block
+          resources: {requests: {storage: 1Gi}}
+EOF
+	); then
+		die "webhook admitted a raw Block workspace claim"
+	fi
+	[[ $rejected == *'wsnap requires a filesystem mount'* ]] || die "Block workspace was denied for an unexpected reason: $rejected"
+	pass "webhook denies a Block PVC template before it can start a workspace"
 	fresh_workspace ws-eph
 	apply_pod eph-1 ws-eph restic-s3 ephemeral no >/dev/null
 	wait_for 180 "eph-1 ready" pod_ready eph-1

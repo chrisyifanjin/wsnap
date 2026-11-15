@@ -69,12 +69,18 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 	if _, err := workspace.FromPod(pod); err != nil {
 		return err
 	}
-	if cfg.ExecutionMode == wsnapv1.ExecutionWorker {
-		return mutateWorkerPod(pod, cfg)
-	}
 	volName := pod.Annotations[wsnapv1.AnnotationVolume]
 	if volName == "" {
 		volName = wsnapv1.DefaultVolumeName
+	}
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name == volName && vol.Ephemeral != nil && vol.Ephemeral.VolumeClaimTemplate != nil &&
+			!workspace.FilesystemVolumeMode(vol.Ephemeral.VolumeClaimTemplate.Spec.VolumeMode) {
+			return fmt.Errorf("workspace volume %q uses Block volume mode; wsnap requires a filesystem mount", volName)
+		}
+	}
+	if cfg.ExecutionMode == wsnapv1.ExecutionWorker {
+		return mutateWorkerPod(pod, cfg)
 	}
 	if !hasVolume(pod, volName) {
 		return fmt.Errorf("pod has no volume %q to protect (set annotation %s to the workspace volume's name)", volName, wsnapv1.AnnotationVolume)

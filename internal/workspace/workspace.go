@@ -87,6 +87,9 @@ func ResolveVolume(ctx context.Context, r client.Reader, pod *corev1.Pod) (wsnap
 	case vol.Ephemeral != nil:
 		// Kubernetes names generic ephemeral volume claims <pod>-<volume>.
 		ref = wsnapv1.VolumeRef{Kind: KindEphemeral, ClaimName: pod.Name + "-" + vol.Name}
+		if vol.Ephemeral.VolumeClaimTemplate != nil && !FilesystemVolumeMode(vol.Ephemeral.VolumeClaimTemplate.Spec.VolumeMode) {
+			return ref, fmt.Errorf("%w: workspace claim %s uses Block volume mode; wsnap requires a filesystem mount", ErrBadVolume, ref.ClaimName)
+		}
 	case vol.EmptyDir != nil:
 		return wsnapv1.VolumeRef{Kind: KindEmptyDir}, nil
 	default:
@@ -100,6 +103,9 @@ func ResolveVolume(ctx context.Context, r client.Reader, pod *corev1.Pod) (wsnap
 	if err != nil {
 		return ref, err
 	}
+	if !FilesystemVolumeMode(pvc.Spec.VolumeMode) {
+		return ref, fmt.Errorf("%w: workspace claim %s uses Block volume mode; wsnap requires a filesystem mount", ErrBadVolume, ref.ClaimName)
+	}
 	ref.ClaimUID = string(pvc.UID)
 	ref.VolumeName = pvc.Spec.VolumeName
 	if ref.VolumeName == "" {
@@ -109,11 +115,20 @@ func ResolveVolume(ctx context.Context, r client.Reader, pod *corev1.Pod) (wsnap
 	if err := r.Get(ctx, client.ObjectKey{Name: ref.VolumeName}, &pv); err != nil {
 		return ref, fmt.Errorf("%w: get volume %s: %v", ErrBadVolume, ref.VolumeName, err)
 	}
+	if !FilesystemVolumeMode(pv.Spec.VolumeMode) {
+		return ref, fmt.Errorf("%w: workspace volume %s uses Block volume mode; wsnap requires a filesystem mount", ErrBadVolume, ref.VolumeName)
+	}
 	if err := CheckBinding(pod.Namespace, ref, &pvc, &pv); err != nil {
 		return ref, err
 	}
 	ref.VolumeUID = string(pv.UID)
 	return ref, nil
+}
+
+// FilesystemVolumeMode accepts Kubernetes' nil default and explicit Filesystem.
+// Agent sidecars and Jobs use volumeMounts; they cannot read a raw block device.
+func FilesystemVolumeMode(mode *corev1.PersistentVolumeMode) bool {
+	return mode == nil || *mode == corev1.PersistentVolumeFilesystem
 }
 
 // CheckBinding rejects a stale or pre-bound claim before its PV can be

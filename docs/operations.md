@@ -60,6 +60,9 @@ Pick a StorageClass whose CSI driver, encryption, topology, and reclaim
 policy meet your requirements. Use `WaitForFirstConsumer` for topology-bound
 storage; Kubernetes waits for a Pod's scheduling decision before provisioning.
 Give each workspace Pod or Sandbox an explicit class and storage request.
+Use a filesystem PVC (`volumeMode: Filesystem`, or omit the field for
+Kubernetes' default). wsnap mounts the workspace in its sidecar and Jobs;
+it refuses raw `Block` claims.
 wsnap does not create its primary PVC. Its temporary rescue PVC pins
 `volumeName` to the already released PV and uses that PV's class, access
 modes, volume mode, and capacity. A rescue needs room in the namespace quota
