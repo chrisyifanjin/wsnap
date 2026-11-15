@@ -40,11 +40,12 @@ spec:
   validations:
     - expression: "has(object.spec.storageClassName) && object.spec.storageClassName == 'wsnap-safe'"
       message: "PVCs in this namespace must use the reviewed wsnap-safe StorageClass"
-    # A namespace user must not pre-create the controller's predictable
-    # rescue claim name and block a released PV's recovery. Adapt the service
+    # A namespace user must not pre-create the controller's predictable rescue
+    # claim name. Kubernetes storage controllers must still update rescue PVCs
+    # to bind volumes and manage protection finalizers. Adapt the service
     # account identity if wsnap is installed outside wsnap-system.
-    - expression: "(!object.metadata.name.startsWith('wsnap-rescue-') && (!has(object.metadata.generateName) || !object.metadata.generateName.startsWith('wsnap-rescue-'))) || request.userInfo.username == 'system:serviceaccount:wsnap-system:wsnap-controller'"
-      message: "only the wsnap controller may create or update wsnap-rescue- PVCs"
+    - expression: "request.operation == 'UPDATE' || (!object.metadata.name.startsWith('wsnap-rescue-') && (!has(object.metadata.generateName) || !object.metadata.generateName.startsWith('wsnap-rescue-'))) || request.userInfo.username == 'system:serviceaccount:wsnap-system:wsnap-controller'"
+      message: "only the wsnap controller may create wsnap-rescue- PVCs"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

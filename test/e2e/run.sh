@@ -345,13 +345,13 @@ scenario_storage_policy() {
 	if rejected=$(storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-collision wsnap-safe 1Gi | kubectl apply --dry-run=server -f - 2>&1); then
 		die "a namespace user reserved a wsnap rescue claim name"
 	fi
-	[[ $rejected == *'only the wsnap controller may create or update wsnap-rescue- PVCs'* ]] || die "rescue name failed for an unexpected reason: $rejected"
+	[[ $rejected == *'only the wsnap controller may create wsnap-rescue- PVCs'* ]] || die "rescue name failed for an unexpected reason: $rejected"
 	if rejected=$(storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-collision wsnap-safe 1Gi |
 		sed 's/name: wsnap-rescue-collision/generateName: wsnap-rescue-/' |
 		kubectl create --dry-run=server -f - 2>&1); then
 		die "a namespace user reserved a generated wsnap rescue claim name"
 	fi
-	[[ $rejected == *'only the wsnap controller may create or update wsnap-rescue- PVCs'* ]] || die "generated rescue name failed for an unexpected reason: $rejected"
+	[[ $rejected == *'only the wsnap controller may create wsnap-rescue- PVCs'* ]] || die "generated rescue name failed for an unexpected reason: $rejected"
 	storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-controller wsnap-safe 1Gi |
 		kubectl --as=system:serviceaccount:wsnap-system:wsnap-controller apply --dry-run=server -f - >/dev/null
 	if rejected=$(storage_policy_pvc_yaml "$policy_ns" oversized wsnap-safe 20Gi | kubectl apply -f - 2>&1); then
