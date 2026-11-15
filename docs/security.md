@@ -189,9 +189,11 @@ resource. The created request records the caller in the
 - **Azure writers can delete** inside their own container. Turn on soft
   delete or versioning.
 - **The filesystem backend has no isolation** between workspaces.
-- **By default the controller can read every Secret** (`get`, never list or
-  watch). Install `config/namespaced-secrets` to allow only namespaces
-  that bind `wsnap-secret-reader` (see operations.md).
+- **A namespace binding grants Secret reads across that namespace.** The
+  controller can `get` any Secret in a namespace that binds
+  `wsnap-secret-reader`; it never lists or watches Secrets. Grant the binding
+  only to namespaces whose repository credentials wsnap should read (see
+  operations.md).
 - **Editing a SnapshotRepository is an administrator right.** A user who can
   edit one can select the `static` provider (and so get the raw backend
   keys), set the image, volumes and security context of wsnap Jobs, and

@@ -288,9 +288,10 @@ setup() {
 	kubectl -n wsnap-system delete deploy wsnap-controller --ignore-not-found --wait=true >/dev/null
 	# Least privilege: the controller reads Secrets only where a namespace
 	# binds wsnap-secret-reader.
-	kubectl apply -k "$ROOT/config/namespaced-secrets" >/dev/null
-	kubectl delete clusterrolebinding wsnap-secret-reader --ignore-not-found >/dev/null
+	kubectl apply -k "$ROOT/config/default" >/dev/null
 	kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	[[ $(kubectl auth can-i get secrets -n "$NS" --as=system:serviceaccount:wsnap-system:wsnap-controller) == no ]] ||
+		die "the default install grants repository Secret access before a namespace binding"
 	kubectl -n "$NS" apply -f "$ROOT/config/samples/secret-access.yaml" >/dev/null
 	kubectl -n wsnap-system rollout restart deploy/wsnap-controller >/dev/null
 	kubectl -n storage wait --for=condition=complete job/minio-setup --timeout=180s >/dev/null

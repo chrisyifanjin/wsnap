@@ -37,22 +37,20 @@ to the release instead; it pins both image tags.
 The sample volume needs a StorageClass. Check yours with
 `kubectl get storageclass` before creating a Pod.
 
-### Limit which Secrets wsnap can read
+### Grant access to repository Secrets
 
-By default the controller may `get` Secrets in every namespace, because
-each SnapshotRepository's Secret lives in its own namespace. To allow only
-the namespaces you choose, install `config/namespaced-secrets` instead of
-`config/default`, and bind the reader role in each namespace that has
-repositories:
+The default installation cannot read repository Secrets until you bind its
+reader role in each namespace that has repositories:
 
 ```sh
-kubectl apply -k config/namespaced-secrets
 kubectl -n agents apply -f config/samples/secret-access.yaml
 ```
 
-A repository in a namespace without the binding reports `Ready=False` with
-reason `SecretForbidden`, and wsnap checks again every minute. wsnap never
-lists or watches Secrets.
+The RoleBinding grants `get` access only in its namespace. A repository in a
+namespace without the binding reports `Ready=False` with reason
+`SecretForbidden`, and wsnap checks again every minute. wsnap never lists or
+watches Secrets. The old `config/namespaced-secrets` path remains an alias for
+the default installation.
 
 ### Safe PVC provisioning
 
@@ -414,10 +412,21 @@ skips its snapshots on purpose.
 
 ## Upgrade
 
-Apply the new `install.yaml`. The controller rolls one replica at a time
-(PDB), and the webhook stays available. Running sidecars keep their old
-image until their Pods restart; the broker accepts older agents within one
-minor version.
+When upgrading from an installation that used the old cluster-wide
+`wsnap-secret-reader` binding, apply `config/samples/secret-access.yaml` in
+every namespace with a SnapshotRepository before removing the old binding.
+Apply the new `install.yaml`, then remove the old binding:
+
+```sh
+kubectl delete clusterrolebinding wsnap-secret-reader --ignore-not-found
+```
+
+Applying a new manifest alone does not delete the old ClusterRoleBinding.
+Check that each repository remains `Ready=True` after this migration.
+
+The controller rolls one replica at a time (PDB), and the webhook stays
+available. Running sidecars keep their old image until their Pods restart;
+the broker accepts older agents within one minor version.
 
 Upgrading to the release with writer epochs: existing PVs have no
 `wsnap.dev/writer-epoch` annotation and count as epoch 0, and existing
