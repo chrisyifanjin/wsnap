@@ -153,6 +153,10 @@ replacement. See [docs/verification.md](docs/verification.md).
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow and
+[docs/engineering.md](docs/engineering.md) for package boundaries and PR
+evidence.
+
 ```sh
 make build vet test      # unit tests
 make generate            # CRDs and deepcopy (controller-gen)
