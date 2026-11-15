@@ -7,14 +7,16 @@
 # It creates, with least privilege:
 #   - an S3 bucket whose conformance/ objects expire after one day;
 #   - the GitHub OIDC identity provider (if missing);
-#   - a CI role that only this repository's workflows can assume (it plays
-#     the wsnap broker);
+#   - a CI role that only this repository's main-branch workflows can assume
+#     (it plays the wsnap broker);
 #   - a workspace role that the CI role assumes with a session policy, as
 #     the s3-sts provider does, allowed to use only that bucket.
 # It prints the repository variables to set. No key is created or stored.
 set -euo pipefail
 
 REPO=${REPO:?set REPO=owner/name}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OIDC_SUBJECT=$(REPO="$REPO" OIDC_SUBJECT="${OIDC_SUBJECT:-}" bash "$SCRIPT_DIR/oidc-subject.sh")
 REGION=${REGION:-us-east-1}
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET=${BUCKET:-wsnap-conformance-$ACCOUNT-$REGION}
@@ -46,8 +48,8 @@ ci_trust=$(cat <<EOF
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
  "Principal":{"Federated":"arn:aws:iam::$ACCOUNT:oidc-provider/$OIDC"},
  "Action":"sts:AssumeRoleWithWebIdentity",
- "Condition":{"StringEquals":{"$OIDC:aud":"sts.amazonaws.com"},
-              "StringLike":{"$OIDC:sub":"repo:$REPO:*"}}}]}
+ "Condition":{"StringEquals":{"$OIDC:aud":"sts.amazonaws.com",
+                            "$OIDC:sub":"$OIDC_SUBJECT"}}}]}
 EOF
 )
 ws_trust=$(cat <<EOF

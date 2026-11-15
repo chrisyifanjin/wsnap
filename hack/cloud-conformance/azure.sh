@@ -18,6 +18,8 @@
 set -euo pipefail
 
 REPO=${REPO:?set REPO=owner/name}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OIDC_SUBJECT=$(REPO="$REPO" OIDC_SUBJECT="${OIDC_SUBJECT:-}" bash "$SCRIPT_DIR/oidc-subject.sh")
 LOCATION=${LOCATION:-eastus}
 GROUP=${GROUP:-wsnap-conformance}
 SUBSCRIPTION=$(az account show --query id -o tsv)
@@ -43,12 +45,25 @@ if [[ -z $APP ]]; then
 	APP=$(az ad app create --display-name wsnap-conformance --query appId -o tsv)
 fi
 az ad sp show --id "$APP" -o none 2>/dev/null || az ad sp create --id "$APP" -o none
-if ! az ad app federated-credential list --id "$APP" --query "[?name=='wsnap-main']" -o tsv | grep -q .; then
-	az ad app federated-credential create --id "$APP" --parameters "{
-	  \"name\": \"wsnap-main\",
-	  \"issuer\": \"https://token.actions.githubusercontent.com\",
-	  \"subject\": \"repo:$REPO:ref:refs/heads/main\",
-	  \"audiences\": [\"api://AzureADTokenExchange\"]}" -o none
+federated_credential=$(cat <<EOF
+{"name":"wsnap-main",
+ "issuer":"https://token.actions.githubusercontent.com",
+ "subject":"$OIDC_SUBJECT",
+ "audiences":["api://AzureADTokenExchange"]}
+EOF
+)
+if az ad app federated-credential list --id "$APP" --query "[?name=='wsnap-main']" -o tsv | grep -q .; then
+	# A legacy subject would never match an immutable GitHub repository.
+	federated_update=$(cat <<EOF
+{"issuer":"https://token.actions.githubusercontent.com",
+ "subject":"$OIDC_SUBJECT",
+ "audiences":["api://AzureADTokenExchange"]}
+EOF
+)
+	az ad app federated-credential update --id "$APP" \
+		--federated-credential-id wsnap-main --parameters "$federated_update" -o none
+else
+	az ad app federated-credential create --id "$APP" --parameters "$federated_credential" -o none
 fi
 az role assignment create --assignee "$APP" --role "Storage Account Key Operator Service Role" --scope "$SCOPE" -o none
 # azure/login selects the subscription; a role in this resource group makes

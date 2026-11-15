@@ -63,6 +63,31 @@ Shell); it creates the resources below with least privilege and prints the
 `gh variable set` commands. Then start a run:
 `gh workflow run cloud-conformance.yml --repo <owner>/wsnap`.
 
+Each script restricts cloud federation to this repository's **main branch**.
+GitHub now gives newer repositories an immutable OIDC subject containing the
+owner and repository IDs ([GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc)).
+The scripts read the exact default subject through an authenticated `gh`
+session. If `gh` is unavailable in a cloud shell, get the subject on a
+machine where `gh` is authenticated, then pass it as `OIDC_SUBJECT` to each
+script:
+
+```sh
+REPO=chrisyifanjin/wsnap
+gh api "repos/$REPO/actions/oidc/customization/sub" \
+  --jq 'select(.use_default).sub_claim_prefix + ":ref:refs/heads/main"'
+# Copy the printed value into the cloud shell:
+OIDC_SUBJECT='repo:...:ref:refs/heads/main' REPO=chrisyifanjin/wsnap REGION=us-east-1 \
+  bash hack/cloud-conformance/aws.sh
+```
+
+Repeat with the GCP and Azure scripts. The scripts accept GitHub's legacy
+and immutable default subject formats. If the repository uses a custom OIDC
+template, adapt the cloud trusts to that exact main-branch identity before
+running setup. Rerun the scripts after upgrading from an older setup: they
+tighten existing AWS and GCP trusts and update the Azure federated credential.
+The commands below assume `gh` is authenticated in that shell or
+`OIDC_SUBJECT` has been exported there.
+
 ```sh
 REPO=<owner>/wsnap REGION=us-east-1 bash hack/cloud-conformance/aws.sh
 REPO=<owner>/wsnap PROJECT=<project> bash hack/cloud-conformance/gcp.sh

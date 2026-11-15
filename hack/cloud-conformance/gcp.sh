@@ -9,11 +9,13 @@
 #   - a service account with objectAdmin on that bucket only (it plays the
 #     wsnap broker; the gcs-downscoped provider narrows it per workspace);
 #   - a workload identity pool and GitHub provider that accept only this
-#     repository, allowed to act as that service account.
+#     repository's main branch, allowed to act as that service account.
 # It prints the repository variables to set. No key is created or stored.
 set -euo pipefail
 
 REPO=${REPO:?set REPO=owner/name}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OIDC_SUBJECT=$(REPO="$REPO" OIDC_SUBJECT="${OIDC_SUBJECT:-}" bash "$SCRIPT_DIR/oidc-subject.sh")
 PROJECT=${PROJECT:-$(gcloud config get-value project 2>/dev/null)}
 [[ -n $PROJECT ]] || { echo "set PROJECT" >&2; exit 1; }
 LOCATION=${LOCATION:-us-central1}
@@ -48,13 +50,19 @@ if ! gcloud iam workload-identity-pools describe "$POOL" --project "$PROJECT" --
 	gcloud iam workload-identity-pools create "$POOL" --project "$PROJECT" --location global \
 		--display-name "wsnap GitHub Actions"
 fi
+SUBJECT_CONDITION="assertion.repository == '$REPO' && assertion.sub == '$OIDC_SUBJECT'"
 if ! gcloud iam workload-identity-pools providers describe "$PROVIDER" --project "$PROJECT" \
 	--location global --workload-identity-pool "$POOL" >/dev/null 2>&1; then
 	gcloud iam workload-identity-pools providers create-oidc "$PROVIDER" --project "$PROJECT" \
 		--location global --workload-identity-pool "$POOL" \
 		--issuer-uri https://token.actions.githubusercontent.com \
 		--attribute-mapping 'google.subject=assertion.sub,attribute.repository=assertion.repository' \
-		--attribute-condition "assertion.repository == '$REPO'"
+		--attribute-condition "$SUBJECT_CONDITION"
+else
+	# Tighten a provider made by an older version of this script as well.
+	gcloud iam workload-identity-pools providers update-oidc "$PROVIDER" --project "$PROJECT" \
+		--location global --workload-identity-pool "$POOL" \
+		--attribute-condition "$SUBJECT_CONDITION"
 fi
 gcloud iam service-accounts add-iam-policy-binding "$SA" --project "$PROJECT" \
 	--role roles/iam.workloadIdentityUser \

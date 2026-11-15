@@ -39,6 +39,8 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - name: Release manifest renders
         run: make install-manifest VERSION=v0.0.0-ci && rm install.yaml
+      - name: Cloud OIDC subject checks
+        run: bash hack/cloud-conformance/test-oidc-subject.sh
 
   e2e:
     # Groups of scenarios that share no state, each on its own
