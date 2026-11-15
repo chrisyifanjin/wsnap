@@ -73,3 +73,46 @@ func TestResolveVolumeRequiresClaimAndPVIdentity(t *testing.T) {
 		t.Fatalf("foreign workspace protection error = %v", err)
 	}
 }
+
+func TestResolveVolumeRejectsBlockModeBeforeProtection(t *testing.T) {
+	ctx := context.Background()
+	block := corev1.PersistentVolumeBlock
+	filesystem := corev1.PersistentVolumeFilesystem
+	if !FilesystemVolumeMode(nil) || !FilesystemVolumeMode(&filesystem) || FilesystemVolumeMode(&block) {
+		t.Fatal("filesystem volume mode must accept Kubernetes' nil default and reject Block")
+	}
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "data", UID: "claim-1"},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-1", UID: "volume-1"},
+		Spec: corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: "team-a", Name: "data", UID: "claim-1"}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "agent"},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}}}}}}
+	for _, tc := range []struct {
+		name string
+		edit func(*corev1.PersistentVolumeClaim, *corev1.PersistentVolume)
+	}{
+		{"claim", func(c *corev1.PersistentVolumeClaim, _ *corev1.PersistentVolume) { c.Spec.VolumeMode = &block }},
+		{"PV", func(_ *corev1.PersistentVolumeClaim, p *corev1.PersistentVolume) { p.Spec.VolumeMode = &block }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, p := claim.DeepCopy(), pv.DeepCopy()
+			tc.edit(c, p)
+			r := fake.NewClientBuilder().WithScheme(scheme).WithObjects(c, p).Build()
+			if _, err := ResolveVolume(ctx, r, pod); !errors.Is(err, ErrBadVolume) {
+				t.Fatalf("ResolveVolume error = %v, want ErrBadVolume for Block %s", err, tc.name)
+			}
+		})
+	}
+	eph := pod.DeepCopy()
+	eph.Spec.Volumes[0].VolumeSource = corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{
+		VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{Spec: corev1.PersistentVolumeClaimSpec{VolumeMode: &block}}}}
+	r := fake.NewClientBuilder().WithScheme(scheme).Build() // claim not created yet
+	if _, err := ResolveVolume(ctx, r, eph); !errors.Is(err, ErrBadVolume) {
+		t.Fatalf("ephemeral Block template error = %v, want ErrBadVolume", err)
+	}
+}

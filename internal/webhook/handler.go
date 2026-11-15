@@ -52,8 +52,8 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 		}
 		return admission.Allowed("")
 	}
-	if cfg.ExecutionMode == wsnapv1.ExecutionWorker && h.Reader != nil {
-		reason, err := h.unsharableClaim(ctx, &pod)
+	if h.Reader != nil {
+		reason, err := h.unsupportedClaim(ctx, &pod, cfg.ExecutionMode)
 		if err != nil {
 			return admission.Errored(http.StatusServiceUnavailable, err)
 		}
@@ -71,11 +71,11 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	return admission.PatchResponseFromRaw(req.Object.Raw, raw)
 }
 
-// unsharableClaim explains why a worker-mode Pod's standalone PVC cannot
-// be shared: a ReadWriteOncePod claim cannot be mounted by the worker, so
-// the workload would wait at its gate forever. A claim that does not exist
-// yet is checked by the controller when the Pod is scheduled.
-func (h *Handler) unsharableClaim(ctx context.Context, pod *corev1.Pod) (string, error) {
+// unsupportedClaim rejects standalone PVC modes that cannot supply the
+// filesystem mount used by every wsnap agent. Worker mode also rejects
+// ReadWriteOncePod, which cannot be mounted by the worker Pod. A claim that
+// does not exist yet is checked by the controller when the Pod is scheduled.
+func (h *Handler) unsupportedClaim(ctx context.Context, pod *corev1.Pod, executionMode string) (string, error) {
 	volName := pod.Annotations[wsnapv1.AnnotationVolume]
 	if volName == "" {
 		volName = wsnapv1.DefaultVolumeName
@@ -92,7 +92,10 @@ func (h *Handler) unsharableClaim(ctx context.Context, pod *corev1.Pod) (string,
 		if err != nil {
 			return "", err
 		}
-		if slices.Contains(claim.Spec.AccessModes, corev1.ReadWriteOncePod) {
+		if !workspace.FilesystemVolumeMode(claim.Spec.VolumeMode) {
+			return fmt.Sprintf("workspace claim %s uses Block volume mode; wsnap requires a filesystem mount", claim.Name), nil
+		}
+		if executionMode == wsnapv1.ExecutionWorker && slices.Contains(claim.Spec.AccessModes, corev1.ReadWriteOncePod) {
 			return fmt.Sprintf("worker mode cannot share ReadWriteOncePod claim %s with a worker Pod", claim.Name), nil
 		}
 	}
