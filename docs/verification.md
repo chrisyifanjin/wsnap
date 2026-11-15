@@ -450,6 +450,10 @@ PVC identity and provisioning checks:
   and a claim above the namespace's 100Gi quota are rejected. The volumes
   CI group runs this on Kubernetes 1.30 and 1.37. The e2e harness checks
   that every defined scenario belongs to exactly one group before setup.
+- The same storage-policy scenario denies non-controller creation and
+  deletion of reserved rescue PVCs, allows controller creation and deletion,
+  leaves ordinary PVC updates and deletion available, and lets a terminating
+  namespace collect its remaining rescue claim.
 - The API server rejects changes to `Workspace.spec.repositoryName` while
   allowing unrelated Workspace updates (`scenario_workspace_identity`).
   To use another `SnapshotRepository`, create a new Workspace and migrate

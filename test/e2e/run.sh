@@ -345,15 +345,22 @@ scenario_storage_policy() {
 	if rejected=$(storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-collision wsnap-safe 1Gi | kubectl apply --dry-run=server -f - 2>&1); then
 		die "a namespace user reserved a wsnap rescue claim name"
 	fi
-	[[ $rejected == *'only the wsnap controller may create wsnap-rescue- PVCs'* ]] || die "rescue name failed for an unexpected reason: $rejected"
+	[[ $rejected == *'only the wsnap controller may create or delete wsnap-rescue- PVCs'* ]] || die "rescue name failed for an unexpected reason: $rejected"
 	if rejected=$(storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-collision wsnap-safe 1Gi |
 		sed 's/name: wsnap-rescue-collision/generateName: wsnap-rescue-/' |
 		kubectl create --dry-run=server -f - 2>&1); then
 		die "a namespace user reserved a generated wsnap rescue claim name"
 	fi
-	[[ $rejected == *'only the wsnap controller may create wsnap-rescue- PVCs'* ]] || die "generated rescue name failed for an unexpected reason: $rejected"
+	[[ $rejected == *'only the wsnap controller may create or delete wsnap-rescue- PVCs'* ]] || die "generated rescue name failed for an unexpected reason: $rejected"
 	storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-controller wsnap-safe 1Gi |
-		kubectl --as=system:serviceaccount:wsnap-system:wsnap-controller apply --dry-run=server -f - >/dev/null
+		kubectl --as=system:serviceaccount:wsnap-system:wsnap-controller create -f - >/dev/null
+	if rejected=$(kubectl -n "$policy_ns" delete pvc wsnap-rescue-controller 2>&1); then
+		die "a non-controller caller deleted a wsnap rescue claim"
+	fi
+	[[ $rejected == *'only the wsnap controller may create or delete wsnap-rescue- PVCs'* ]] || die "rescue deletion failed for an unexpected reason: $rejected"
+	kubectl -n "$policy_ns" get pvc wsnap-rescue-controller >/dev/null || die "denied deletion removed rescue claim"
+	kubectl --as=system:serviceaccount:wsnap-system:wsnap-controller -n "$policy_ns" delete pvc wsnap-rescue-controller --wait=true --timeout=45s >/dev/null
+	kubectl -n "$policy_ns" annotate pvc reviewed wsnap.dev/policy-probe=allowed >/dev/null
 	if rejected=$(storage_policy_pvc_yaml "$policy_ns" oversized wsnap-safe 20Gi | kubectl apply -f - 2>&1); then
 		die "storage policy admitted a PVC above the 10Gi limit"
 	fi
@@ -371,10 +378,15 @@ scenario_storage_policy() {
 		kubectl -n "$policy_ns" get pvc quota-overflow >/dev/null 2>&1; then
 		die "a rejected PVC was stored"
 	fi
+	kubectl -n "$policy_ns" delete pvc reviewed --wait=true >/dev/null
+	# Namespace teardown must still collect rescue claims. A policy that
+	# blocks the namespace controller here would leave Terminating forever.
+	storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-namespace wsnap-safe 1Gi |
+		kubectl --as=system:serviceaccount:wsnap-system:wsnap-controller create -f - >/dev/null
+	kubectl delete namespace "$policy_ns" --wait=true --timeout=90s >/dev/null
 	kubectl delete validatingadmissionpolicybinding wsnap-storage-class.wsnap.dev >/dev/null
 	kubectl delete validatingadmissionpolicy wsnap-storage-class.wsnap.dev >/dev/null
-	kubectl delete namespace "$policy_ns" --wait=false >/dev/null
-	pass "reviewed PVC and controller rescue claim admitted; unreviewed class, reserved rescue name, 20Gi claim, and namespace quota overflow rejected"
+	pass "reviewed PVC and controller rescue claim admitted; unreviewed class, reserved rescue name and deletion, 20Gi claim, and namespace quota overflow rejected; namespace deletion completed"
 }
 
 scenario_pvc() {
