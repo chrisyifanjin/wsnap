@@ -75,9 +75,11 @@ kubectl label namespace agents wsnap.dev/storage-policy=safe
 
 The `LimitRange` caps each claim; the `ResourceQuota` caps total requested
 storage and claim count. The `ValidatingAdmissionPolicy` enforces the
-reviewed StorageClass and reserves `wsnap-rescue-` PVC creation, updates, and
-deletion for the wsnap controller in labeled namespaces. If the controller
-uses a different service account, adapt that identity in the sample policy.
+reviewed StorageClass and reserves `wsnap-rescue-` PVC creation and deletion
+for the wsnap controller in labeled namespaces. Kubernetes storage controllers
+must be able to update those PVCs for binding and protection finalizers; use
+namespace RBAC to restrict who else can update PVCs. If the controller uses a
+different service account, adapt that identity in the sample policy.
 An administrator who must remove an orphaned rescue claim after inspecting
 its PV and UID can impersonate that controller service account for the
 specific delete. Install the policy before labeling a namespace, and make
