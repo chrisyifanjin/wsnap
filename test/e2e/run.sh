@@ -342,6 +342,18 @@ scenario_storage_policy() {
 		die "storage policy admitted an unreviewed StorageClass"
 	fi
 	[[ $rejected == *'PVCs in this namespace must use the reviewed wsnap-safe StorageClass'* ]] || die "unreviewed class failed for an unexpected reason: $rejected"
+	if rejected=$(storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-collision wsnap-safe 1Gi | kubectl apply --dry-run=server -f - 2>&1); then
+		die "a namespace user reserved a wsnap rescue claim name"
+	fi
+	[[ $rejected == *'only the wsnap controller may create or update wsnap-rescue- PVCs'* ]] || die "rescue name failed for an unexpected reason: $rejected"
+	if rejected=$(storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-collision wsnap-safe 1Gi |
+		sed 's/name: wsnap-rescue-collision/generateName: wsnap-rescue-/' |
+		kubectl create --dry-run=server -f - 2>&1); then
+		die "a namespace user reserved a generated wsnap rescue claim name"
+	fi
+	[[ $rejected == *'only the wsnap controller may create or update wsnap-rescue- PVCs'* ]] || die "generated rescue name failed for an unexpected reason: $rejected"
+	storage_policy_pvc_yaml "$policy_ns" wsnap-rescue-controller wsnap-safe 1Gi |
+		kubectl --as=system:serviceaccount:wsnap-system:wsnap-controller apply --dry-run=server -f - >/dev/null
 	if rejected=$(storage_policy_pvc_yaml "$policy_ns" oversized wsnap-safe 20Gi | kubectl apply -f - 2>&1); then
 		die "storage policy admitted a PVC above the 10Gi limit"
 	fi
@@ -362,7 +374,7 @@ scenario_storage_policy() {
 	kubectl delete validatingadmissionpolicybinding wsnap-storage-class.wsnap.dev >/dev/null
 	kubectl delete validatingadmissionpolicy wsnap-storage-class.wsnap.dev >/dev/null
 	kubectl delete namespace "$policy_ns" --wait=false >/dev/null
-	pass "reviewed PVC admitted; unreviewed class, 20Gi claim, and namespace quota overflow rejected"
+	pass "reviewed PVC and controller rescue claim admitted; unreviewed class, reserved rescue name, 20Gi claim, and namespace quota overflow rejected"
 }
 
 scenario_pvc() {
