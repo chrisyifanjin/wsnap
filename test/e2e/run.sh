@@ -26,7 +26,8 @@
 #
 # The groups split the scenarios into sets of about equal length that
 # share no state, so CI runs each set on its own cluster in parallel.
-# Without arguments, every group runs in order on one cluster.
+# Without arguments, the six non-destructive groups run in order on one
+# cluster. Run lifecycle on a fresh cluster: it removes the installation.
 # SKIP_IMAGE_BUILD=1 makes setup load images that are already built.
 # E2E_INSTALL_BUNDLE=1 installs the generated release bundle with local image
 # tags, so the E2E checks exercise the artifact users apply.
@@ -452,6 +453,76 @@ scenario_pvc() {
 	pass "cold restore into a new PVC returned the latest data"
 	kubectl -n "$NS" delete pod pvc-3 --wait=true >/dev/null
 	kubectl -n "$NS" delete pvc pvc-b >/dev/null
+}
+
+release_job_exit_code() {
+	kubectl -n wsnap-system get pods -l "batch.kubernetes.io/job-name=$1" \
+		-o jsonpath='{.items[0].status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null
+}
+
+release_job_exited() { [[ -n $(release_job_exit_code "$1") ]]; }
+
+run_release_job() { # name
+	kubectl -n wsnap-system delete job "$1" --ignore-not-found --wait=true >/dev/null
+	kubectl apply -f - >/dev/null <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata: {name: $1, namespace: wsnap-system}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: wsnap-controller
+      containers:
+      - name: release
+        image: wsnap-controller:dev
+        imagePullPolicy: IfNotPresent
+        args: [--release-volumes]
+EOF
+	wait_for 120 "release job $1 exited" release_job_exited "$1"
+	release_job_exit_code "$1"
+}
+
+scenario_uninstall() {
+	log "uninstall: refuse unprotected data, then release a snapshotted PV and remove the bundle"
+	local pv code protected pod_uid
+	apply_pvc uninstall-pvc >/dev/null
+	apply_pod uninstall-pod ws-uninstall kopia-s3 pvc:uninstall-pvc yes >/dev/null
+	wait_for 180 "uninstall-pod ready" pod_ready uninstall-pod
+	write_file uninstall-pod /workspace/last-write protected
+	pv=$(pv_of uninstall-pvc)
+	pod_uid=$(kubectl -n "$NS" get pod uninstall-pod -o jsonpath='{.metadata.uid}')
+	wait_for 60 "PV protected" pv_policy_is "$pv" Retain
+	protected=$(kubectl get pv -l wsnap.dev/protected=true -o name)
+	[[ $protected == "persistentvolume/$pv" ]] ||
+		die "uninstall E2E requires an isolated cluster with only $pv protected (found: $protected)"
+
+	code=$(run_release_job release-unsafe)
+	[[ $code == 2 ]] || die "release job exited $code while unsnapshotted data was in use"
+	kubectl -n wsnap-system logs job/release-unsafe | grep -q "SKIPPED $pv:" ||
+		die "release job did not explain why $pv was skipped"
+	pv_policy_is "$pv" Retain || die "unsafe uninstall changed $pv reclaim policy"
+	pass "uninstall refused a PV with unsnapshotted writes"
+
+	kubectl -n "$NS" delete pod uninstall-pod --wait=true >/dev/null
+	[[ $(ws_field ws-uninstall .status.lastSnapshot.final) == true ]] ||
+		die "uninstall-pod did not take a final snapshot"
+	wait_for 60 "PV final snapshot marker" pv_annotation_is "$pv" final-pod-uid "$pod_uid"
+	code=$(run_release_job release-safe)
+	[[ $code == 0 ]] || die "release job exited $code after the final snapshot"
+	pv_policy_is "$pv" Delete || die "uninstall did not restore $pv original reclaim policy"
+	kubectl -n "$NS" delete pvc uninstall-pvc --wait=true >/dev/null
+	wait_for 120 "released PV $pv reclaimed" pv_gone "$pv"
+	pass "snapshotted PV restored to its original reclaim policy and reclaimed"
+
+	if [[ -n ${E2E_INSTALL_BUNDLE:-} ]]; then
+		kubectl delete -f "$ROOT/install.yaml" --ignore-not-found --wait=false >/dev/null
+	else
+		kubectl delete -k "$ROOT/config/default" --ignore-not-found --wait=false >/dev/null
+	fi
+	wait_for 120 "wsnap-system removed" not_found namespace wsnap-system
+	pass "wsnap installation removed without a stranded namespace"
 }
 
 scenario_workspace_identity() {
@@ -1125,6 +1196,7 @@ group() {
 	worker) echo worker ;;
 	runtimes) echo runtimes ;;
 	kata) echo kata ;;
+	lifecycle) echo uninstall ;;
 	esac
 }
 
@@ -1133,7 +1205,7 @@ group() {
 # cluster work begins; keep this compatible with macOS's Bash 3.2.
 verify_scenario_coverage() {
 	local g s fn grouped='' seen=''
-	for g in controlplane volumes failures worker runtimes kata; do
+	for g in controlplane volumes failures worker runtimes kata lifecycle; do
 		grouped="${grouped} $(group "$g")"
 	done
 	for s in $grouped; do

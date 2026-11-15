@@ -480,7 +480,8 @@ the upgrade is gone.
    The command restores each PV's original reclaim policy. It refuses PVs
    whose data is in no snapshot and exits with code 2. Add `--force` to
    release them anyway.
-3. `kubectl delete -k config/default`.
+3. Delete the installation with `kubectl delete -f install.yaml` for a release,
+   or `kubectl delete -k config/default` for a source install.
 
 Repository data stays in object storage. Delete it by prefix (or
 container) when you no longer need it.
