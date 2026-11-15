@@ -28,6 +28,8 @@
 # share no state, so CI runs each set on its own cluster in parallel.
 # Without arguments, every group runs in order on one cluster.
 # SKIP_IMAGE_BUILD=1 makes setup load images that are already built.
+# E2E_INSTALL_BUNDLE=1 installs the generated release bundle with local image
+# tags, so the E2E checks exercise the artifact users apply.
 set -euo pipefail
 
 ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
@@ -273,9 +275,18 @@ setup() {
 		docker build -q --target controller -t wsnap-controller:dev "$ROOT" >/dev/null
 		docker build -q --target agent -t wsnap-agent:dev "$ROOT" >/dev/null
 	fi
+	if [[ -n ${E2E_INSTALL_BUNDLE:-} ]]; then
+		for target in controller agent; do
+			docker tag "wsnap-$target:dev" "wsnap-$target:e2e"
+		done
+	fi
 	# Only locally built images need loading; the node pulls public ones.
 	# (kind cannot import multi-arch images that are only partly present.)
-	for img in wsnap-controller:dev wsnap-agent:dev; do
+	local images=(wsnap-controller:dev wsnap-agent:dev)
+	if [[ -n ${E2E_INSTALL_BUNDLE:-} ]]; then
+		images+=(wsnap-controller:e2e wsnap-agent:e2e)
+	fi
+	for img in "${images[@]}"; do
 		kind load docker-image --name "$CLUSTER" "$img" >/dev/null
 	done
 	log "install agent-sandbox, MinIO and wsnap"
@@ -288,7 +299,13 @@ setup() {
 	kubectl -n wsnap-system delete deploy wsnap-controller --ignore-not-found --wait=true >/dev/null
 	# Least privilege: the controller reads Secrets only where a namespace
 	# binds wsnap-secret-reader.
-	kubectl apply -k "$ROOT/config/default" >/dev/null
+	if [[ -n ${E2E_INSTALL_BUNDLE:-} ]]; then
+		make -C "$ROOT" install-manifest \
+			CONTROLLER_IMAGE=wsnap-controller:e2e AGENT_IMAGE=wsnap-agent:e2e >/dev/null
+		kubectl apply -f "$ROOT/install.yaml" >/dev/null
+	else
+		kubectl apply -k "$ROOT/config/default" >/dev/null
+	fi
 	kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 	[[ $(kubectl auth can-i get secrets -n "$NS" --as=system:serviceaccount:wsnap-system:wsnap-controller) == no ]] ||
 		die "the default install grants repository Secret access before a namespace binding"
