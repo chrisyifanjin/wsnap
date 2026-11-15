@@ -423,11 +423,8 @@ PVC identity and provisioning checks:
   the policy to become active, then checks that a reviewed 1Gi claim is
   admitted while an unreviewed class, a 20Gi claim above the 10Gi limit,
   and a claim above the namespace's 100Gi quota are rejected. The volumes
-  CI group runs this on Kubernetes 1.30 and 1.37.
-- The sample `LimitRange`, `ResourceQuota`, and StorageClass admission
-  policy were applied to an isolated Kubernetes 1.37 namespace. A claim
-  using the reviewed class was admitted; an unreviewed class and a 20Gi
-  claim above the 10Gi limit were rejected.
+  CI group runs this on Kubernetes 1.30 and 1.37. The e2e harness checks
+  that every defined scenario belongs to exactly one group before setup.
 - The API server rejects changes to `Workspace.spec.repositoryName` while
   allowing unrelated Workspace updates (`scenario_workspace_identity`).
   To use another `SnapshotRepository`, create a new Workspace and migrate
