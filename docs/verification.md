@@ -18,6 +18,11 @@ tests found.
 | Mutation checks | a script that removes one guard at a time | Each test fails when the guard it covers is removed. |
 | End to end | `test/e2e/run.sh` | The whole system on kind, with agent-sandbox, MinIO, and failures injected. |
 
+The Kubernetes 1.37 `controlplane` CI group installs the generated
+`install.yaml` with locally built image tags. It tests the same resource bundle
+attached to a release, including controller startup and webhook injection.
+Other groups install `config/default` directly.
+
 The release workflow checks that a tag points to a commit on `main` with a
 successful push CI run for that exact commit before it pushes images. It runs
 this check and unit tests with read-only permissions; a separate job obtains
