@@ -48,7 +48,10 @@ func ReleaseProtectedVolumes(ctx context.Context, c client.Client, force bool) (
 		if original == "" {
 			original = corev1.PersistentVolumeReclaimDelete
 		}
-		patch := client.MergeFrom(pv.DeepCopy())
+		// A writer can start after List. Refuse to remove protection if it
+		// changes the PV's writer/final markers before this patch reaches the
+		// API server; the operator can stop it and rerun the command.
+		patch := client.MergeFromWithOptions(pv.DeepCopy(), client.MergeFromWithOptimisticLock{})
 		delete(pv.Labels, wsnapv1.LabelProtected)
 		pv.Spec.PersistentVolumeReclaimPolicy = original
 		if err := c.Patch(ctx, pv, patch); err != nil {

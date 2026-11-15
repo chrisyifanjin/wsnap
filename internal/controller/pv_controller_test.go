@@ -573,6 +573,47 @@ func TestReleaseProtectedVolumes(t *testing.T) {
 	}
 }
 
+// newWriterBeforeRelease simulates a Pod taking ownership after the
+// uninstall command listed a PV but before its reclaim-policy patch.
+type newWriterBeforeRelease struct {
+	client.Client
+	changed bool
+}
+
+func (c *newWriterBeforeRelease) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if !c.changed {
+		c.changed = true
+		var latest corev1.PersistentVolume
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(obj), &latest); err != nil {
+			return err
+		}
+		latest.Annotations[workspace.AnnotationWriterPod] = "new-writer"
+		if err := c.Client.Update(ctx, &latest); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestReleaseProtectedVolumesRefusesConcurrentWriter(t *testing.T) {
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "old-writer", workspace.AnnotationFinalPod: "old-writer"})
+	_, backing := newPVReconciler(t, pv)
+	c := &newWriterBeforeRelease{Client: backing}
+	if res, err := ReleaseProtectedVolumes(context.Background(), c, false); err == nil {
+		t.Fatalf("concurrent writer was not detected: %+v", res)
+	}
+	var got corev1.PersistentVolume
+	if err := backing.Get(context.Background(), client.ObjectKey{Name: pv.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain ||
+		got.Labels[wsnapv1.LabelProtected] != "true" ||
+		got.Annotations[workspace.AnnotationWriterPod] != "new-writer" {
+		t.Fatalf("concurrent writer lost PV protection: policy %s, labels %v, writer %q",
+			got.Spec.PersistentVolumeReclaimPolicy, got.Labels, got.Annotations[workspace.AnnotationWriterPod])
+	}
+}
+
 func TestJobsTrustTheBrokerCA(t *testing.T) {
 	jc := JobConfig{AgentImage: "a", BrokerURL: "https://b", Audience: "wsnap", CAConfigMap: "wsnap-ca"}
 	job := jc.newAgentJob("mover", "j", testWorkspace(), &wsnapv1.SnapshotRepository{}, []string{"mover"}, nil, nil)
