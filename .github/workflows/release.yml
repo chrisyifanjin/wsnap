@@ -7,6 +7,7 @@ on:
     tags: ['v*']
 
 permissions:
+  actions: read
   contents: write
   packages: write
 
@@ -19,6 +20,12 @@ jobs:
       VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify the tag commit passed CI on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash hack/verify-release-source.sh
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
