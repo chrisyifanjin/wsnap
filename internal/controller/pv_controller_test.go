@@ -276,6 +276,41 @@ func TestRescueRefusesPreexistingSameNameClaim(t *testing.T) {
 	}
 }
 
+func TestStartRescueDoesNotAllocateClaimFromStalePV(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*corev1.PersistentVolume)
+	}{
+		{"rescue already done", func(pv *corev1.PersistentVolume) {
+			pv.Annotations[wsnapv1.AnnotationRescue] = wsnapv1.RescueDone
+		}},
+		{"PV replaced", func(pv *corev1.PersistentVolume) { pv.UID = "replacement-uid" }},
+		{"PV rebound", func(pv *corev1.PersistentVolume) {
+			pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: testNS, Name: "other-claim", UID: "other-uid"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			ws := testWorkspace()
+			r, c := newPVReconciler(t, ws, releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
+			stale := getPV(t, c)
+			current := getPV(t, c)
+			tc.change(current)
+			if err := c.Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.startRescue(ctx, stale, ws); err == nil {
+				t.Fatal("started rescue from a stale PV")
+			}
+			var claim corev1.PersistentVolumeClaim
+			key := types.NamespacedName{Namespace: testNS, Name: rescueClaimName(stale.Name)}
+			if err := c.Get(ctx, key, &claim); !apierrors.IsNotFound(err) {
+				t.Fatalf("stale PV allocated rescue claim %s: %v", key, err)
+			}
+		})
+	}
+}
+
 func TestCompletedRescueKeepsReplacementClaim(t *testing.T) {
 	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{workspace.AnnotationWriterPod: "u2"}))
 	reconcilePV(t, r)

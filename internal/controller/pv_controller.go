@@ -136,6 +136,17 @@ func (r *PVReconciler) deleteRescueClaim(ctx context.Context, pv *corev1.Persist
 }
 
 func (r *PVReconciler) startRescue(ctx context.Context, pv *corev1.PersistentVolume, ws *wsnapv1.Workspace) error {
+	// The reconcile cache can lag a completed rescue, a PV replacement, or a
+	// new binding. Check the live PV before allocating a rescue claim, since
+	// a later pre-bind failure would leave that claim behind.
+	var current corev1.PersistentVolume
+	if err := r.Reader.Get(ctx, types.NamespacedName{Name: pv.Name}, &current); err != nil {
+		return fmt.Errorf("read volume before rescue: %w", err)
+	}
+	if current.UID != pv.UID || current.ResourceVersion != pv.ResourceVersion {
+		return fmt.Errorf("volume %s changed before rescue claim allocation", pv.Name)
+	}
+
 	var repo wsnapv1.SnapshotRepository
 	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: ws.Namespace, Name: ws.Spec.RepositoryName}, &repo); err != nil {
 		return fmt.Errorf("snapshot repository: %w", err)
