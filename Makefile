@@ -19,19 +19,24 @@ generate:
 
 VERSION ?= dev
 REGISTRY ?= ghcr.io/chrisyifanjin
+CONTROLLER_IMAGE ?= $(REGISTRY)/wsnap-controller:$(VERSION)
+AGENT_IMAGE ?= $(REGISTRY)/wsnap-agent:$(VERSION)
 
 images:
 	docker build --target controller --build-arg VERSION=$(VERSION) -t wsnap-controller:dev .
 	docker build --target agent --build-arg VERSION=$(VERSION) -t wsnap-agent:dev .
 
-# install.yaml: CRDs, RBAC and the controller with released image tags.
-# The agent image is a controller argument, so it is rewritten too; the
-# grep fails the build if either rewrite did not happen.
+# install.yaml: CRDs, RBAC and the controller with explicit image references.
+# Release builds pass immutable digests; the default version tags are useful
+# for local rendering. The agent image is a controller argument, so rewrite it
+# as well and fail if either source reference remains.
 install-manifest:
 	kubectl kustomize config/default | \
-	  sed -e 's#image: wsnap-controller:dev#image: $(REGISTRY)/wsnap-controller:$(VERSION)#' \
-	      -e 's#--agent-image=wsnap-agent:dev#--agent-image=$(REGISTRY)/wsnap-agent:$(VERSION)#' > install.yaml
-	test "$$(grep -c '$(REGISTRY)/wsnap-.*:$(VERSION)' install.yaml)" -eq 2
+	  sed -e 's#image: wsnap-controller:dev#image: $(CONTROLLER_IMAGE)#' \
+	      -e 's#--agent-image=wsnap-agent:dev#--agent-image=$(AGENT_IMAGE)#' > install.yaml
+	test "$$(grep -F -c -- 'image: $(CONTROLLER_IMAGE)' install.yaml)" -eq 1
+	test "$$(grep -F -c -- '--agent-image=$(AGENT_IMAGE)' install.yaml)" -eq 1
+	! grep -E 'wsnap-(controller|agent):dev' install.yaml
 
 # Needs a kind cluster named wsnap; see docs/verification.md.
 e2e:
