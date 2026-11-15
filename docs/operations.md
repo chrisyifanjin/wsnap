@@ -32,7 +32,7 @@ If you already have a cluster, build and push both images to a registry
 that its nodes can pull from. Change the controller image and its
 `--agent-image` argument in `config/manager/manager.yaml` before applying
 `config/default`. For a released version, use the `install.yaml` attached
-to the release instead; it pins both image tags.
+to the release instead; it pins both images by digest.
 
 The sample volume needs a StorageClass. Check yours with
 `kubectl get storageclass` before creating a Pod.
