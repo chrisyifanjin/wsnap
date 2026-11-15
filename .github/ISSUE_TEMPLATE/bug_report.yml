@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible wsnap failure or data safety concern.
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        For a security vulnerability, use the private reporting path in
+        SECURITY.md instead of a public issue. Remove credentials and Secret
+        values from any logs you attach.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest workload and commands that reproduce it.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        Include wsnap version or commit, Kubernetes version, CSI driver and
+        StorageClass, volume kind, execution mode, engine, backend, and
+        credential provider where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Conditions, events, and logs that show the failure.
+    validations:
+      required: false

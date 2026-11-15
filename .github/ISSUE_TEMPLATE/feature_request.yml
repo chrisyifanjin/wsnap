@@ -1,0 +1,24 @@
+name: Feature request
+description: Describe a workspace recovery or operations use case.
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What workload or failure mode should wsnap support?
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Desired behavior
+      description: Describe the observable result and any compatibility needs.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Recovery and security considerations
+      description: What could this change affect about data loss, access, or PVC ownership?
+    validations:
+      required: false
