@@ -1,14 +1,6 @@
-# The default install, except that the controller may read Secrets only in
-# wsnap-system and in namespaces that bind wsnap-secret-reader
-# (config/samples/secret-access.yaml).
+# Compatibility path for installations that already use this overlay.
+# The default installation now has the same namespace-scoped Secret access.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - ../default
-patches:
-- patch: |-
-    $patch: delete
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: ClusterRoleBinding
-    metadata:
-      name: wsnap-secret-reader

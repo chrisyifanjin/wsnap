@@ -90,6 +90,7 @@ kubectl create namespace agents
 kubectl -n agents create secret generic wsnap-creds \
   --from-literal=WSNAP_MASTER_KEY="$(openssl rand -hex 32)" \
   --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...
+kubectl -n agents apply -f config/samples/secret-access.yaml
 # First edit the sample's bucket, region and role ARN for your S3 account.
 kubectl -n agents apply -f config/samples/repository-s3-sts.yaml
 kubectl -n agents get snaprepo default
