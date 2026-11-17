@@ -8,14 +8,14 @@ set -euo pipefail
 : "${GITHUB_RUN_ATTEMPT:?}"
 : "${EXPECTED_E2E_LEGS:?}"
 [[ $EXPECTED_E2E_LEGS =~ ^[1-9][0-9]*$ ]]
-expected=$((EXPECTED_E2E_LEGS + 1)) # the Go job plus every E2E leg
+expected=$((EXPECTED_E2E_LEGS + 2)) # Go, multiarch, and every E2E leg
 endpoint="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100"
 
 # The API can lag job completion briefly. Fail closed if the expected jobs do
 # not all appear as completed within one minute.
 jobs='[]'
 for _ in {1..12}; do
-	jobs=$(gh api -X GET "$endpoint" --jq '[.jobs[] | select(.name == "go" or (.name | startswith("e2e ("))) | {name, status, conclusion}]')
+	jobs=$(gh api -X GET "$endpoint" --jq '[.jobs[] | select(.name == "go" or .name == "multiarch" or (.name | startswith("e2e ("))) | {name, status, conclusion}]')
 	if jq -e --argjson expected "$expected" \
 		'length == $expected and all(.[]; .status == "completed")' <<<"$jobs" >/dev/null; then
 		break
@@ -25,8 +25,8 @@ done
 
 if ! jq -e --argjson expected "$expected" \
 	'length == $expected and all(.[]; .conclusion == "success")' <<<"$jobs" >/dev/null; then
-	echo "CI requires Go and all $EXPECTED_E2E_LEGS Kubernetes E2E legs to succeed:" >&2
+	echo "CI requires Go, multiarch, and all $EXPECTED_E2E_LEGS Kubernetes E2E legs to succeed:" >&2
 	jq -r '.[] | "\(.name): \(.status)/\(.conclusion)"' <<<"$jobs" >&2
 	exit 1
 fi
-echo "Go and all $EXPECTED_E2E_LEGS Kubernetes E2E legs succeeded"
+echo "Go, multiarch, and all $EXPECTED_E2E_LEGS Kubernetes E2E legs succeeded"
