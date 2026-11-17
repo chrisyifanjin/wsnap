@@ -136,3 +136,30 @@ jobs:
           name: kind-logs-${{ matrix.group }}-k8s-${{ matrix.k8s }}
           path: ${{ runner.temp }}/kind-logs
           retention-days: 7
+
+  # Keep one stable status check as the matrix grows. Branch protection
+  # requires this job, so a failing or cancelled matrix leg blocks a merge.
+  required:
+    if: ${{ always() }}
+    needs: [go, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Require Go and every Kubernetes E2E leg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GO_RESULT: ${{ needs.go.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+          EXPECTED_E2E_LEGS: "9" # Update when the matrix changes.
+        run: |
+          if [[ $GO_RESULT != success || $E2E_RESULT != success ]]; then
+            echo "Go: $GO_RESULT; Kubernetes E2E: $E2E_RESULT" >&2
+            exit 1
+          fi
+          bash hack/verify-ci-jobs.sh
