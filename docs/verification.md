@@ -29,6 +29,9 @@ successful push CI run for that exact commit before it pushes images. It runs
 this check and unit tests with read-only permissions; a separate job obtains
 publish permissions only after verification passes. A green pull-request run
 does not satisfy this gate; wait for the final `main` run after merging.
+Tags with a pre-release suffix are published as GitHub pre-releases and are
+not marked Latest. Version-specific notes in `.github/release-notes/` take
+precedence over generated notes.
 The CI `multiarch` job builds both release images for linux/amd64 and
 linux/arm64, then verifies the OCI indexes and Buildx digests. The `required`
 job checks it, Go, and every Kubernetes E2E job in the current workflow
