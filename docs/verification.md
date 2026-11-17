@@ -29,10 +29,12 @@ successful push CI run for that exact commit before it pushes images. It runs
 this check and unit tests with read-only permissions; a separate job obtains
 publish permissions only after verification passes. A green pull-request run
 does not satisfy this gate; wait for the final `main` run after merging.
-The CI `required` job checks every Go and Kubernetes E2E job in the current
-workflow attempt through GitHub's jobs API. It rejects failed, skipped,
-cancelled, and missing matrix legs. Branch protection uses this single,
-stable check name as the matrix grows.
+The CI `multiarch` job builds both release images for linux/amd64 and
+linux/arm64, then verifies the OCI indexes and Buildx digests. The `required`
+job checks it, Go, and every Kubernetes E2E job in the current workflow
+attempt through GitHub's jobs API. It rejects failed, skipped, cancelled,
+and missing jobs. Branch protection uses this single, stable check name as
+the matrix grows.
 
 ## How to run the store tests
 

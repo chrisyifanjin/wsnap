@@ -137,11 +137,28 @@ jobs:
           path: ${{ runner.temp }}/kind-logs
           retention-days: 7
 
+  multiarch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build both release images for amd64 and arm64
+        run: |
+          for target in controller agent; do
+            archive="$RUNNER_TEMP/wsnap-$target.oci"
+            metadata="$RUNNER_TEMP/wsnap-$target.json"
+            docker buildx build --platform linux/amd64,linux/arm64 --target "$target" \
+              --build-arg VERSION=v0.0.0-ci --provenance=true --sbom=true \
+              --metadata-file "$metadata" --output "type=oci,dest=$archive" .
+            bash hack/verify-oci-index.sh "$archive" "$metadata"
+          done
+
   # Keep one stable status check as the matrix grows. Branch protection
-  # requires this job, so a failing or cancelled matrix leg blocks a merge.
+  # requires this job, so a failing or cancelled build blocks a merge.
   required:
     if: ${{ always() }}
-    needs: [go, e2e]
+    needs: [go, e2e, multiarch]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -151,15 +168,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Require Go and every Kubernetes E2E leg
+      - name: Require Go, multi-arch images, and every Kubernetes E2E leg
         env:
           GH_TOKEN: ${{ github.token }}
           GO_RESULT: ${{ needs.go.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
+          MULTIARCH_RESULT: ${{ needs.multiarch.result }}
           EXPECTED_E2E_LEGS: "9" # Update when the matrix changes.
         run: |
-          if [[ $GO_RESULT != success || $E2E_RESULT != success ]]; then
-            echo "Go: $GO_RESULT; Kubernetes E2E: $E2E_RESULT" >&2
+          if [[ $GO_RESULT != success || $E2E_RESULT != success || $MULTIARCH_RESULT != success ]]; then
+            echo "Go: $GO_RESULT; Kubernetes E2E: $E2E_RESULT; multi-arch: $MULTIARCH_RESULT" >&2
             exit 1
           fi
           bash hack/verify-ci-jobs.sh
