@@ -216,7 +216,11 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 	if owner := pv.Annotations[wsnapv1.AnnotationWorkspaceRef]; owner != "" && owner != wsRef {
 		return fmt.Errorf("%w: volume %s belongs to workspace %s", ErrBadVolume, pv.Name, owner)
 	}
-	if pv.Labels[wsnapv1.LabelProtected] == "true" && pv.Annotations[wsnapv1.AnnotationWorkspaceRef] == wsRef {
+	// Another controller or operator may have changed the policy after the
+	// previous protection. A label alone does not keep a deleted claim's
+	// volume from being reclaimed.
+	if pv.Labels[wsnapv1.LabelProtected] == "true" && pv.Annotations[wsnapv1.AnnotationWorkspaceRef] == wsRef &&
+		pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimRetain {
 		return nil
 	}
 	patch := client.MergeFromWithOptions(pv.DeepCopy(), client.MergeFromWithOptimisticLock{})

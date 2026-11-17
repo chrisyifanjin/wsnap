@@ -74,6 +74,44 @@ func TestResolveVolumeRequiresClaimAndPVIdentity(t *testing.T) {
 	}
 }
 
+func TestProtectRestoresRetainIfPolicyChanged(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "data", UID: "claim-1"},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-1", UID: "volume-1"},
+		Spec: corev1.PersistentVolumeSpec{ClaimRef: &corev1.ObjectReference{Namespace: "team-a", Name: "data", UID: "claim-1"},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(claim, pv).Build()
+	id := Identity{Namespace: "team-a", Name: "work"}
+	ref := wsnapv1.VolumeRef{Kind: KindPVC, ClaimName: claim.Name, ClaimUID: string(claim.UID), VolumeName: pv.Name, VolumeUID: string(pv.UID)}
+	if err := Protect(ctx, c, c, id, ref); err != nil {
+		t.Fatal(err)
+	}
+	var current corev1.PersistentVolume
+	if err := c.Get(ctx, client.ObjectKey{Name: pv.Name}, &current); err != nil {
+		t.Fatal(err)
+	}
+	current.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+	if err := c.Update(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := Protect(ctx, c, c, id, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Name: pv.Name}, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain ||
+		current.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy] != string(corev1.PersistentVolumeReclaimDelete) {
+		t.Fatalf("protected PV has reclaim policy %s and original policy %q; want Retain and Delete",
+			current.Spec.PersistentVolumeReclaimPolicy, current.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy])
+	}
+}
+
 func TestResolveVolumeRejectsBlockModeBeforeProtection(t *testing.T) {
 	ctx := context.Background()
 	block := corev1.PersistentVolumeBlock
