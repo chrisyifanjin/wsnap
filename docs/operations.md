@@ -65,6 +65,9 @@ wsnap does not create its primary PVC. Its temporary rescue PVC pins
 `volumeName` to the already released PV and uses that PV's class, access
 modes, volume mode, and capacity. A rescue needs room in the namespace quota
 for one extra PVC and its requested capacity until it finishes.
+Restrict who can change PV reclaim policies. wsnap reapplies `Retain` when it
+observes an external change on a protected PV, but a claim deleted before
+that reconcile can still lose unsnapshotted data.
 
 An administrator can apply the example policy after adapting its namespace,
 class, and limits:
