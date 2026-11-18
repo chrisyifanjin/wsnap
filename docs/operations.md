@@ -465,6 +465,7 @@ the upgrade is gone.
 | Pod refused at creation | The webhook explains why in the error message. |
 | `Ready=False` on a repository | Read the condition message. |
 | PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed, ran out of time (2 h), or could not check the volume. Read the mover Pod's log, fix the cause, then remove the annotation to retry. |
+| Protected PV reports an invalid workspace reference | The controller keeps its data and `Retain` policy. Check `wsnap.dev/workspace-ref` against the intended namespace and Workspace before correcting the annotation; a malformed reference is not evidence that the Workspace was deleted. |
 | PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | Set only by versions before writer epochs. Remove the annotation; the PV is then rescued, and its data is kept without replacing newer history. |
 | The broker logs "snapshot of an older writer epoch kept, but not as the newest" | A rescue saved an older writer's volume after a newer writer's snapshot. The data is in the repository under the logged snapshot ID; restore it with a `WorkspaceRestore` if you need it. |
 | A writer on a lost node blocks a new Pod | The block ends 2 minutes after the old Pod's deletion deadline. |

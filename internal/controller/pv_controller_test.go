@@ -130,6 +130,40 @@ func TestProtectedBoundVolumeRestoresRetainPolicy(t *testing.T) {
 	}
 }
 
+func TestMalformedWorkspaceRefKeepsReleasedPV(t *testing.T) {
+	for _, ref := range []string{"", "team-a", "/", "team-a/", "/ws1", "team-a/ws1/other", "team-a/Invalid"} {
+		t.Run(ref, func(t *testing.T) {
+			pv := releasedPV(map[string]string{wsnapv1.AnnotationWorkspaceRef: ref})
+			r, c := newPVReconciler(t, pv)
+			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: pv.Name}})
+			if err == nil {
+				t.Fatal("malformed workspace reference should fail instead of reclaiming a PV")
+			}
+			got := getPV(t, c)
+			if got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain ||
+				got.Labels[wsnapv1.LabelProtected] != "true" {
+				t.Fatalf("malformed workspace reference %q lost volume protection: %+v", ref, got)
+			}
+		})
+	}
+}
+
+func TestMalformedWorkspaceRefStillRestoresRetain(t *testing.T) {
+	pv := releasedPV(map[string]string{wsnapv1.AnnotationWorkspaceRef: "/"})
+	pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+	r, c := newPVReconciler(t, pv)
+	reconcilePV(t, r)
+	got := getPV(t, c)
+	if got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain ||
+		got.Labels[wsnapv1.LabelProtected] != "true" {
+		t.Fatalf("malformed reference left volume unprotected: %+v", got)
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: pv.Name}})
+	if err == nil {
+		t.Fatal("malformed reference should still prevent reclaim after Retain is restored")
+	}
+}
+
 func TestReleasedWithFinalSnapshotIsReclaimed(t *testing.T) {
 	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{
 		workspace.AnnotationWriterPod: "u1", workspace.AnnotationFinalPod: "u1",
