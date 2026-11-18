@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,10 +49,6 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	if pv.Labels[wsnapv1.LabelProtected] != "true" || pv.DeletionTimestamp != nil {
 		return ctrl.Result{}, nil
 	}
-	ns, name, ok := strings.Cut(pv.Annotations[wsnapv1.AnnotationWorkspaceRef], "/")
-	if !ok {
-		return ctrl.Result{}, nil
-	}
 	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
 		// A policy change while a writer is running can delete the only
 		// copy of its latest data when the claim goes away. Recheck the PV
@@ -71,6 +68,13 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	workspaceRef := pv.Annotations[wsnapv1.AnnotationWorkspaceRef]
+	ns, name, ok := strings.Cut(workspaceRef, "/")
+	if !ok || len(validation.IsDNS1123Label(ns)) > 0 || len(validation.IsDNS1123Label(name)) > 0 {
+		// A malformed reference must not be treated as a deleted Workspace:
+		// that would reclaim a Released PV whose data may not be saved.
+		return ctrl.Result{}, fmt.Errorf("protected volume %s has invalid workspace reference %q; keeping it", pv.Name, workspaceRef)
 	}
 	phase := pv.Annotations[wsnapv1.AnnotationRescue]
 	// wsnapv1.RescueSkippedNewerWriter is only set by earlier versions.
