@@ -423,6 +423,9 @@ scenario_pvc() {
 		die "Workspace did not record the bound PVC and PV UIDs"
 	[[ $(kubectl get pv "$pv" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}') == Retain ]] || die "PV $pv not protected"
 	pass "PV $pv switched to Retain; Workspace recorded its PVC and PV UIDs"
+	kubectl patch pv "$pv" --type=merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' >/dev/null
+	wait_for 60 "PV $pv Retain policy restored" pv_policy_is "$pv" Retain
+	pass "PV $pv policy changed during a live writer; controller restored Retain"
 
 	kubectl -n "$NS" delete pod pvc-1 --wait=true >/dev/null
 	[[ $(ws_field ws-pvc .status.lastSnapshot.final) == true ]] || die "no final snapshot after graceful delete"

@@ -52,6 +52,26 @@ func (r *PVReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	if !ok {
 		return ctrl.Result{}, nil
 	}
+	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		// A policy change while a writer is running can delete the only
+		// copy of its latest data when the claim goes away. Recheck the PV
+		// live and restore Retain before processing any rescue or reclaim.
+		var current corev1.PersistentVolume
+		if err := r.Reader.Get(ctx, types.NamespacedName{Name: pv.Name}, &current); err != nil {
+			return ctrl.Result{}, err
+		}
+		if current.UID != pv.UID || current.ResourceVersion != pv.ResourceVersion ||
+			current.Labels[wsnapv1.LabelProtected] != "true" ||
+			current.Annotations[wsnapv1.AnnotationWorkspaceRef] != pv.Annotations[wsnapv1.AnnotationWorkspaceRef] {
+			return ctrl.Result{}, fmt.Errorf("volume %s changed before restoring Retain policy", pv.Name)
+		}
+		patch := client.MergeFromWithOptions(current.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		current.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimRetain
+		if err := r.Patch(ctx, &current, patch); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
 	phase := pv.Annotations[wsnapv1.AnnotationRescue]
 	// wsnapv1.RescueSkippedNewerWriter is only set by earlier versions.
 	if phase == wsnapv1.RescueFailed || phase == wsnapv1.RescueSkippedNewerWriter {

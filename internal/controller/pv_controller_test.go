@@ -115,6 +115,21 @@ func getPV(t *testing.T, c client.Client) *corev1.PersistentVolume {
 	return &pv
 }
 
+func TestProtectedBoundVolumeRestoresRetainPolicy(t *testing.T) {
+	pv := releasedPV(nil)
+	pv.Status.Phase = corev1.VolumeBound
+	pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+	r, c := newPVReconciler(t, testWorkspace(), pv)
+	reconcilePV(t, r)
+	got := getPV(t, c)
+	if got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain ||
+		got.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy] != "Delete" ||
+		got.Labels[wsnapv1.LabelProtected] != "true" {
+		t.Fatalf("protected bound PV lost Retain policy: policy=%s, original=%q, protected=%q",
+			got.Spec.PersistentVolumeReclaimPolicy, got.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy], got.Labels[wsnapv1.LabelProtected])
+	}
+}
+
 func TestReleasedWithFinalSnapshotIsReclaimed(t *testing.T) {
 	r, c := newPVReconciler(t, testWorkspace(), releasedPV(map[string]string{
 		workspace.AnnotationWriterPod: "u1", workspace.AnnotationFinalPod: "u1",
@@ -194,6 +209,23 @@ func TestReclaimRejectsRebindBetweenLiveReadAndPatch(t *testing.T) {
 		got.Labels[wsnapv1.LabelProtected] != "true" ||
 		got.Annotations[wsnapv1.AnnotationWorkspaceRef] != testNS+"/another-workspace" {
 		t.Fatalf("concurrently rebound volume lost its protection: %+v", got)
+	}
+}
+
+func TestRestoreRetainRejectsRebindBeforePatch(t *testing.T) {
+	pv := releasedPV(nil)
+	pv.Status.Phase = corev1.VolumeBound
+	pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+	r, c := newPVReconciler(t, testWorkspace(), pv)
+	r.Client = rebindBeforePatchClient{r.Client}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: pv.Name}})
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("restore Retain after a concurrent rebind: %v, want conflict", err)
+	}
+	got := getPV(t, c)
+	if got.Annotations[wsnapv1.AnnotationWorkspaceRef] != testNS+"/another-workspace" ||
+		got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimDelete {
+		t.Fatalf("rebound PV was changed by stale protection: %+v", got)
 	}
 }
 
