@@ -222,14 +222,11 @@ func (s *Server) trackVolume(ctx context.Context, c *caller, consumeRestoreFrom 
 	}); err != nil {
 		return err
 	}
-	if err := workspace.Protect(ctx, s.Client, s.Reader, c.id, ref); err != nil {
-		return fmt.Errorf("protect volume: %w", err)
-	}
-	if err := workspace.MarkPVAll(ctx, s.Client, s.Reader, ref.VolumeName, map[string]string{
+	if err := workspace.ProtectAndMark(ctx, s.Client, s.Reader, c.id, ref, map[string]string{
 		workspace.AnnotationWriterPod:   string(c.pod.UID),
 		workspace.AnnotationWriterEpoch: strconv.FormatInt(epoch, 10),
 	}); err != nil {
-		return fmt.Errorf("mark volume writer: %w", err)
+		return fmt.Errorf("protect and mark volume writer: %w", err)
 	}
 	return nil
 }
