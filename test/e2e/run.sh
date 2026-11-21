@@ -1384,7 +1384,8 @@ EOF
 
 # in_gvisor checks, from inside a Pod's container, that its kernel is the
 # gVisor Sentry, so a test cannot pass on runc by accident.
-in_gvisor() { kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>/dev/null | grep -q gVisor; }
+# Read all of dmesg: grep -q exits early and can SIGPIPE kubectl under pipefail.
+in_gvisor() { kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>/dev/null | grep -F gVisor >/dev/null; }
 
 # in_kata checks that a Pod runs its own kernel (the Kata guest), not the
 # node's: under runc or gVisor uname -r would match the node, or say gVisor.
