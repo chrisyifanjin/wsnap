@@ -125,6 +125,19 @@ func ResolveVolume(ctx context.Context, r client.Reader, pod *corev1.Pod) (wsnap
 	return ref, nil
 }
 
+// MountsClaim reports whether a Pod uses a PVC, including the claim that
+// Kubernetes creates for a generic ephemeral volume. A Pod may name the
+// volume anything, so checking only the workspace volume name is unsafe.
+func MountsClaim(p *corev1.Pod, claim string) bool {
+	for _, v := range p.Spec.Volumes {
+		if (v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim) ||
+			(v.Ephemeral != nil && p.Name+"-"+v.Name == claim) {
+			return true
+		}
+	}
+	return false
+}
+
 // FilesystemVolumeMode accepts Kubernetes' nil default and explicit Filesystem.
 // Agent sidecars and Jobs use volumeMounts; they cannot read a raw block device.
 func FilesystemVolumeMode(mode *corev1.PersistentVolumeMode) bool {
