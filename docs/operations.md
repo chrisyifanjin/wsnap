@@ -463,7 +463,7 @@ the upgrade is gone.
 |---|---|
 | Pod stays in `PodInitializing` | The sidecar waits until the broker admits the Pod as the writer. Read `kubectl logs <pod> -c wsnap`. A `409` means another Pod still writes the workspace, a rescue runs, or a Job works on the volume; it ends by itself. |
 | Pod refused at creation | The webhook explains why in the error message. |
-| `Ready=False` on a repository | Read the condition message. |
+| `Ready=False` on a repository | Read the condition message. The controller rechecks its Secret every five minutes, so readiness updates after a Secret or access change without a restart. |
 | PV stays `Released` with `wsnap.dev/rescue=failed` | The mover failed, ran out of time (2 h), or could not check the volume. Read the mover Pod's log, fix the cause, then remove the annotation to retry. |
 | Protected PV reports an invalid workspace reference | The controller keeps its data and `Retain` policy. Check `wsnap.dev/workspace-ref` against the intended namespace and Workspace before correcting the annotation; a malformed reference is not evidence that the Workspace was deleted. |
 | PV stays `Released` with `wsnap.dev/rescue=skipped-newer-writer` | Set only by versions before writer epochs. Remove the annotation; the PV is then rescued, and its data is kept without replacing newer history. |

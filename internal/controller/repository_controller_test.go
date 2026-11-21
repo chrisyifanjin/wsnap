@@ -102,3 +102,44 @@ func TestForbiddenSecretIsReported(t *testing.T) {
 		t.Fatalf("Ready = %+v", cond)
 	}
 }
+
+func TestRepositoryReadinessRechecksSecretWithoutRepositoryChange(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = wsnapv1.AddToScheme(scheme)
+	repo := &wsnapv1.SnapshotRepository{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "repo"},
+		Spec: wsnapv1.SnapshotRepositorySpec{Engine: wsnapv1.EngineSpec{Type: "restic"},
+			Backend:     wsnapv1.BackendSpec{S3: &wsnapv1.S3Backend{Bucket: "bucket"}},
+			Credentials: wsnapv1.CredentialsSpec{SecretName: "creds"}}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(repo).WithStatusSubresource(repo).Build()
+	r := &RepositoryReconciler{Client: c, Reader: c}
+	key := types.NamespacedName{Namespace: testNS, Name: repo.Name}
+	check := func(want metav1.ConditionStatus) {
+		t.Helper()
+		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		if err != nil || res.RequeueAfter <= 0 {
+			t.Fatalf("Reconcile result = %+v, error = %v; want periodic secret recheck", res, err)
+		}
+		var got wsnapv1.SnapshotRepository
+		if err := c.Get(ctx, key, &got); err != nil {
+			t.Fatal(err)
+		}
+		ready := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+		if ready == nil || ready.Status != want {
+			t.Fatalf("Ready = %+v; want %s", ready, want)
+		}
+	}
+	check(metav1.ConditionFalse)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "creds"},
+		Data: map[string][]byte{"WSNAP_MASTER_KEY": []byte("0123456789abcdef"),
+			"AWS_ACCESS_KEY_ID": []byte("access"), "AWS_SECRET_ACCESS_KEY": []byte("secret")}}
+	if err := c.Create(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	check(metav1.ConditionTrue)
+	if err := c.Delete(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	check(metav1.ConditionFalse)
+}
