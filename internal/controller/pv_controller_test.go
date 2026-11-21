@@ -639,6 +639,46 @@ func TestReleaseProtectedVolumes(t *testing.T) {
 	}
 }
 
+func TestReleaseProtectedVolumesWaitsForPodsToStop(t *testing.T) {
+	pv := releasedPV(map[string]string{workspace.AnnotationWriterPod: "old-writer", workspace.AnnotationFinalPod: "old-writer"})
+	pv.Status.Phase = corev1.VolumeBound
+	old := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "old", UID: "old-writer"},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "old-claim"}}}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	newPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "new", UID: "new-writer"},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "old-claim"}}}}},
+		Status: corev1.PodStatus{Phase: corev1.PodPending}}
+	_, c := newPVReconciler(t, pv, old)
+	ctx := context.Background()
+	checkSkip := func(want string) {
+		t.Helper()
+		res, err := ReleaseProtectedVolumes(ctx, c, false)
+		if err != nil || !strings.Contains(res.Skipped[pv.Name], want) {
+			t.Fatalf("release = %+v, error %v; want skip for %s", res, err, want)
+		}
+		if got := getPV(t, c); got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+			t.Fatalf("active Pod's volume changed to %s", got.Spec.PersistentVolumeReclaimPolicy)
+		}
+	}
+	checkSkip("team-a/old")
+	if err := c.Delete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, newPod); err != nil {
+		t.Fatal(err)
+	}
+	checkSkip("team-a/new") // not yet recorded as the PV writer
+	if err := c.Delete(ctx, newPod); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ReleaseProtectedVolumes(ctx, c, false)
+	if err != nil || len(res.Released) != 1 || res.Released[0] != pv.Name {
+		t.Fatalf("release after Pods stopped = %+v, error %v", res, err)
+	}
+}
+
 // newWriterBeforeRelease simulates a Pod taking ownership after the
 // uninstall command listed a PV but before its reclaim-policy patch.
 type newWriterBeforeRelease struct {

@@ -3,8 +3,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	wsnapv1 "github.com/chrisyifanjin/wsnap/api/v1alpha1"
@@ -44,6 +46,16 @@ func ReleaseProtectedVolumes(ctx context.Context, c client.Client, force bool) (
 			}
 			continue
 		}
+		if !force {
+			active, err := activePodOnVolume(ctx, c, pv)
+			if err != nil {
+				return res, fmt.Errorf("check pods for volume %s: %w", pv.Name, err)
+			}
+			if active != "" {
+				res.Skipped[pv.Name] = fmt.Sprintf("pod %s may still write this volume; stop it before releasing", active)
+				continue
+			}
+		}
 		original := corev1.PersistentVolumeReclaimPolicy(a[wsnapv1.AnnotationOriginalReclaimPolicy])
 		if original == "" {
 			original = corev1.PersistentVolumeReclaimDelete
@@ -60,4 +72,37 @@ func ReleaseProtectedVolumes(ctx context.Context, c client.Client, force bool) (
 		res.Released = append(res.Released, pv.Name)
 	}
 	return res, nil
+}
+
+// A final snapshot is proof only after the writer has stopped. A Pod can
+// still mount the claim while its sidecar reports that final snapshot.
+func activePodOnVolume(ctx context.Context, c client.Client, pv *corev1.PersistentVolume) (string, error) {
+	claim := pv.Spec.ClaimRef
+	if claim == nil || claim.Namespace == "" || claim.Name == "" {
+		return "", fmt.Errorf("volume has no claim namespace and name")
+	}
+	ns, name, ok := strings.Cut(pv.Annotations[wsnapv1.AnnotationWorkspaceRef], "/")
+	if !ok || ns != claim.Namespace || len(validation.IsDNS1123Label(name)) > 0 {
+		return "", fmt.Errorf("volume's workspace reference does not match its claim namespace")
+	}
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.InNamespace(claim.Namespace)); err != nil {
+		return "", err
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if string(pod.UID) == pv.Annotations[workspace.AnnotationWriterPod] && pod.UID != "" {
+			return pod.Namespace + "/" + pod.Name, nil
+		}
+		for _, vol := range pod.Spec.Volumes {
+			if (vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == claim.Name) ||
+				(vol.Ephemeral != nil && pod.Name+"-"+vol.Name == claim.Name) {
+				return pod.Namespace + "/" + pod.Name, nil
+			}
+		}
+	}
+	return "", nil
 }

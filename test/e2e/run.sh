@@ -508,6 +508,16 @@ scenario_uninstall() {
 	pv_policy_is "$pv" Retain || die "unsafe uninstall changed $pv reclaim policy"
 	pass "uninstall refused a PV with unsnapshotted writes"
 
+	# A final marker alone cannot prove the Pod has stopped writing. Mimic
+	# a stale or premature report while the workload still mounts the claim.
+	kubectl annotate pv "$pv" "wsnap.dev/final-pod-uid=$pod_uid" --overwrite >/dev/null
+	code=$(run_release_job release-live-writer)
+	[[ $code == 2 ]] || die "release job exited $code while the final-marked Pod was still running"
+	kubectl -n wsnap-system logs job/release-live-writer | grep -q "SKIPPED $pv: pod $NS/uninstall-pod may still write" ||
+		die "release job did not identify the live Pod"
+	pv_policy_is "$pv" Retain || die "live Pod lost PV protection after a final marker"
+	pass "uninstall refused a final-marked PV while its Pod still ran"
+
 	kubectl -n "$NS" delete pod uninstall-pod --wait=true >/dev/null
 	[[ $(ws_field ws-uninstall .status.lastSnapshot.final) == true ]] ||
 		die "uninstall-pod did not take a final snapshot"
@@ -1374,7 +1384,8 @@ EOF
 
 # in_gvisor checks, from inside a Pod's container, that its kernel is the
 # gVisor Sentry, so a test cannot pass on runc by accident.
-in_gvisor() { kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>/dev/null | grep -q gVisor; }
+# Read all of dmesg: grep -q exits early and can SIGPIPE kubectl under pipefail.
+in_gvisor() { kubectl -n "$NS" exec "$1" -c agent -- dmesg 2>/dev/null | grep -F gVisor >/dev/null; }
 
 # in_kata checks that a Pod runs its own kernel (the Kata guest), not the
 # node's: under runc or gVisor uname -r would match the node, or say gVisor.
