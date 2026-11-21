@@ -1303,10 +1303,14 @@ func TestJobWaitsForWorkloadOnItsVolume(t *testing.T) {
 		Labels:          map[string]string{wsnapv1.LabelJob: "mover"},
 		OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "wsnap-reqs-x", UID: "job-uid", Controller: ptr.To(true)}}}}
 	writer := workloadPod("w1", "u1", "ws1", func(p *corev1.Pod) { p.Status.Phase = corev1.PodPending })
+	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "foreign", UID: "foreign-uid"},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "different-name", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-w1"}}}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning}}
 	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-w1"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
 	wsObj := &wsnapv1.Workspace{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ws1"}, Spec: wsnapv1.WorkspaceSpec{RepositoryName: "repo"},
 		Status: wsnapv1.WorkspaceStatus{Jobs: []wsnapv1.JobRef{{Name: "wsnap-reqs-x", UID: "job-uid", Kind: "mover"}}}}
-	e := newEnv(t, job, jobPod, writer, claim, wsObj)
+	e := newEnv(t, job, jobPod, writer, foreign, claim, wsObj)
 	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != http.StatusConflict {
 		t.Fatalf("mover got %d while a starting writer uses its volume, want 409", rec.Code)
 	}
@@ -1314,8 +1318,15 @@ func TestJobWaitsForWorkloadOnItsVolume(t *testing.T) {
 	if err := e.client.Status().Update(context.Background(), writer); err != nil {
 		t.Fatal(err)
 	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != http.StatusConflict {
+		t.Fatalf("mover got %d while an unlabeled Pod mounts its claim under another name, want 409", rec.Code)
+	}
+	foreign.Status.Phase = corev1.PodSucceeded
+	if err := e.client.Status().Update(context.Background(), foreign); err != nil {
+		t.Fatal(err)
+	}
 	if rec, _ := e.call(t, "/v1/credentials", "token-mover-pod", protocol.CredentialsRequest{Role: protocol.RoleMover}); rec.Code != 200 {
-		t.Fatalf("mover got %d after the writer stopped: %s", rec.Code, rec.Body.String())
+		t.Fatalf("mover got %d after both other Pods stopped: %s", rec.Code, rec.Body.String())
 	}
 }
 
