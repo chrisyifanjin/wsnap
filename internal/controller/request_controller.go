@@ -272,21 +272,21 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 		return ctrl.Result{}, err
 	}
 	for _, p := range pods.Items {
-		// wsnap's own Job Pods (this request's mover, a rescue) are not
-		// foreign writers.
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.Labels[wsnapv1.LabelJob] != "" {
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		if !mountsClaim(&p, vol.ClaimName) {
 			continue
 		}
-		if p.Labels[wsnapv1.LabelWorkspace] != "" {
+		if p.Labels[wsnapv1.LabelWorkspace] != "" || p.Labels[wsnapv1.LabelJob] != "" {
 			// A wsnap Pod that is starting (its sidecar may be restoring)
-			// or stopping (its sidecar takes the final snapshot). A Job now
-			// would work under the sidecar; wait for the Pod.
+			// or stopping (its sidecar takes the final snapshot), or an
+			// orphaned Job Pod whose Job was removed. Job labels are user
+			// writable, so they never prove a Pod is safe to ignore. Wait
+			// for it to stop before starting another Job on the claim.
 			st := sr.Status()
 			if msg := "waiting for pod " + p.Name; st.Message != msg {
-				st.Phase, st.Message = wsnapv1.SnapshotPending, msg
+				st.Phase, st.Executor, st.ClaimedBy, st.Message = wsnapv1.SnapshotPending, "", "", msg
 				if err := r.Status().Update(ctx, sr.obj); err != nil {
 					return ctrl.Result{}, err
 				}
