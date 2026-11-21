@@ -147,7 +147,7 @@ multi-node scenario: `kind create cluster --name wsnap --config test/e2e/kind-mu
 | `worker` | Worker mode: the workload Pod gets only a gate; a worker on its node serves a live request, takes the final snapshot with the last write after the workload stops, and restores a new workload on a new PVC. A `ReadWriteOncePod` claim is refused. |
 | `runtimes` | Installs a pinned, checksum-verified gVisor release on every node and a `gvisor` RuntimeClass. Sidecar mode with the workload and the sidecar inside one gVisor sandbox: request snapshot, final snapshot, cold restore. Worker mode with a gVisor workload and a default-runtime worker sharing the PVC: live snapshot, final snapshot with the last write, restore. Each Pod's kernel is checked to be gVisor. |
 | `kata` | Installs Kata Containers 4.2.0 (Rust runtime, QEMU; checksum verified) on one node with a `kata` RuntimeClass, and runs the same checks as `runtimes`: sidecar mode inside the microVM, and a default-runtime worker beside a Kata workload sharing the PVC over virtio-fs. Each Pod is checked to run its own guest kernel. Needs KVM; CI loads `vhost_vsock` before creating the cluster and enlarges the Kata node's `/dev/shm` (Kata keeps guest RAM there; Docker's default is 64 MiB). |
-| `uninstall` | Refuses to restore a PV's Delete policy while it has unsnapshotted writes; after a final snapshot, restores the original policy and removes the generated install bundle. |
+| `uninstall` | Refuses to restore a PV's Delete policy while it has unsnapshotted writes or a live Pod still mounts it, even with a final marker; after the Pod stops with a final snapshot, restores the original policy and removes the generated install bundle. |
 
 The scenarios form seven groups that share no state:
 

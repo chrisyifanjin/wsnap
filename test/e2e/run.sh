@@ -508,6 +508,16 @@ scenario_uninstall() {
 	pv_policy_is "$pv" Retain || die "unsafe uninstall changed $pv reclaim policy"
 	pass "uninstall refused a PV with unsnapshotted writes"
 
+	# A final marker alone cannot prove the Pod has stopped writing. Mimic
+	# a stale or premature report while the workload still mounts the claim.
+	kubectl annotate pv "$pv" "wsnap.dev/final-pod-uid=$pod_uid" --overwrite >/dev/null
+	code=$(run_release_job release-live-writer)
+	[[ $code == 2 ]] || die "release job exited $code while the final-marked Pod was still running"
+	kubectl -n wsnap-system logs job/release-live-writer | grep -q "SKIPPED $pv: pod $NS/uninstall-pod may still write" ||
+		die "release job did not identify the live Pod"
+	pv_policy_is "$pv" Retain || die "live Pod lost PV protection after a final marker"
+	pass "uninstall refused a final-marked PV while its Pod still ran"
+
 	kubectl -n "$NS" delete pod uninstall-pod --wait=true >/dev/null
 	[[ $(ws_field ws-uninstall .status.lastSnapshot.final) == true ]] ||
 		die "uninstall-pod did not take a final snapshot"

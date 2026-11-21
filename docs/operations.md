@@ -482,9 +482,10 @@ the upgrade is gone.
    ```
 
    The command restores each PV's original reclaim policy. It refuses PVs
-   whose data is in no snapshot and exits with code 2. Add `--force` to
-   release them anyway. If a writer starts during the command, the PV stays
-   protected and the command fails; stop the writer and rerun it.
+   whose data is in no snapshot or whose claim is still mounted by a
+   nonterminal Pod, and exits with code 2. Add `--force` to release them
+   anyway. If a writer starts during the command, the PV stays protected
+   and the command fails; stop the writer and rerun it.
 3. Delete the installation with `kubectl delete -f install.yaml` for a release,
    or `kubectl delete -k config/default` for a source install.
 
