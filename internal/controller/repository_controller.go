@@ -103,7 +103,10 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	ready := metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Valid", Message: "configuration is valid", ObservedGeneration: repo.Generation}
-	var result ctrl.Result
+	// Secrets are read live rather than cached or watched. Recheck even a
+	// healthy repository so Secret creation, deletion, rotation, and RBAC
+	// changes eventually update the reported readiness without a restart.
+	result := ctrl.Result{RequeueAfter: 5 * time.Minute}
 	if forbidden {
 		// Installed with config/namespaced-secrets and this namespace has
 		// no RoleBinding yet. RBAC changes are not watched; check again.
@@ -130,9 +133,8 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return result, r.Status().Update(ctx, &repo)
 }
 
-// SetupWithManager registers the reconciler. Secrets are not watched (they
-// are not cached), so a fixed Secret is picked up on the next repository
-// change or controller restart; the broker reads Secrets live regardless.
+// SetupWithManager registers the reconciler. Secrets are read live and
+// readiness is rechecked periodically; the broker also reads Secrets live.
 func (r *RepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).Named("snapshotrepository").For(&wsnapv1.SnapshotRepository{}).Complete(r)
 }
