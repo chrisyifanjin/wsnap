@@ -195,6 +195,13 @@ func JobRefMatches(recorded wsnapv1.JobRef, job *batchv1.Job) bool {
 // It records the original policy and the workspace on the PV. Protect is
 // idempotent.
 func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity, ref wsnapv1.VolumeRef) error {
+	return ProtectAndMark(ctx, c, r, id, ref, nil)
+}
+
+// ProtectAndMark makes protection and writer identity one optimistic patch.
+// An uninstall command cannot release a PV between these two changes and
+// mistake the previous writer's final snapshot for the new writer's data.
+func ProtectAndMark(ctx context.Context, c client.Client, r client.Reader, id Identity, ref wsnapv1.VolumeRef, marks map[string]string) error {
 	if ref.VolumeName == "" {
 		return nil
 	}
@@ -219,8 +226,12 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 	// Another controller or operator may have changed the policy after the
 	// previous protection. A label alone does not keep a deleted claim's
 	// volume from being reclaimed.
-	if pv.Labels[wsnapv1.LabelProtected] == "true" && pv.Annotations[wsnapv1.AnnotationWorkspaceRef] == wsRef &&
-		pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimRetain {
+	protected := pv.Labels[wsnapv1.LabelProtected] == "true" && pv.Annotations[wsnapv1.AnnotationWorkspaceRef] == wsRef &&
+		pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimRetain
+	for key, value := range marks {
+		protected = protected && pv.Annotations[key] == value
+	}
+	if protected {
 		return nil
 	}
 	patch := client.MergeFromWithOptions(pv.DeepCopy(), client.MergeFromWithOptimisticLock{})
@@ -234,6 +245,9 @@ func Protect(ctx context.Context, c client.Client, r client.Reader, id Identity,
 	pv.Annotations[wsnapv1.AnnotationWorkspaceRef] = wsRef
 	if _, ok := pv.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy]; !ok {
 		pv.Annotations[wsnapv1.AnnotationOriginalReclaimPolicy] = string(pv.Spec.PersistentVolumeReclaimPolicy)
+	}
+	for key, value := range marks {
+		pv.Annotations[key] = value
 	}
 	pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimRetain
 	return c.Patch(ctx, &pv, patch)

@@ -77,7 +77,8 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if live.UID != pod.UID || live.DeletionTimestamp != nil || live.Status.Phase == corev1.PodSucceeded || live.Status.Phase == corev1.PodFailed {
 			return ctrl.Result{}, nil
 		}
-		if err := workspace.MarkPV(ctx, r.Client, r.Reader, ref.VolumeName, workspace.AnnotationWriterPod, string(pod.UID)); err != nil {
+		if err := workspace.ProtectAndMark(ctx, r.Client, r.Reader, id, ref,
+			map[string]string{workspace.AnnotationWriterPod: string(pod.UID)}); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

@@ -367,6 +367,59 @@ func TestCredentialsResponse(t *testing.T) {
 	}
 }
 
+// releaseBeforeWriterMarkClient models uninstall restoring Delete after the
+// broker reads the PV but before its writer mark reaches the API server.
+type releaseBeforeWriterMarkClient struct {
+	client.Client
+	released bool
+}
+
+func (c *releaseBeforeWriterMarkClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*corev1.PersistentVolume); ok && !c.released {
+		c.released = true
+		var pv corev1.PersistentVolume
+		if err := c.Client.Get(ctx, client.ObjectKey{Name: obj.GetName()}, &pv); err != nil {
+			return err
+		}
+		before := pv.DeepCopy()
+		delete(pv.Labels, wsnapv1.LabelProtected)
+		pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+		if err := c.Client.Patch(ctx, &pv, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestCredentialsRefusePVReleaseBetweenProtectionAndWriterMark(t *testing.T) {
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-1",
+		Labels: map[string]string{wsnapv1.LabelProtected: "true"}, Annotations: map[string]string{
+			wsnapv1.AnnotationWorkspaceRef:          ns + "/ws1",
+			wsnapv1.AnnotationOriginalReclaimPolicy: "Delete",
+			workspace.AnnotationWriterPod:           "old-writer",
+			workspace.AnnotationFinalPod:            "old-writer",
+		}}, Spec: corev1.PersistentVolumeSpec{PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "data-w1"},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"}}
+	e := newEnv(t, workloadPod("w1", "new-writer", "ws1"), pv, pvc)
+	c := &releaseBeforeWriterMarkClient{Client: e.client}
+	e.srv.Client = c
+	rec, _ := e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot})
+	if !c.released {
+		t.Fatal("test did not simulate release")
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatalf("granted credentials after PV release: %s", rec.Body.String())
+	}
+	var got corev1.PersistentVolume
+	if err := e.client.Get(context.Background(), client.ObjectKey{Name: "pv-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimDelete || got.Annotations[workspace.AnnotationWriterPod] != "old-writer" {
+		t.Fatalf("release raced with writer mark: policy=%s writer=%q", got.Spec.PersistentVolumeReclaimPolicy, got.Annotations[workspace.AnnotationWriterPod])
+	}
+}
+
 func TestJobRoles(t *testing.T) {
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wsnap-mover-x", UID: "job-uid",
