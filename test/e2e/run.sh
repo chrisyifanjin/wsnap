@@ -705,7 +705,7 @@ scenario_requests() {
 	log "requests: control plane (CRs) and data plane (files); work done by the Pod or a Job"
 	# A failed earlier run may have left the claim and its initialized data.
 	# Start from an empty volume so this scenario tests a fresh restore path.
-	kubectl -n "$NS" delete pod req-1 req-2 fork-1 fork-2 --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$NS" delete pod req-1 req-2 req-labeled fork-1 fork-2 --ignore-not-found --wait=true >/dev/null
 	kubectl -n "$NS" delete pvc req-a --ignore-not-found --wait=true >/dev/null
 	fresh_workspace ws-req
 	apply_pvc req-a >/dev/null
@@ -744,6 +744,39 @@ scenario_requests() {
 	pass "WorkspaceRestore on a live Pod: saved the live data, rolled back to $v1 in place, then re-snapshotted"
 
 	kubectl -n "$NS" delete pod req-1 --wait=true >/dev/null
+	# A namespace user can copy wsnap's Job label. The request must not
+	# start a mover while that Pod still mounts the same PVC.
+	cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: req-labeled
+  namespace: $NS
+  labels:
+    wsnap.dev/job: mover
+spec:
+  automountServiceAccountToken: false
+  containers:
+    - name: writer
+      image: alpine:3.22
+      command: [sleep, infinity]
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: req-a
+EOF
+	wait_for 120 "job-labeled claim user ready" pod_ready req-labeled
+	apply_request wssnap snap-labeled ws-req >/dev/null
+	wait_for 30 "request waits for labeled claim user" req_is wssnap snap-labeled Pending
+	[[ $(req_field wssnap snap-labeled .status.message) == "waiting for pod req-labeled" ]] ||
+		die "request did not identify the job-labeled Pod using its claim"
+	kubectl -n "$NS" delete pod req-labeled --wait=true >/dev/null
+	wait_for 120 "request runs after labeled Pod stops" req_is wssnap snap-labeled Succeeded
+	pass "a copied Job label cannot bypass the PVC mount check"
+
 	apply_request wssnap snap-idle ws-req >/dev/null
 	wait_for 120 "idle snapshot request" req_is wssnap snap-idle Succeeded
 	[[ $(req_field wssnap snap-idle .status.executor) == mover ]] || die "idle request not served by a mover"

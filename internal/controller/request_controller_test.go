@@ -313,16 +313,25 @@ func (s *createSpy) Create(ctx context.Context, obj client.Object, opts ...clien
 	return s.Client.Create(ctx, obj, opts...)
 }
 
-// TestOwnMoverPodIsNotAForeignWriter: the request's own mover Pod mounts
-// the claim; on the recreate path it must not count as a Pod without a
-// sidecar.
-func TestOwnMoverPodIsNotAForeignWriter(t *testing.T) {
+// A Pod can copy wsnap's Job label. It must not make a volume appear idle
+// while it still mounts the claim, including on the Job recreation path.
+func TestJobLabeledPodCannotBypassClaimMountCheck(t *testing.T) {
 	sr := snapReq(time.Now(), wsnapv1.SnapshotRunning, "mover")
-	moverPod := runningPod("mover-pod", "m", "data")
-	moverPod.Labels = map[string]string{wsnapv1.LabelJob: "mover"}
-	r, c := requestEnv(t, sr, wsWith(pvcVol, nil), boundClaim(), moverPod)
-	if got := reconcileReq(t, r, c); got.Status.Phase != wsnapv1.SnapshotRunning {
-		t.Fatalf("phase %q (%s): the request's own mover was taken for a foreign writer", got.Status.Phase, got.Status.Message)
+	pod := runningPod("other-pod", "m", "data")
+	pod.Labels = map[string]string{wsnapv1.LabelJob: wsnapv1.JobMover}
+	r, c := requestEnv(t, sr, wsWith(pvcVol, nil), boundClaim(), pod)
+	if got := reconcileReq(t, r, c); got.Status.Phase != wsnapv1.SnapshotPending || got.Status.Message != "waiting for pod other-pod" {
+		t.Fatalf("phase %q message %q; want Pending while the labeled Pod mounts the claim", got.Status.Phase, got.Status.Message)
+	}
+	var jobs batchv1.JobList
+	if err := c.List(context.Background(), &jobs); err != nil || len(jobs.Items) != 0 {
+		t.Fatalf("started a mover beside the labeled Pod: %v, %d Jobs", err, len(jobs.Items))
+	}
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if got := reconcileReq(t, r, c); got.Status.Phase != wsnapv1.SnapshotRunning || got.Status.Executor != wsnapv1.JobMover {
+		t.Fatalf("phase %q executor %q after Pod stopped; want Running mover", got.Status.Phase, got.Status.Executor)
 	}
 }
 
