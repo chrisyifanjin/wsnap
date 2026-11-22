@@ -275,7 +275,7 @@ func (r *RequestReconciler) startJob(ctx context.Context, sr request, ws *wsnapv
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		if !mountsClaim(&p, vol.ClaimName) {
+		if !workspace.MountsClaim(&p, vol.ClaimName) {
 			continue
 		}
 		if p.Labels[wsnapv1.LabelWorkspace] != "" || p.Labels[wsnapv1.LabelJob] != "" {
@@ -385,19 +385,6 @@ func (r *RequestReconciler) otherJobOnVolume(ctx context.Context, namespace, vol
 		}
 	}
 	return "", nil
-}
-
-// mountsClaim reports whether p uses the claim: as a persistentVolumeClaim
-// volume, or as a generic ephemeral volume, whose claim is named
-// <pod>-<volume>.
-func mountsClaim(p *corev1.Pod, claim string) bool {
-	for _, v := range p.Spec.Volumes {
-		if (v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim) ||
-			(v.Ephemeral != nil && p.Name+"-"+v.Name == claim) {
-			return true
-		}
-	}
-	return false
 }
 
 // stripedMutex serializes work per key within this process, with fixed

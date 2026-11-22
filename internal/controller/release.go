@@ -97,11 +97,8 @@ func activePodOnVolume(ctx context.Context, c client.Client, pv *corev1.Persiste
 		if string(pod.UID) == pv.Annotations[workspace.AnnotationWriterPod] && pod.UID != "" {
 			return pod.Namespace + "/" + pod.Name, nil
 		}
-		for _, vol := range pod.Spec.Volumes {
-			if (vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == claim.Name) ||
-				(vol.Ephemeral != nil && pod.Name+"-"+vol.Name == claim.Name) {
-				return pod.Namespace + "/" + pod.Name, nil
-			}
+		if workspace.MountsClaim(pod, claim.Name) {
+			return pod.Namespace + "/" + pod.Name, nil
 		}
 	}
 	return "", nil
