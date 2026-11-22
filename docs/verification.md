@@ -458,6 +458,10 @@ PVC identity and provisioning checks:
   Pod asks for credentials. The controller records that identity in
   Workspace status, so editing the Job's annotations cannot change it
   (`TestIdleRequestRejectsReplacedClaim`, `TestJobRoles`).
+- A mover or restorer checks every live Pod in its namespace before it
+  receives credentials. A Pod that mounted the claim after the controller
+  started the Job blocks it even without workspace labels or the usual
+  volume name (`TestJobWaitsForWorkloadOnItsVolume`).
 - A rescue PVC is pinned to its released PV and the PV is pre-bound to
   the new claim UID. A preexisting same-name claim cannot cause a mover
   Job to start (`TestRescueRefusesPreexistingSameNameClaim`).
