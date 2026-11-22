@@ -231,29 +231,29 @@ func (s *Server) trackVolume(ctx context.Context, c *caller, consumeRestoreFrom 
 	return nil
 }
 
-// checkNoWorkloadOnVolume makes a mover or restorer wait while a workspace
-// Pod that has not stopped uses the Job's volume: its sidecar may be
-// restoring into it or taking its final snapshot. It is the broker's half
-// of "one agent per volume"; checkNoActiveJob is the other half.
+// checkNoWorkloadOnVolume makes a mover or restorer wait while any other
+// live Pod mounts its claim. The Pod may have no workspace label or may
+// mount the claim under another volume name. This rechecks the controller's
+// idle-volume decision when the Job Pod asks for a credential.
 func (s *Server) checkNoWorkloadOnVolume(ctx context.Context, c *caller) error {
 	volume := c.jobObj.Annotations[wsnapv1.AnnotationVolumeName]
 	if volume == "" {
 		return nil
 	}
+	claim := workspace.JobRef(c.jobObj).ClaimName
+	if claim == "" {
+		return fail(http.StatusForbidden, "job %s has no workspace claim", c.jobObj.Name)
+	}
 	var pods corev1.PodList
-	if err := s.Reader.List(ctx, &pods, client.InNamespace(c.id.Namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: c.id.Name}); err != nil {
-		return upstream(err, "list workspace pods")
+	if err := s.Reader.List(ctx, &pods, client.InNamespace(c.id.Namespace)); err != nil {
+		return upstream(err, "list pods using volume %s", volume)
 	}
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+		if p.UID == c.pod.UID || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		ref, err := workspace.ResolveVolume(ctx, s.Reader, p)
-		if err != nil {
-			continue // not bound yet, or no usable volume: not this one
-		}
-		if ref.VolumeName == volume {
+		if workspace.MountsClaim(p, claim) {
 			return fail(http.StatusConflict, "pod %s uses volume %s; waiting until it stops", p.Name, volume)
 		}
 	}
