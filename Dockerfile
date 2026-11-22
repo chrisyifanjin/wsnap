@@ -4,7 +4,7 @@
 
 # Compile both target architectures on the builder's native CPU. Running the
 # Go toolchain under QEMU is slower and can fail before compilation starts.
-FROM --platform=$BUILDPLATFORM golang:1.26.11 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
