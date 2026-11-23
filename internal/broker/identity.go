@@ -263,8 +263,10 @@ func (s *Server) resolveWorkerTarget(ctx context.Context, c *caller, ref wsnapv1
 
 // sameAgentSpec checks that a Pod runs its Job's template where it
 // matters: every container that can read the wsnap token is a template
-// container, unchanged (image, command, arguments, environment, mounts,
-// security context), and every volume the template defines is unchanged.
+// container, unchanged (image and pull policy, command, arguments,
+// environment, mounts, security context), and every volume the template
+// defines is unchanged. A different pull policy can run different bytes
+// for the same mutable image tag.
 // The API server defaults a Job template and its Pods the same way, so
 // these fields match exactly for a Pod the Job controller created. Other
 // containers and volumes are allowed, as long as the added containers
@@ -303,7 +305,8 @@ func sameAgentSpec(pod, tmpl *corev1.PodSpec, audience string) error {
 	// container and can read its token and state (reviewer #6).
 	same := func(p corev1.Container) bool {
 		t, ok := tmplContainers[p.Name]
-		return ok && p.Image == t.Image && equality.Semantic.DeepEqual(p.Command, t.Command) &&
+		return ok && p.Image == t.Image && p.ImagePullPolicy == t.ImagePullPolicy &&
+			equality.Semantic.DeepEqual(p.Command, t.Command) &&
 			equality.Semantic.DeepEqual(p.Args, t.Args) && equality.Semantic.DeepEqual(p.Env, t.Env) &&
 			equality.Semantic.DeepEqual(p.EnvFrom, t.EnvFrom) && equality.Semantic.DeepEqual(p.VolumeMounts, t.VolumeMounts) &&
 			equality.Semantic.DeepEqual(p.SecurityContext, t.SecurityContext) &&
