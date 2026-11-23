@@ -541,6 +541,13 @@ func TestRestoreWaitsForPendingRescue(t *testing.T) {
 	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusConflict {
 		t.Fatalf("restore during a pending rescue got %d, want 409", rec.Code)
 	}
+	// A broker cache that has not observed the Released PV must still deny
+	// the restore using the live API reader.
+	e.srv.Client = stalePVListClient{Client: e.client}
+	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusConflict {
+		t.Fatalf("restore with a stale PV cache got %d, want 409", rec.Code)
+	}
+	e.srv.Client = e.client
 	// Snapshots are not blocked, only restores.
 	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleSnapshot}); rec.Code != 200 {
 		t.Fatalf("snapshot blocked: %d", rec.Code)
@@ -552,6 +559,16 @@ func TestRestoreWaitsForPendingRescue(t *testing.T) {
 	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != 200 {
 		t.Fatalf("restore after the rescue: %d %s", rec.Code, rec.Body.String())
 	}
+}
+
+type stalePVListClient struct{ client.Client }
+
+func (c stalePVListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if pvs, ok := list.(*corev1.PersistentVolumeList); ok {
+		pvs.Items = nil
+		return nil
+	}
+	return c.Client.List(ctx, list, opts...)
 }
 
 func TestReusedFinalDoesNotCountTowardMaintenance(t *testing.T) {

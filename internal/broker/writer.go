@@ -72,7 +72,10 @@ func (s *Server) checkNoPendingRescue(ctx context.Context, c *caller) error {
 	ref := id.Namespace + "/" + id.Name
 	own, _ := workspace.ResolveVolume(ctx, s.Reader, c.pod)
 	var pvs corev1.PersistentVolumeList
-	if err := s.Client.List(ctx, &pvs, client.MatchingFields{workspace.IndexWorkspaceRef: ref}); err != nil {
+	// A recently released or stopped writer's PV may not be in the cache
+	// yet. List live before restoring; older PVs can still need rescue even
+	// if they have no protected label.
+	if err := s.Reader.List(ctx, &pvs); err != nil {
 		return err
 	}
 	for _, pv := range pvs.Items {
