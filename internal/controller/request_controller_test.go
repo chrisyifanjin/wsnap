@@ -537,6 +537,50 @@ func TestMaintenanceRunsAtMostHourly(t *testing.T) {
 	}
 }
 
+// A snapshot can change the generated maintenance Job name before the cache
+// observes the previous Job. The live list must still find that running Job.
+func TestMaintenanceSeesRecentlyCreatedJob(t *testing.T) {
+	ctx := context.Background()
+	ws := wsWith(pvcVol, nil)
+	ws.Status.LastSnapshot = &wsnapv1.SnapshotRecord{ID: "new-snapshot"}
+	ws.Status.SnapshotsSinceMaintenance = 50
+	r, c := requestEnv(t, ws)
+	var repo wsnapv1.SnapshotRepository
+	if err := c.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "repo"}, &repo); err != nil {
+		t.Fatal(err)
+	}
+	repo.Spec.Retention.MaintenanceEvery = 20
+	if err := c.Update(ctx, &repo); err != nil {
+		t.Fatal(err)
+	}
+	previous := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "wsnap-maint-previous", UID: "previous",
+		Labels: map[string]string{wsnapv1.LabelJob: wsnapv1.JobMaintenance, wsnapv1.LabelJobWorkspace: "ws1"}}}
+	if err := c.Create(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+	wr := &WorkspaceReconciler{Client: staleMaintenanceJobClient{Client: c}, Reader: c, Jobs: r.Jobs}
+	if _, err := wr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "ws1"}}); err != nil {
+		t.Fatal(err)
+	}
+	var jobs batchv1.JobList
+	if err := c.List(ctx, &jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 || jobs.Items[0].Name != previous.Name {
+		t.Fatalf("created concurrent maintenance Job while the first was live: %+v", jobs.Items)
+	}
+}
+
+type staleMaintenanceJobClient struct{ client.Client }
+
+func (c staleMaintenanceJobClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if jobs, ok := list.(*batchv1.JobList); ok {
+		jobs.Items = nil
+		return nil
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
 // TestTargetedRequestSnapshotsThatVolume (reviewer #4 finding 5): the
 // broker's rescue request names a stopped writer's PV; the mover must run
 // on that PV's claim, not on status.volume.

@@ -50,9 +50,11 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 	}
-	// One maintenance Job at a time per workspace.
+	// One maintenance Job at a time per workspace. Read live: the cached
+	// list may not contain a Job just created for the previous snapshot,
+	// while maintenanceJobName has already changed for a newer snapshot.
 	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, client.InNamespace(ws.Namespace), client.MatchingLabels{
+	if err := r.Reader.List(ctx, &jobs, client.InNamespace(ws.Namespace), client.MatchingLabels{
 		wsnapv1.LabelJob: wsnapv1.JobMaintenance, wsnapv1.LabelJobWorkspace: ws.Name,
 	}); err != nil {
 		return ctrl.Result{}, err
