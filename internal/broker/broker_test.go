@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -275,6 +276,30 @@ func (e *env) call(t *testing.T, path, token string, body any) (*httptest.Respon
 		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	}
 	return rec, &resp
+}
+
+func TestBrokerLimitsPostBodies(t *testing.T) {
+	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
+	large := `{"role":"snapshot","padding":"` + strings.Repeat("x", int(maxRequestBodyBytes)) + `"}`
+	for _, tc := range []struct {
+		name          string
+		contentLength int64
+		want          int
+	}{
+		{"known length", int64(len(large)), http.StatusRequestEntityTooLarge},
+		{"streamed body", -1, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/credentials", strings.NewReader(large))
+			req.ContentLength = tc.contentLength
+			req.Header.Set("Authorization", "Bearer token-w1")
+			rec := httptest.NewRecorder()
+			e.srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status %d, want %d: %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
 }
 
 func TestRoles(t *testing.T) {

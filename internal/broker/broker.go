@@ -58,6 +58,10 @@ type Server struct {
 	Gateway GatewayAuth
 }
 
+// A report or gateway request is small JSON. Bound it before decoding so a
+// caller cannot make the broker buffer an unbounded string in a POST body.
+const maxRequestBodyBytes int64 = 1 << 20
+
 // Handler returns the broker's routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -67,7 +71,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/worker-state", s.handleWorkerState)
 	s.registerGateway(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if r.ContentLength > maxRequestBodyBytes {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 type httpError struct {
