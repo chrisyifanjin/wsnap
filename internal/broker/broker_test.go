@@ -972,6 +972,103 @@ func TestRestoreWaitsWhileTheOldClaimIsBeingDeleted(t *testing.T) {
 	}
 }
 
+func TestStoppedWriterRescueRequestMustMatchVolume(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*wsnapv1.WorkspaceSnapshot)
+	}{
+		{"different workspace", func(r *wsnapv1.WorkspaceSnapshot) { r.Spec.WorkspaceName = "other" }},
+		{"different volume", func(r *wsnapv1.WorkspaceSnapshot) { r.Annotations[wsnapv1.AnnotationVolumeName] = "other-pv" }},
+		{"different claim UID", func(r *wsnapv1.WorkspaceSnapshot) { r.Annotations[workspace.AnnotationClaimUID] = "other-claim" }},
+		{"different PV UID", func(r *wsnapv1.WorkspaceSnapshot) { r.Annotations[workspace.AnnotationPVUID] = "other-pv" }},
+		{"unmanaged", func(r *wsnapv1.WorkspaceSnapshot) { delete(r.Labels, wsnapv1.LabelManagedBy) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "old-pv", Annotations: map[string]string{
+					wsnapv1.AnnotationWorkspaceRef: ns + "/ws1", workspace.AnnotationWriterPod: "old-writer"}},
+				Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+			}
+			claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "old-claim"},
+				Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "old-pv"}}
+			e := newEnv(t, workloadPod("w2", "u2", "ws1"), old, claim)
+			if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusConflict {
+				t.Fatalf("initial restore got %d, want 409", rec.Code)
+			}
+			var requests wsnapv1.WorkspaceSnapshotList
+			if err := e.client.List(context.Background(), &requests, client.InNamespace(ns)); err != nil || len(requests.Items) != 1 {
+				t.Fatalf("rescue requests: %v, error: %v", requests.Items, err)
+			}
+			request := &requests.Items[0]
+			tc.change(request)
+			if err := e.client.Update(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			request.Status.Phase = wsnapv1.SnapshotFailed
+			if err := e.client.Status().Update(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusConflict {
+				t.Fatalf("restore with mismatched rescue request got %d, want 409: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+type failingClaimReader struct{ client.Reader }
+
+func (r failingClaimReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.PersistentVolumeClaim); ok && key.Name == "old-claim" {
+		return fmt.Errorf("temporary PVC read failure")
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestRestoreFailsClosedWhenOldClaimReadFails(t *testing.T) {
+	old := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-pv", Annotations: map[string]string{
+			wsnapv1.AnnotationWorkspaceRef: ns + "/ws1", workspace.AnnotationWriterPod: "old-writer"}},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "old-claim"},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "old-pv"}}
+	e := newEnv(t, workloadPod("w2", "u2", "ws1"), old, claim)
+	e.srv.Reader = failingClaimReader{Reader: e.client}
+	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("restore after PVC read failure got %d, want 503: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLostWriterCannotBypassMismatchedRescueRequest(t *testing.T) {
+	deadline := metav1.NewTime(time.Now().Add(-stuckTerminationMargin - time.Minute))
+	stuck := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "old", UID: "old-writer",
+		Labels:            map[string]string{wsnapv1.LabelWorkspace: "ws1", wsnapv1.LabelRepository: "repo"},
+		DeletionTimestamp: &deadline, Finalizers: []string{"test/keep"}}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	old := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-pv", Annotations: map[string]string{
+			wsnapv1.AnnotationWorkspaceRef: ns + "/ws1", workspace.AnnotationWriterPod: "old-writer"}},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "old-claim"},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "old-pv"}}
+	e := newEnv(t, workloadPod("w2", "u2", "ws1"), stuck, old, claim)
+	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusOK {
+		t.Fatalf("lost writer's first restore got %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var requests wsnapv1.WorkspaceSnapshotList
+	if err := e.client.List(context.Background(), &requests, client.InNamespace(ns)); err != nil || len(requests.Items) != 1 {
+		t.Fatalf("rescue requests: %v, error: %v", requests.Items, err)
+	}
+	request := &requests.Items[0]
+	request.Annotations[workspace.AnnotationPVUID] = "other-pv"
+	if err := e.client.Update(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := e.call(t, "/v1/credentials", "token-w2", protocol.CredentialsRequest{Role: protocol.RoleRestore}); rec.Code != http.StatusConflict {
+		t.Fatalf("lost writer bypassed mismatched rescue request (%d): %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestReportOperationMustMatchRole(t *testing.T) {
 	e := newEnv(t, workloadPod("w1", "u1", "ws1"))
 	e.call(t, "/v1/credentials", "token-w1", protocol.CredentialsRequest{Role: protocol.RoleSnapshot})

@@ -86,7 +86,14 @@ func (s *Server) checkNoPendingRescue(ctx context.Context, c *caller) error {
 		hasFinal := workspace.HasFinalSnapshot(a)
 		rescue := a[wsnapv1.AnnotationRescue]
 		running := rescue == wsnapv1.RescueRunning
-		awaiting := rescue == "" && !hasFinal && (pv.Status.Phase == corev1.VolumeReleased || s.claimGone(ctx, &pv))
+		awaiting := rescue == "" && !hasFinal && pv.Status.Phase == corev1.VolumeReleased
+		if rescue == "" && !hasFinal && !awaiting {
+			gone, err := s.claimGone(ctx, &pv)
+			if err != nil {
+				return upstream(err, "check claim of volume %s", pv.Name)
+			}
+			awaiting = gone
+		}
 		if running || awaiting {
 			return fail(http.StatusConflict, "volume %s of workspace %s is being rescued; waiting", pv.Name, id.Name)
 		}
@@ -111,6 +118,10 @@ func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Iden
 	writer := pv.Annotations[workspace.AnnotationWriterPod]
 	if writer == "" {
 		return nil
+	}
+	claim := pv.Spec.ClaimRef
+	if pv.UID == "" || claim == nil || claim.Namespace != id.Namespace || claim.UID == "" {
+		return fail(http.StatusConflict, "stopped volume %s has no complete claim and PV identity; waiting", pv.Name)
 	}
 	var pods corev1.PodList
 	if err := s.Reader.List(ctx, &pods, client.InNamespace(id.Namespace), client.MatchingLabels{wsnapv1.LabelWorkspace: id.Name}); err != nil {
@@ -139,25 +150,33 @@ func (s *Server) checkStoppedWriterVolume(ctx context.Context, id workspace.Iden
 	if apierrors.IsNotFound(err) {
 		req = wsnapv1.WorkspaceSnapshot{
 			ObjectMeta: metav1.ObjectMeta{Namespace: id.Namespace, Name: name,
-				Labels:      map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue},
-				Annotations: map[string]string{wsnapv1.AnnotationVolumeName: pv.Name}},
+				Labels: map[string]string{wsnapv1.LabelManagedBy: wsnapv1.ManagedByValue},
+				Annotations: map[string]string{wsnapv1.AnnotationVolumeName: pv.Name,
+					workspace.AnnotationClaimUID: string(claim.UID), workspace.AnnotationPVUID: string(pv.UID)}},
 			Spec: wsnapv1.WorkspaceSnapshotSpec{WorkspaceName: id.Name},
 		}
-		if err := s.Client.Create(ctx, &req); err != nil && !apierrors.IsAlreadyExists(err) {
-			return upstream(err, "create rescue request")
+		if createErr := s.Client.Create(ctx, &req); createErr != nil {
+			if !apierrors.IsAlreadyExists(createErr) {
+				return upstream(createErr, "create rescue request")
+			}
+			err = s.Reader.Get(ctx, client.ObjectKey{Namespace: id.Namespace, Name: name}, &req)
+		} else {
+			err = nil
 		}
-		if stuck {
-			s.Log.Info("restoring while a lost writer's volume holds unsaved data; its rescue will be kept as superseded",
-				"workspace", id.Name, "pv", pv.Name, "request", name)
-			return nil
-		}
-		return fail(http.StatusConflict, "volume %s of stopped pod holds unsaved data; saving it first (request %s)", pv.Name, name)
-	}
-	if stuck {
-		return nil
 	}
 	if err != nil {
 		return upstream(err, "rescue request %s", name)
+	}
+	if req.Labels[wsnapv1.LabelManagedBy] != wsnapv1.ManagedByValue ||
+		req.Spec.WorkspaceName != id.Name || req.Annotations[wsnapv1.AnnotationVolumeName] != pv.Name ||
+		req.Annotations[workspace.AnnotationClaimUID] != string(claim.UID) ||
+		req.Annotations[workspace.AnnotationPVUID] != string(pv.UID) {
+		return fail(http.StatusConflict, "rescue request %s does not match stopped volume %s of workspace %s; waiting", name, pv.Name, id.Name)
+	}
+	if stuck {
+		s.Log.Info("restoring while a lost writer's volume holds unsaved data; its rescue will be kept as superseded",
+			"workspace", id.Name, "pv", pv.Name, "request", name)
+		return nil
 	}
 	switch req.Status.Phase {
 	case wsnapv1.SnapshotSucceeded, wsnapv1.SnapshotFailed:
@@ -295,12 +314,18 @@ func jobDone(j *batchv1.Job) bool {
 
 // claimGone reports whether a Bound PV's claim is deleted or being
 // deleted: the PV controller marks the PV Released only a moment later.
-func (s *Server) claimGone(ctx context.Context, pv *corev1.PersistentVolume) bool {
+func (s *Server) claimGone(ctx context.Context, pv *corev1.PersistentVolume) (bool, error) {
 	ref := pv.Spec.ClaimRef
 	if ref == nil || pv.Status.Phase != corev1.VolumeBound {
-		return false
+		return false, nil
 	}
 	var pvc corev1.PersistentVolumeClaim
 	err := s.Reader.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &pvc)
-	return apierrors.IsNotFound(err) || (err == nil && (pvc.UID != ref.UID || pvc.DeletionTimestamp != nil))
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return pvc.UID != ref.UID || pvc.DeletionTimestamp != nil, nil
 }
